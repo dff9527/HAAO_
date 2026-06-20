@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -21,6 +22,10 @@ ALLOWED_EXECUTABLES = frozenset(
         "node",
     }
 )
+
+# Version-suffixed Python interpreters, e.g. "python3", "python3.14" (sys.executable
+# on some platforms resolves to a versioned name not literally in ALLOWED_EXECUTABLES).
+_VERSIONED_PYTHON = re.compile(r"^python\d+(\.\d+)*$")
 
 SHELL_OPERATOR_TOKENS = frozenset({";", "|", "||", "&", "&&", ">", "<"})
 
@@ -191,7 +196,7 @@ def parse_command(command: str) -> list[str]:
         )
 
     executable = Path(argv[0]).name
-    if executable not in ALLOWED_EXECUTABLES:
+    if executable not in ALLOWED_EXECUTABLES and not _VERSIONED_PYTHON.match(executable):
         raise TestRunnerError(
             f"Executable {executable!r} is not allowed. "
             f"Allowed executables: {', '.join(sorted(ALLOWED_EXECUTABLES))}"
