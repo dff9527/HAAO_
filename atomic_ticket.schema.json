@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://haao.dev/schemas/atomic_ticket.schema.json",
+  "title": "HAAO Atomic AI Ticket",
+  "description": "Runtime contract between the Claude Tech Lead and a local Coder model. A ticket must be machine-readable, self-contained in context, and verifiable before Product Owner acceptance.",
+  "type": "object",
+  "required": ["id", "title", "type", "status", "task", "context", "definition_of_done", "execution", "audit"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^T-[0-9]{3,}$",
+      "description": "Ticket id, e.g. T-012"
+    },
+    "title": {
+      "type": "string",
+      "maxLength": 120,
+      "description": "One-line task summary, imperative form"
+    },
+    "type": {
+      "type": "string",
+      "enum": ["feature", "bugfix", "refactor", "test", "chore"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["backlog", "ready", "in_progress", "testing", "diff_pending", "review", "awaiting_acceptance", "done", "blocked"],
+      "description": "Current state-machine state"
+    },
+    "priority": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "default": "medium"
+    },
+    "created_by": {
+      "type": "string",
+      "description": "Creator identity, e.g. claude-opus / human. Claude means Tech Lead, not Product Owner.",
+      "default": "claude"
+    },
+    "dependencies": {
+      "type": "array",
+      "description": "Ticket ids that must reach 'done' before this one can start",
+      "items": { "type": "string", "pattern": "^T-[0-9]{3,}$" },
+      "default": []
+    },
+
+    "task": {
+      "type": "object",
+      "description": "What to change. Kept small on purpose — see granularity rules.",
+      "required": ["description", "target_files"],
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Unambiguous instruction the local model can act on without guessing intent"
+        },
+        "target_files": {
+          "type": "array",
+          "description": "Files the model is ALLOWED to modify. MVP rule: keep this small (ideally 1).",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "maxItems": 5
+        },
+        "constraints": {
+          "type": "array",
+          "description": "Hard limits: what must NOT change, conventions to follow, libs not to add",
+          "items": { "type": "string" },
+          "default": []
+        }
+      }
+    },
+
+    "context": {
+      "type": "object",
+      "description": "Self-contained context injected into the prompt. Do NOT rely on the model to discover files itself.",
+      "required": ["files"],
+      "additionalProperties": false,
+      "properties": {
+        "files": {
+          "type": "array",
+          "description": "Snapshots of relevant code injected directly into the ticket (the Local RAG output).",
+          "items": {
+            "type": "object",
+            "required": ["path", "content"],
+            "additionalProperties": false,
+            "properties": {
+              "path": { "type": "string" },
+              "content": { "type": "string", "description": "File content or relevant excerpt at dispatch time" },
+              "truncated": { "type": "boolean", "default": false },
+              "reason": { "type": "string", "description": "Why this file is in context" }
+            }
+          }
+        },
+        "related_symbols": {
+          "type": "array",
+          "description": "Function/class signatures the model should be aware of but not edit",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "notes": {
+          "type": "string",
+          "description": "Extra architectural hints from the PO",
+          "default": ""
+        },
+        "token_estimate": {
+          "type": "integer",
+          "description": "Estimated context tokens; orchestrator uses this to guard the local model's window",
+          "minimum": 0
+        }
+      }
+    },
+
+    "definition_of_done": {
+      "type": "object",
+      "description": "Machine-verifiable completion criteria. The cheaper checks gate the expensive technical audit.",
+      "required": ["tests"],
+      "additionalProperties": false,
+      "properties": {
+        "tests": {
+          "type": "array",
+          "description": "Commands that must pass. This is the primary gate.",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["command", "expect"],
+            "additionalProperties": false,
+            "properties": {
+              "command": { "type": "string", "description": "e.g. 'pytest tests/test_security.py -q'" },
+              "expect": { "type": "string", "enum": ["pass", "fail"], "default": "pass" },
+              "timeout_sec": { "type": "integer", "default": 120 }
+            }
+          }
+        },
+        "static_checks": {
+          "type": "array",
+          "description": "Cheap gates run before tests: lint, type-check, format",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "description": "Product-owner-readable criteria used by technical audit and final product acceptance",
+          "items": { "type": "string" },
+          "default": []
+        }
+      }
+    },
+
+    "execution": {
+      "type": "object",
+      "description": "Who runs it and the self-correction budget.",
+      "required": ["assigned_model", "retry_budget"],
+      "additionalProperties": false,
+      "properties": {
+        "assigned_model": {
+          "type": "string",
+          "description": "Local model id, e.g. qwen3-coder-next, gemma-4-26b-a4b",
+          "examples": ["qwen3-coder-next", "gemma-4-26b-a4b", "qwen3.6-35b-a3b"]
+        },
+        "retry_budget": {
+          "type": "integer",
+          "description": "Max self-correction loops on test failure before escalation",
+          "minimum": 0,
+          "default": 3
+        },
+        "attempts": {
+          "type": "integer",
+          "description": "Attempts used so far",
+          "minimum": 0,
+          "default": 0
+        },
+        "escalate_to": {
+          "type": "string",
+          "description": "Where to route when retry_budget is exhausted",
+          "enum": ["tech_lead", "human", "blocked"],
+          "default": "tech_lead"
+        }
+      }
+    },
+
+    "result": {
+      "type": "object",
+      "description": "Filled by the local worker after execution.",
+      "additionalProperties": false,
+      "properties": {
+        "outcome": { "type": "string", "enum": ["success", "test_failed", "error", "pending"], "default": "pending" },
+        "diff": { "type": "string", "description": "Unified diff of changes" },
+        "test_output": { "type": "string" },
+        "logs": {
+          "type": "array",
+          "description": "Agent reasoning/action log shown on the Kanban for transparency",
+          "items": {
+            "type": "object",
+            "required": ["ts", "message"],
+            "properties": {
+              "ts": { "type": "string", "format": "date-time" },
+              "level": { "type": "string", "enum": ["info", "warn", "error"], "default": "info" },
+              "message": { "type": "string" }
+            }
+          },
+          "default": []
+        }
+      }
+    },
+
+    "audit": {
+      "type": "object",
+      "description": "Filled by the Claude Tech Lead during technical review.",
+      "additionalProperties": false,
+      "properties": {
+        "reviewed_by": { "type": "string", "default": "" },
+        "verdict": { "type": "string", "enum": ["pending", "approved", "rejected"], "default": "pending" },
+        "feedback": { "type": "string", "description": "On reject, the actionable reason returned to the worker", "default": "" }
+      }
+    },
+
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "epic": { "type": "string", "description": "Parent feature/epic id" }
+      }
+    }
+  }
+}

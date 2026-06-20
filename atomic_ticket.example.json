@@ -1,0 +1,72 @@
+{
+  "id": "T-012",
+  "title": "hash_password 改用 bcrypt",
+  "type": "refactor",
+  "status": "in_progress",
+  "priority": "high",
+  "created_by": "claude-opus",
+  "dependencies": ["T-010"],
+  "task": {
+    "description": "Replace the SHA-256 implementation in hash_password() with bcrypt (cost factor 12). Keep the function signature unchanged.",
+    "target_files": ["auth/security.py"],
+    "constraints": [
+      "Do not change the public signature hash_password(plain: str) -> str",
+      "Do not add new dependencies other than bcrypt (already in requirements)",
+      "Do not touch any other file"
+    ]
+  },
+  "context": {
+    "files": [
+      {
+        "path": "auth/security.py",
+        "content": "import hashlib\n\ndef hash_password(plain: str) -> str:\n    return hashlib.sha256(plain.encode()).hexdigest()\n\ndef verify_password(plain: str, hashed: str) -> bool:\n    return hash_password(plain) == hashed\n",
+        "truncated": false,
+        "reason": "File to modify"
+      },
+      {
+        "path": "tests/test_security.py",
+        "content": "from auth.security import hash_password, verify_password\n\ndef test_roundtrip():\n    h = hash_password('hunter2')\n    assert verify_password('hunter2', h)\n    assert not verify_password('wrong', h)\n",
+        "truncated": false,
+        "reason": "DoD test the change must satisfy"
+      }
+    ],
+    "related_symbols": ["verify_password(plain: str, hashed: str) -> bool"],
+    "notes": "verify_password must keep working after the change — bcrypt.checkpw, not string equality.",
+    "token_estimate": 380
+  },
+  "definition_of_done": {
+    "tests": [
+      { "command": "pytest tests/test_security.py -q", "expect": "pass", "timeout_sec": 120 }
+    ],
+    "static_checks": ["ruff check auth/security.py"],
+    "acceptance_criteria": [
+      "hash output is a bcrypt hash, not a hex digest",
+      "verify_password uses bcrypt.checkpw"
+    ]
+  },
+  "execution": {
+    "assigned_model": "qwen3-coder-next",
+    "retry_budget": 3,
+    "attempts": 1,
+    "escalate_to": "tech_lead"
+  },
+  "result": {
+    "outcome": "test_failed",
+    "diff": "",
+    "test_output": "1 failed - bcrypt.hashpw missing salt argument",
+    "logs": [
+      { "ts": "2026-06-17T12:04:00Z", "level": "info", "message": "讀取 auth/security.py" },
+      { "ts": "2026-06-17T12:05:10Z", "level": "error", "message": "pytest 1 failed (salt 缺參數)" }
+    ]
+  },
+  "audit": {
+    "reviewed_by": "",
+    "verdict": "pending",
+    "feedback": ""
+  },
+  "metadata": {
+    "created_at": "2026-06-17T11:58:00Z",
+    "updated_at": "2026-06-17T12:05:10Z",
+    "epic": "EP-AUTH"
+  }
+}
