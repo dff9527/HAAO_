@@ -1,7 +1,10 @@
 <h1 align="center">HAAO</h1>
 <p align="center"><b>Hybrid AI-Agile Orchestrator</b></p>
 <p align="center">Run AI coding agents like a Scrum team — you stay the Product Owner, a cloud model is the Tech Lead, and local LLMs do the work.</p>
-
+<p align="center">
+  <b>▶ Live demo:</b> <a href="https://haao-demo.pages.dev">haao-demo.pages.dev</a>
+  &nbsp;·&nbsp; <i>interactive simulation — no live model calls</i>
+</p>
 <p align="center">
   <code>status: working end-to-end prototype · controlled pilot complete</code> ·
   <code>python · fastapi · react · LM Studio · Claude</code>
