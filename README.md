@@ -57,7 +57,7 @@ The non-obvious design choice: the **human is the PO, not the Scrum Master**. Pr
         You (Product Owner)
    write prompt │           │ approve / accept
                 ▼           ▲
-        ┌───────────────────────────────┐
+        ┌────────────────────────────────┐
         │   Orchestrator (Scrum Master)  │  state machine · routing · retry · escalation
         └───┬───────────┬───────────┬────┘
             │ decompose │ dispatch  │ run tests
