@@ -31,3 +31,6 @@ pnpm-debug.log*
 .DS_Store
 .vscode/
 .idea/
+
+# Local marketing/launch material
+LAUNCH_KIT.md
