@@ -1,4 +1,10 @@
-<h1 align="center">HAAO</h1>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./frontend/src/assets/frame.png">
+    <source media="(prefers-color-scheme: light)" srcset="./frontend/src/assets/frame-lite.png">
+    <img src="./frontend/src/assets/frame-lite.png" alt="HAAO" width="400">
+  </picture>
+</p>
 <p align="center"><b>Hybrid AI-Agile Orchestrator</b></p>
 <p align="center">Run AI coding agents like a Scrum team — you stay the Product Owner, a cloud model is the Tech Lead, and local LLMs do the work.</p>
 <p align="center">
