@@ -91,6 +91,8 @@ I'm trying to be honest about the open questions, because they're the whole ball
 
 The next milestone isn't features — it's a number. Run the loop end to end on one real project and measure the one-shot rate and the cost per accepted ticket on consumer hardware. If those look good, the rest (parallel workers, dependency graphs, multi-project) is worth building. If they don't, the architecture taught me something cheap.
 
+*Since writing this, the loop grew up around its edges.* The front door is now a **conversation**: you talk to an orchestrator agent, it restates what it heard and files the work as backlog proposals, and it reports `done` / `blocked` back — the Scrum Master, made conversational. The tail now **ships**: accepted work opens a pull request to GitHub/GitLab. The "glass factory floor" got real instruments — an Activity stream of every run event, an Insights dashboard (throughput, escalation rate, local-vs-cloud cost with an honest `actual / estimated / unknown` status), and a cross-project Inbox. You can register multiple cloud providers and assign any model per role, or stay fully local. And because it runs AI-written code and holds keys, safety became first-class: sandboxed (network-disabled) execution, AES-GCM-encrypted secrets, prompt-injection-aware context, log redaction. The deployment shape that falls out of all this is **split-plane** — host the control plane, keep execution and keys on the user's side — the cheapest way to ship it and the one that never runs your code on someone else's box. None of that changed the thesis; it just made it usable.
+
 If you're thinking about how to manage AI coding agents rather than just prompt them, I'd love to compare notes.
 
 ---
