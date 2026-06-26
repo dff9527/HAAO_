@@ -8,6 +8,7 @@ from typing import Protocol
 
 from orchestrator.context.conventions import detect_conventions, detect_test_command
 from orchestrator.context.injector import ContextInjector
+from orchestrator.attachments import build_attachment_context
 from orchestrator.cloud_usage import CloudUsage, apply_usage_to_requirement
 from orchestrator.context.repo_context import build_enriched_repo_context
 from orchestrator.context.scope import validate_scope_paths
@@ -105,7 +106,10 @@ class RequirementService:
             scope_paths=stored.scope_paths,
             constraints=stored.constraints,
             acceptance_notes=stored.acceptance_notes,
-            attachments=[attachment.model_dump(mode="json") for attachment in stored.attachments],
+            attachments=[
+                build_attachment_context(attachment.model_dump(mode="json"))
+                for attachment in stored.attachments
+            ],
             intent=stored.intent,
             scale=stored.scale,
             granularity=stored.granularity,

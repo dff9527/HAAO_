@@ -139,6 +139,8 @@ export interface Ticket {
   gitMergedTo?: string;            // Branch this ticket was merged into
   gitMergeCommit?: string;         // Merge commit hash
   gitRevertCommit?: string;        // Revert commit hash
+  prUrl?: string;                  // Open PR link (never includes token)
+  prStatus?: string;               // opened | updated | …
   lastInterventionNotification?: InterventionNotification;
 }
 
@@ -148,4 +150,49 @@ export interface InterventionNotification {
   reason: string;
   ticketUrl: string;
   sentAt?: string;
+}
+
+export type ChatMessageRole = 'user' | 'agent' | 'system_report';
+export type ChatReportKind = 'done' | 'blocked' | 'needs_you';
+export type ChatAttachmentKind = 'file' | 'image';
+
+export interface ChatAttachment {
+  id: string;
+  filename: string;
+  mime: string;
+  size: number;
+  kind: ChatAttachmentKind;
+  stored_path: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  project_id: string;
+  role: ChatMessageRole;
+  text: string;
+  requirement_id?: string;
+  ticket_id?: string;
+  report_kind?: ChatReportKind;
+  segment_id: string;
+  created_at: string;
+  attachment_ids?: string[];
+  attachments?: ChatAttachment[];
+}
+
+export interface CloudModel {
+  id: string;
+  label: string;
+  provider: string;
+  model_id: string;
+  key_configured: boolean;
+  deletable?: boolean;
+}
+
+export interface ChatSegment {
+  id: string;
+  project_id: string;
+  title: string;
+  summary: string;
+  created_at: string;
+  is_active: boolean;
 }

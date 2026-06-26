@@ -5,8 +5,10 @@ from fastapi.testclient import TestClient
 
 from clients.claude_po import ClaudeTechLeadClient
 from clients.openai_compat import OpenAICompatReasoner
+from orchestrator.cloud_models import add_cloud_model
 from orchestrator.cloud_reasoner_config import (
     build_cloud_reasoner,
+    cloud_model_inventory,
     provider_options,
     selected_cloud_reasoner_id,
     validate_cloud_reasoner_id,
@@ -48,6 +50,25 @@ def test_select_openai_builds_openai_compat(tmp_path) -> None:
     assert client.api_key == "ok"
 
 
+def test_build_cloud_reasoner_prefers_registry_key(tmp_path, monkeypatch) -> None:
+    repo = SettingsRepository(connect(tmp_path / "s.sqlite3"))
+    monkeypatch.setenv("HAAO_SECRET_KEY", "master-secret")
+    add_cloud_model(
+        repo,
+        label="Registered GPT",
+        provider="openai",
+        model_id="gpt-4o",
+        api_key="registry-key",
+    )
+    repo.set_cloud_reasoner("openai:gpt-4o")
+    settings = _settings(openai_api_key="env-key")
+
+    client = build_cloud_reasoner(settings, repo)
+
+    assert isinstance(client, OpenAICompatReasoner)
+    assert client.api_key == "registry-key"
+
+
 def test_validate_cloud_reasoner_id() -> None:
     assert validate_cloud_reasoner_id("openai:gpt-4o") == "openai:gpt-4o"
     # Bare id resolves to the anthropic provider.
@@ -65,9 +86,34 @@ def test_provider_options_flag_configured_keys() -> None:
     assert by_id["google"]["label"] == "Gemini (Google)"
 
 
-def test_cloud_reasoner_endpoints(tmp_path) -> None:
+def test_cloud_model_inventory_includes_non_deletable_default(tmp_path) -> None:
+    repo = SettingsRepository(connect(tmp_path / "s.sqlite3"))
+    settings = _settings(claude_api_key="ck")
+
+    inventory = cloud_model_inventory(settings, repo)
+
+    assert inventory[0] == {
+        "id": "anthropic:claude-sonnet-4-6",
+        "label": "Claude (Anthropic) · default",
+        "provider": "anthropic",
+        "model_id": "claude-sonnet-4-6",
+        "key_configured": True,
+        "deletable": False,
+    }
+
+
+def test_cloud_reasoner_endpoints(tmp_path, monkeypatch) -> None:
     db = tmp_path / "haao.sqlite3"
-    settings = _settings(openai_api_key="ok", database_url=f"sqlite:///{db}")
+    settings = _settings(claude_api_key="ck", openai_api_key="ok", database_url=f"sqlite:///{db}")
+    monkeypatch.setenv("HAAO_SECRET_KEY", "master-secret")
+    repo = SettingsRepository(connect(db))
+    add_cloud_model(
+        repo,
+        label="Registered GPT",
+        provider="openai",
+        model_id="gpt-4o",
+        api_key="registry-key",
+    )
     app.dependency_overrides[get_settings] = lambda: settings
     try:
         client = TestClient(app)
@@ -76,13 +122,48 @@ def test_cloud_reasoner_endpoints(tmp_path) -> None:
         assert r.status_code == 200
         assert r.json()["model_id"] == "anthropic:claude-sonnet-4-6"
         assert any(p["id"] == "openai" and p["key_configured"] for p in r.json()["providers"])
+        assert r.json()["registry"][0]["id"] == "anthropic:claude-sonnet-4-6"
+        assert r.json()["registry"][0]["deletable"] is False
+        assert r.json()["registry"][0]["key_configured"] is True
+        assert r.json()["registry"][1]["id"] == "openai:gpt-4o"
+        assert r.json()["registry"][1]["key_configured"] is True
 
         r = client.put("/config/cloud-reasoner", json={"model_id": "openai:gpt-4o"})
         assert r.status_code == 200
         assert r.json()["provider"] == "openai"
+        assert r.json()["registry"][1]["id"] == "openai:gpt-4o"
 
         r = client.get("/config/cloud-reasoner")
         assert r.json()["model_id"] == "openai:gpt-4o"
+
+        r = client.put(
+            "/config/cloud-reasoner",
+            json={"model_id": "anthropic:claude-sonnet-4-6"},
+        )
+        assert r.status_code == 200
+        assert r.json()["model_id"] == "anthropic:claude-sonnet-4-6"
+
+        r = client.get("/config/cloud-models")
+        models = r.json()["models"]
+        assert models[0]["id"] == "anthropic:claude-sonnet-4-6"
+        assert models[0]["deletable"] is False
+        assert models[0]["key_configured"] is True
+        assert models[1]["id"] == "openai:gpt-4o"
+        assert models[1]["deletable"] is True
+
+        r = client.post(
+            "/config/cloud-models",
+            json={
+                "label": "Default overwrite",
+                "provider": "anthropic",
+                "model_id": "claude-sonnet-4-6",
+                "api_key": "nope",
+            },
+        )
+        assert r.status_code == 400
+
+        r = client.delete("/config/cloud-models/anthropic%3Aclaude-sonnet-4-6")
+        assert r.status_code == 400
 
         r = client.put("/config/cloud-reasoner", json={"model_id": "acme:x"})
         assert r.status_code == 400

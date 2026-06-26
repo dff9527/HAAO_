@@ -90,7 +90,7 @@ export const INITIAL_MODEL_CONFIGS: ModelConfig[] = [
 
 export const INITIAL_ROLE_ROUTES: RoleRoute[] = [
   {
-    id: 'po',
+    id: 'tech_lead',
     role: 'Tech Lead (decompose + technical audit)',
     note: 'high-level reasoning, cloud only',
     model: 'Claude · Tech Lead',

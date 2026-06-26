@@ -63,6 +63,7 @@ class LMStudioClient:
         model: str,
         messages: list[ChatMessage | dict[str, str]],
         temperature: float = 0.2,
+        max_tokens: int | None = None,
     ) -> str:
         payload = {
             "model": model,
@@ -72,30 +73,39 @@ class LMStudioClient:
             ],
             "temperature": temperature,
         }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
 
-        try:
-            response = self._client().post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers=self._headers(),
-            )
-            response.raise_for_status()
-        except httpx.TimeoutException as exc:
-            raise LMStudioError(
-                f"LM Studio request timed out after {self.timeout_sec}s"
-            ) from exc
-        except httpx.ConnectError as exc:
-            raise LMStudioError(
-                f"Could not connect to LM Studio at {self.base_url}"
-            ) from exc
-        except httpx.HTTPStatusError as exc:
-            raise LMStudioError(
-                f"LM Studio returned HTTP {exc.response.status_code}: "
-                f"{exc.response.text}"
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise LMStudioError(f"LM Studio request failed: {exc}") from exc
+        response: httpx.Response | None = None
+        for attempt in range(2):
+            try:
+                response = self._client().post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers=self._headers(),
+                )
+                response.raise_for_status()
+                break
+            except httpx.TimeoutException as exc:
+                raise LMStudioError(
+                    f"LM Studio request timed out after {self.timeout_sec}s"
+                ) from exc
+            except httpx.ConnectError as exc:
+                raise LMStudioError(
+                    f"Could not connect to LM Studio at {self.base_url}"
+                ) from exc
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 400 and attempt == 0:
+                    continue
+                attempts = " after 2 attempts" if attempt else ""
+                raise LMStudioError(
+                    f"LM Studio returned HTTP {exc.response.status_code}{attempts}: "
+                    f"{exc.response.text}"
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise LMStudioError(f"LM Studio request failed: {exc}") from exc
 
+        assert response is not None
         return _extract_content(response.json())
 
     def list_models(self) -> list[str]:

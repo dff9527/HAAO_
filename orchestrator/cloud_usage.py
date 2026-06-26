@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 # Approximate Sonnet-class pricing for transparency (USD per million tokens).
 INPUT_COST_PER_MTOK = 3.0
 OUTPUT_COST_PER_MTOK = 15.0
+CostStatus = Literal["actual", "estimated", "unknown"]
+KNOWN_ESTIMATED_PRICING_PROVIDERS = {
+    "anthropic",
+    "openai",
+    "google",
+    "gemini",
+    "openrouter",
+    "together",
+    "fireworks",
+}
 
 
 @dataclass(frozen=True)
 class CloudUsage:
     input_tokens: int = 0
     output_tokens: int = 0
+    cost_status: CostStatus = "unknown"
 
     @property
     def total_tokens(self) -> int:
@@ -24,6 +36,7 @@ class CloudUsage:
         return CloudUsage(
             input_tokens=self.input_tokens + other.input_tokens,
             output_tokens=self.output_tokens + other.output_tokens,
+            cost_status=_combined_cost_status(self.cost_status, other.cost_status),
         )
 
 
@@ -33,6 +46,14 @@ def estimate_cost_usd(input_tokens: int, output_tokens: int) -> float:
         + (output_tokens / 1_000_000) * OUTPUT_COST_PER_MTOK,
         4,
     )
+
+
+def cost_status_for_provider(provider: str, usage: CloudUsage) -> CostStatus:
+    if usage.total_tokens <= 0:
+        return "unknown"
+    if usage.cost_status == "actual":
+        return "actual"
+    return "estimated" if provider.lower() in KNOWN_ESTIMATED_PRICING_PROVIDERS else "unknown"
 
 
 def apply_usage_to_requirement(requirement, usage: CloudUsage):
@@ -55,4 +76,10 @@ def usage_from_api_payload(payload: dict) -> CloudUsage:
         return CloudUsage()
     input_tokens = int(usage.get("input_tokens") or 0)
     output_tokens = int(usage.get("output_tokens") or 0)
-    return CloudUsage(input_tokens=input_tokens, output_tokens=output_tokens)
+    status: CostStatus = "estimated" if input_tokens or output_tokens else "unknown"
+    return CloudUsage(input_tokens=input_tokens, output_tokens=output_tokens, cost_status=status)
+
+
+def _combined_cost_status(left: CostStatus, right: CostStatus) -> CostStatus:
+    order = {"unknown": 0, "estimated": 1, "actual": 2}
+    return left if order[left] >= order[right] else right

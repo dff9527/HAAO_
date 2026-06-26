@@ -12,8 +12,19 @@ class Settings(BaseSettings):
         default="http://localhost:1234/v1",
         alias="LMSTUDIO_BASE_URL",
     )
+    local_max_output_tokens: int = Field(
+        default=4096,
+        ge=1,
+        alias="LOCAL_MAX_OUTPUT_TOKENS",
+    )
+    local_patch_mode_threshold_tokens: int = Field(
+        default=2048,
+        ge=1,
+        alias="LOCAL_PATCH_MODE_THRESHOLD_TOKENS",
+    )
     database_url: str = Field(default="sqlite:///./haao.sqlite3", alias="DATABASE_URL")
     claude_model: str = Field(default="claude-sonnet-4-6", alias="CLAUDE_MODEL")
+    haao_api_token: str = Field(default="", alias="HAAO_API_TOKEN")
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

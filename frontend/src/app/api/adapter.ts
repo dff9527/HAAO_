@@ -118,6 +118,8 @@ export function toUiTicket(ticket: BackendTicket, projectName?: string): Ticket 
     gitMergedTo: typeof ticket.metadata?.git_merged_to === 'string' ? ticket.metadata.git_merged_to : undefined,
     gitMergeCommit: typeof ticket.metadata?.git_merge_commit === 'string' ? ticket.metadata.git_merge_commit : undefined,
     gitRevertCommit: typeof ticket.metadata?.git_revert_commit === 'string' ? ticket.metadata.git_revert_commit : undefined,
+    prUrl: typeof ticket.metadata?.pr_url === 'string' ? ticket.metadata.pr_url : undefined,
+    prStatus: typeof ticket.metadata?.pr_status === 'string' ? ticket.metadata.pr_status : undefined,
     lastInterventionNotification: toInterventionNotification(ticket.metadata),
   };
 }
@@ -185,7 +187,7 @@ export function roleRoutingToRoutes(routing: BackendRoleRouting): RoleRoute[] {
   const devChain = devTeamChainFromRouting(routing);
   return [
     {
-      id: 'po',
+      id: 'tech_lead',
       role: 'Tech Lead (decompose + technical audit)',
       note: 'high-level reasoning, cloud only',
       model: toAssignedModel(routing.tech_lead),
@@ -220,7 +222,7 @@ export function routesToRoleRouting(routes: RoleRoute[], devTeamChain?: string[]
     .filter(Boolean);
   const devTeam = chain.length > 1 ? chain : (chain[0] ?? normalize(byId.get('dev') ?? 'qwen3-coder-next'));
   return {
-    tech_lead: normalize(byId.get('po') ?? 'Claude · Tech Lead'),
+    tech_lead: normalize(byId.get('tech_lead') ?? 'Claude · Tech Lead'),
     dev_team: devTeam,
     gatekeeper: normalize(byId.get('gatekeeper') ?? 'gemma-4-26b-a4b'),
     escalation_target: normalize(byId.get('escalation') ?? 'Claude · Tech Lead'),

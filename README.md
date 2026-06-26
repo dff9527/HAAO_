@@ -6,16 +6,10 @@
   </picture>
 </p>
 <p align="center"><b>Hybrid AI-Agile Orchestrator</b></p>
-<p align="center">Run AI coding agents like a Scrum team — you stay the Product Owner, a cloud model is the Tech Lead, and local LLMs do the work.</p>
+<p align="center">Talk to an agent about what you want built. It files the work, a hybrid AI team delivers it, you watch every step, and it ships as a pull request — you stay the Product Owner.</p>
 <p align="center">
-  <b>▶ Live demo:</b> <a href="https://haao-demo.pages.dev">haao-demo.pages.dev</a>
-  &nbsp;·&nbsp; <i>interactive simulation — no live model calls</i>
+  <code>python · fastapi · react · LM Studio · cloud LLMs (Anthropic / OpenAI / …)</code>
 </p>
-<p align="center">
-  <code>status: working end-to-end prototype · controlled pilot complete</code> ·
-  <code>python · fastapi · react · LM Studio · Claude</code>
-</p>
-
 <p align="center">
   <b>New here?</b> &nbsp;
   Non-technical operator → <a href="./OPERATOR_GUIDE.md">Operator's guide</a> &nbsp;·&nbsp;
@@ -29,94 +23,110 @@
 Two ways of pointing LLMs at a codebase, two failure modes:
 
 - **Pure cloud agents** (Devin-style): strong reasoning, but expensive at scale, raise privacy concerns, and drift on large projects.
-- **Pure local models**: fast, private, cheap — but a 3–4B-active MoE can't hold architecture in its head or make sound high-level calls.
+- **Pure local models**: fast, private, cheap — but a small MoE can't hold architecture in its head or make sound high-level calls.
 
-HAAO splits the difference. It treats software delivery as a **Scrum process with a hybrid AI workforce**: a cloud model handles the thinking that needs depth, local models handle the high-frequency implementation, and a human owns the direction and the sign-off. The orchestrator runs the process so the human doesn't have to babysit a ticket queue.
+And a third problem with "vibe coding" against any agent: **you can't see what it intends to do, what it's doing now, or what it hasn't finished.** It's a black box.
+
+HAAO answers both. It runs software delivery as a **Scrum process with a hybrid AI workforce** — a cloud model does the thinking that needs depth, local models do the high-frequency implementation, and a human owns direction and sign-off — and it makes the whole thing **legible**: a live board, a run-event stream, and an agent that reports back.
+
+## How you use it
+
+1. **Chat.** Tell the orchestrator agent what you want, in plain language. It restates what it heard and files it as **proposals in the backlog** — it never silently creates tickets.
+2. **Approve.** You approve the backlog (Gate 1). Approved work starts automatically.
+3. **Watch.** The hybrid team executes; the agent reports `done` / `blocked` back to you, and every step streams to the board and the Activity log.
+4. **Accept & ship.** You accept the result (Gate 2); on accept, HAAO opens a **pull request** to your GitHub/GitLab.
 
 ## The core idea: roles, assigned where they belong
 
 | Scrum role | Who | Responsibility |
 |---|---|---|
 | **Product Owner** | **You (human)** | Define requirements, prioritize, **approve the backlog, accept the result**. Accountability and taste stay human. |
-| **Tech Lead / Architect** | Cloud model (Claude) | Decompose requirements into atomic tickets, write machine-verifiable DoD, run technical audit. |
+| **Tech Lead / Architect** | Cloud model | Decompose requirements into atomic tickets, write machine-verifiable DoD, run the technical audit. |
 | **Scrum Master** | The orchestrator (software) | Dispatch, route, enforce WIP, retry, escalate, move tickets — **automated**. |
-| **Dev team** | Local LLMs (via LM Studio) | Read context, write code, run tests, report back. |
+| **Dev team** | Local LLMs (via LM Studio) — or cloud, your choice | Read context, write code, run tests, report back. |
 
-The non-obvious design choice: the **human is the PO, not the Scrum Master**. Process mechanics (the Scrum Master's job) are exactly what should be automated; product judgment (the PO's job) is exactly what shouldn't. Putting the human on the board's manual controls would trap them in the lowest-leverage work.
+The non-obvious choice: the **human is the PO, not the Scrum Master**. Process mechanics should be automated; product judgment shouldn't.
 
-## What's actually novel here
+## What's in the box
 
-- **The Atomic Ticket is a machine contract.** A [JSON-Schema-defined ticket](./atomic_ticket.schema.json) is the handover format between the cloud Tech Lead and a local coder. It is self-contained (relevant code is **injected**, not referenced by filename), and its Definition of Done is **machine-verifiable** (test commands, static checks) so completion isn't a matter of opinion.
-- **Hybrid cost routing.** Work stays local by default. A retry budget governs self-correction; only when local attempts are exhausted does the ticket escalate to the cloud. Cheap, machine checks gate the expensive cloud audit — so you don't pay a frontier model to read every diff.
-- **Two human gates, nothing in between.** The PO approves a decomposed backlog (front) and accepts finished work (tail). Everything else is automatic.
-- **Transparency by default.** Every agent action streams to a Kanban board with a live log. Unlike a black-box autonomous agent, you can watch what each model is doing and why.
+- **Conversational intake.** A chat agent (cloud or local) turns a conversation into backlog proposals and reports progress back — the agent is your single point of contact.
+- **The Atomic Ticket is a machine contract.** A [JSON-Schema ticket](./atomic_ticket.schema.json) is the handover format between the cloud Tech Lead and a coder: self-contained (code is **injected**, not referenced) with a **machine-verifiable** Definition of Done.
+- **Hybrid cost routing, made visible.** Work stays local by default; a retry budget governs self-correction; only exhausted tickets escalate to cloud. Cost is tracked per ticket with an honest `actual / estimated / unknown` status — no false precision.
+- **Bring any model.** Register multiple cloud providers (Anthropic / OpenAI / OpenRouter / …) with encrypted keys, or run everything local. Assign a specific model per role; discover a provider's models from your key.
+- **Ships real work.** On accept, opens a branch + PR (least-privilege, idempotent) to GitHub/GitLab.
+- **Observability built in.** **Activity** (live run-event stream: model calls, diffs, retries, escalations, cost), **Insights** (throughput, cycle time, escalation rate, local-vs-cloud mix, cost dashboard, per-model scorecards), **Inbox** (cross-project needs-you / done / blocked).
+- **Two human gates, nothing in between.** Approve the backlog (front), accept the result (tail). Everything else is automatic.
+
+## Security
+
+HAAO executes AI-written code and holds model/git credentials, so safety is first-class:
+
+- **Sandboxed execution** — DoD/test commands run network-disabled with a scoped environment by default; outbound attempts are audited.
+- **Encrypted secrets at rest** — cloud keys and integration tokens are AES-GCM encrypted (master secret from `HAAO_SECRET_KEY`).
+- **Prompt-injection aware** — repo/attachment content is wrapped as untrusted; the models are told to treat it as data, not instructions.
+- **Secret redaction** — keys/tokens are scrubbed from logs, run events, and streams.
+- **Optional API auth** — set `HAAO_API_TOKEN` to require a bearer token on every route (HTTP + WebSocket).
 
 ## Architecture
 
 ```
         You (Product Owner)
-   write prompt │           │ approve / accept
-                ▼           ▲
+   chat / approve │        │ accept → PR
+                  ▼        ▲
         ┌────────────────────────────────┐
-        │   Orchestrator (Scrum Master)  │  state machine · routing · retry · escalation
-        └───┬───────────┬───────────┬────┘
-            │ decompose │ dispatch  │ run tests
-            │ + audit   │           │
-        ┌───▼────┐  ┌───▼────────┐  ┌▼───────────────┐
-        │ Claude │  │ Local LLMs │  │ pytest/npm test│
-        │ (Tech  │  │ (LM Studio)│  │ (validation)   │
-        │  Lead) │  │  dev team  │  └────────────────┘
-        └────────┘  └────────────┘
+        │   Orchestrator (Scrum Master)  │  state machine · routing · retry · escalation · run-events
+        └─┬────────┬───────────┬─────────┬┘
+          │ decompose          │ run tests│ open PR
+          │ + audit  │ dispatch │ (sandbox)│
+        ┌─▼─────┐ ┌──▼───────┐ ┌▼────────┐ ┌▼──────────────┐
+        │ Cloud │ │ Local /  │ │ pytest /│ │ GitHub/GitLab │
+        │ Tech  │ │ cloud    │ │ npm test│ │ pull request  │
+        │ Lead  │ │ dev team │ └─────────┘ └───────────────┘
+        └───────┘ └──────────┘
 ```
-
-## The loop
-
-1. **Prompt** — the PO writes a requirement; the Tech Lead decomposes it into atomic tickets; the PO reviews and approves (Gate 1).
-2. **Execute** — the orchestrator dispatches each ticket to its assigned local model, which writes code and runs the ticket's tests.
-3. **Self-correct** — on failure, the worker retries within budget; if exhausted, it escalates to the Tech Lead.
-4. **Audit** — the Tech Lead checks the diff against the DoD (technical audit, automatic).
-5. **Accept** — the PO accepts or rejects with feedback (Gate 2).
-
-## Status & honest scope
-
-Working end-to-end prototype, built to validate **one hypothesis**: *can a local coder model one-shot the atomic tickets a cloud model produces?* The full loop runs (decompose → Gate 1 → execute + test → audit → Gate 2 → done), and a **controlled pilot** has been completed on a seeded sandbox. *Honest scope:* the pilot is small-n on curated tasks — an early positive signal, **not a benchmark**. The prototype is deliberately single-project, single-worker, single-file-plus-one-test tickets; scaling out a model fleet or multi-project support is intentionally deferred until the one-shot number holds on real repos.
-
-## Roadmap
-
-- [x] End-to-end loop on one project, with a measured one-shot success rate (controlled pilot, small-n)
-- [ ] Hybrid cost benchmark: local vs. cloud, cost per accepted ticket, on consumer hardware
-- [x] Prompt/requirement composer with decomposition preview
-- [ ] Ticket dependency graph + parallel workers
-- [ ] Conflict handling for concurrent edits
 
 ## Getting started
 
+### Docker (recommended)
+
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
+cp .env.example .env          # set CLAUDE_API_KEY / model keys as needed
+docker compose up --build
 ```
 
-Set `CLAUDE_API_KEY` when Claude Tech Lead decomposition / technical audit is enabled, and point `LMSTUDIO_BASE_URL` at your local LM Studio server.
+Open <http://localhost:3001> (API at <http://localhost:8000/health>). On macOS/Windows the backend reaches a local LM Studio via `host.docker.internal`. To use cloud models or PR output you'll set keys in Settings — note that adding encrypted cloud keys requires `HAAO_SECRET_KEY` in `.env` (generate with `openssl rand -base64 32`).
 
-Run and health-check:
+### Local (dev)
 
 ```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
 uvicorn orchestrator.main:app --reload
-curl http://127.0.0.1:8000/health
+# frontend: cd frontend && npm install && npm run dev
 pytest
 ```
 
+## Roadmap
+
+- [x] End-to-end loop (decompose → approve → execute + test → audit → accept)
+- [x] Conversational agent intake (chat → backlog proposals + progress reports)
+- [x] Multi-provider cloud model registry + per-role assignment, local or cloud execution
+- [x] PR delivery to GitHub/GitLab on accept
+- [x] Observability: Activity / Insights / Inbox
+- [x] Security: sandboxed execution, encrypted secrets, prompt-injection wrapping, optional auth
+- [ ] Hosted control plane (split-plane: vendor hosts coordination, execution stays client-side)
+- [ ] In-product model eval harness expansion
+
 ## Design notes
 
-The reasoning behind the architecture — why Scrum roles map this way, why the ticket is a contract, and how the hybrid routing works — is written up here: [**design article**](./HAAO_technical_article.md). If you're operating HAAO rather than building it (PM / non-engineering background), start with the plain-language [**operator's guide**](./OPERATOR_GUIDE.md).
+The reasoning behind the architecture — why Scrum roles map this way, why the ticket is a contract, how hybrid routing works — is written up in the [**design article**](./HAAO_technical_article.md). Operating it rather than building it? Start with the [**operator's guide**](./OPERATOR_GUIDE.md).
 
-> A note on how this was built: HAAO is developed with heavy AI assistance (local + cloud agents — it eats its own dog food). The parts that are mine are the architecture, the role model, the ticket-as-contract design, and the cost-routing strategy. The implementation is delegated; the judgment isn't.
+> How this was built: HAAO is developed with heavy AI assistance (local + cloud agents — it eats its own dog food). The architecture, the role model, the ticket-as-contract design, and the cost-routing strategy are the human's; the implementation is delegated. The judgment isn't.
 
 ## Tech stack
 
-Python · FastAPI · SQLite · React · Tailwind · LM Studio (local inference) · Claude API (cloud).
+Python · FastAPI · SQLite · React · Tailwind · LM Studio (local inference) · cloud LLM APIs.
 
 ## License
 

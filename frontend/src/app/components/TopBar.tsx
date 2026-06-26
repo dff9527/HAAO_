@@ -1,6 +1,6 @@
-import { Moon, Sun } from 'lucide-react';
+import { Moon, Sun, HelpCircle } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
 import type { Project } from '../types';
-import { AddWorkMenu } from './AddWorkMenu';
 import { ProjectSwitcher } from './ProjectSwitcher';
 import brandLogoUrl from '@/assets/frame.png';
 import brandLogoLiteUrl from '@/assets/frame-lite.png';
@@ -8,9 +8,6 @@ import brandLogoLiteUrl from '@/assets/frame-lite.png';
 interface Props {
   darkMode: boolean;
   onToggleDark: () => void;
-  onNewReq: () => void;
-  onNewTicket: () => void;
-  showBoardControls: boolean;
   boardLive?: boolean;
   projects: Project[];
   selectedProjectId: string;
@@ -26,14 +23,12 @@ interface Props {
       defaultBranch: string;
     },
   ) => Promise<void>;
+  onOpenSetupWizard?: () => void;
 }
 
 export function TopBar({
   darkMode,
   onToggleDark,
-  onNewReq,
-  onNewTicket,
-  showBoardControls,
   boardLive = false,
   projects,
   selectedProjectId,
@@ -41,7 +36,20 @@ export function TopBar({
   onCreateProject,
   onDeleteProject,
   onUpdateProjectSettings,
+  onOpenSetupWizard,
 }: Props) {
+  const [helpOpen, setHelpOpen] = useState(false);
+  const helpRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!helpOpen) return;
+    function onPointerDown(event: MouseEvent) {
+      if (!helpRef.current?.contains(event.target as Node)) setHelpOpen(false);
+    }
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [helpOpen]);
+
   return (
     <header className="relative h-14 flex items-center justify-between px-3 sm:px-4 border-b border-border bg-card shrink-0 gap-2 min-w-0">
       <div className="flex items-center gap-2 min-w-0 z-10 max-w-[42%] sm:max-w-[45%]">
@@ -72,6 +80,33 @@ export function TopBar({
       </div>
 
       <div className="flex items-center gap-1.5 shrink-0 z-10">
+        {onOpenSetupWizard && (
+          <div ref={helpRef} className="relative">
+            <button
+              type="button"
+              onClick={() => setHelpOpen((value) => !value)}
+              className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              aria-label="Help and setup"
+              aria-expanded={helpOpen}
+            >
+              <HelpCircle size={14} />
+            </button>
+            {helpOpen && (
+              <div className="absolute right-0 top-[calc(100%+4px)] z-50 w-52 rounded-lg border border-border bg-card p-1 shadow-xl">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setHelpOpen(false);
+                    onOpenSetupWizard();
+                  }}
+                  className="w-full rounded-md px-3 py-2 text-left text-xs hover:bg-muted transition-colors"
+                >
+                  Setup wizard
+                </button>
+              </div>
+            )}
+          </div>
+        )}
         <button
           type="button"
           onClick={onToggleDark}
@@ -80,10 +115,6 @@ export function TopBar({
         >
           {darkMode ? <Sun size={14} /> : <Moon size={14} />}
         </button>
-
-        {showBoardControls && (
-          <AddWorkMenu onNewRequirement={onNewReq} onNewTicket={onNewTicket} />
-        )}
       </div>
     </header>
   );

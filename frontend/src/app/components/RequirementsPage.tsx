@@ -1,5 +1,5 @@
 import { Sparkles, Plus, Cloud, ChevronRight } from 'lucide-react';
-import { getModelMeta } from '../constants';
+import { formatCloudCost, getModelMeta } from '../constants';
 import type { RequirementSource, Ticket } from '../types';
 
 interface Props {
@@ -7,11 +7,6 @@ interface Props {
   tickets: Ticket[];
   onOpenRequirement: (id: string) => void;
   onNewRequirement: () => void;
-}
-
-function formatCloudCost(usd?: number) {
-  if (usd === undefined || usd <= 0) return null;
-  return `$${usd.toFixed(4)}`;
 }
 
 export function RequirementsPage({ requirements, tickets, onOpenRequirement, onNewRequirement }: Props) {

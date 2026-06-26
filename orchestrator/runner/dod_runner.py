@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Literal
 
 from orchestrator.models.ticket import TestCommand, Ticket
+from orchestrator.policies import ExecutionPolicy
+from orchestrator.runner.sandbox import SandboxAuditSink, run_with_policy
 
 ALLOWED_EXECUTABLES = frozenset(
     {
@@ -45,6 +47,8 @@ class TestRunResult:
     stderr: str
     timed_out: bool = False
     return_code: int | None = None
+    sandbox_primitive: str | None = None
+    network_disabled: bool = False
 
 
 class TestRunner:
@@ -61,6 +65,8 @@ class TestRunner:
         cleanup_cmd: str = "",
         setup_timeout_sec: int = 120,
         cleanup_timeout_sec: int = 120,
+        execution_policy: ExecutionPolicy | None = None,
+        audit_sink: SandboxAuditSink | None = None,
     ) -> None:
         self.cwd = Path(cwd).resolve() if cwd is not None else None
         self.env = dict(env or {})
@@ -68,6 +74,8 @@ class TestRunner:
         self.cleanup_cmd = cleanup_cmd.strip()
         self.setup_timeout_sec = setup_timeout_sec
         self.cleanup_timeout_sec = cleanup_timeout_sec
+        self.execution_policy = execution_policy or ExecutionPolicy()
+        self.audit_sink = audit_sink
 
     def run_ticket_tests(self, ticket: Ticket) -> list[TestRunResult]:
         results: list[TestRunResult] = []
@@ -106,15 +114,16 @@ class TestRunner:
         timeout_sec: int = 120,
     ) -> TestRunResult:
         argv = normalize_command(parse_command(command))
-        completed = subprocess.run(
+        sandbox_result = run_with_policy(
             argv,
             cwd=self.cwd,
-            env=_subprocess_env(self.env),
-            capture_output=True,
-            text=True,
+            env=_subprocess_env(self.env, self.execution_policy.env_allowlist),
             timeout=timeout_sec,
-            shell=False,
+            command=command,
+            policy=self.execution_policy,
+            audit_sink=self.audit_sink,
         )
+        completed = sandbox_result.completed
         actual_status: Literal["pass", "fail"] = (
             "pass" if completed.returncode == 0 else "fail"
         )
@@ -129,6 +138,8 @@ class TestRunner:
             stderr=completed.stderr,
             timed_out=False,
             return_code=completed.returncode,
+            sandbox_primitive=sandbox_result.primitive,
+            network_disabled=sandbox_result.network_disabled,
         )
 
     def run_test_safe(self, test: TestCommand) -> TestRunResult:
@@ -162,6 +173,8 @@ class TestRunner:
                 stderr=stderr or f"Command timed out after {timeout_sec}s",
                 timed_out=True,
                 return_code=None,
+                sandbox_primitive=None,
+                network_disabled=not self.execution_policy.test_allow_network,
             )
 
     def _cleanup_result(self) -> TestRunResult | None:
@@ -214,13 +227,19 @@ def normalize_command(argv: list[str]) -> list[str]:
     return argv
 
 
-def _subprocess_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
-    env = dict(os.environ)
+def _subprocess_env(
+    extra_env: dict[str, str] | None = None,
+    allowlist: tuple[str, ...] | list[str] | None = None,
+) -> dict[str, str]:
+    allowed = {str(item) for item in (allowlist or ()) if str(item).strip()}
+    env = {key: value for key, value in os.environ.items() if key in allowed}
     for key, value in (extra_env or {}).items():
-        env[str(key)] = str(value)
+        if str(key) in allowed:
+            env[str(key)] = str(value)
     executable_dir = str(Path(sys.executable).resolve().parent)
     current_path = env.get("PATH", "")
-    env["PATH"] = (
-        executable_dir if not current_path else os.pathsep.join([executable_dir, current_path])
-    )
+    if "PATH" in allowed:
+        env["PATH"] = (
+            executable_dir if not current_path else os.pathsep.join([executable_dir, current_path])
+        )
     return env

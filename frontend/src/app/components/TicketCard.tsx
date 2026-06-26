@@ -7,6 +7,7 @@ import {
 import { getModelMeta, MANUAL_STATUS_TRANSITIONS, TYPE_CLASSES } from '../constants';
 import { STATE_COPY } from '../copy';
 import { InterventionNotice, interventionNoticeForTicket } from './InterventionNotice';
+import { PrLinkBadge } from './PrLinkBadge';
 import type { Ticket } from '../types';
 
 const PRIORITY_DOT: Record<string, string> = {
@@ -198,6 +199,14 @@ export function TicketCard({ ticket, isSelected, onClick, onApprove, onAccept }:
         </span>
 
         <div className="flex items-center gap-2 ml-auto shrink-0">
+          {ticket.prUrl && (
+            <PrLinkBadge
+              prUrl={ticket.prUrl}
+              prStatus={ticket.prStatus}
+              compact
+              onClick={(event) => event.stopPropagation()}
+            />
+          )}
           {ticket.autoEscalated && (
             <span className="text-[10px] text-amber-600 dark:text-amber-400 font-mono" title="Auto-escalated by HAAO">
               ↑ escalated

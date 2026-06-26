@@ -114,13 +114,19 @@ def test_b012_tickets_rest_api_and_manual_move(tmp_path, fresh_ticket_dict) -> N
 
 
 def test_product_owner_gate_endpoints_and_role_routing(tmp_path, fresh_ticket_dict) -> None:
-    repository = TicketRepository(connect(tmp_path / "haao.sqlite3"))
+    connection = connect(tmp_path / "haao.sqlite3")
+    repository = TicketRepository(connection)
+    settings_repository = SettingsRepository(connection)
     repository.create(make_api_ticket(fresh_ticket_dict))
 
     def override_repository():
         return repository
 
+    def override_settings_repository():
+        return settings_repository
+
     app.dependency_overrides[get_repository] = override_repository
+    app.dependency_overrides[get_settings_repository] = override_settings_repository
     try:
         client = TestClient(app)
 
@@ -418,6 +424,9 @@ def test_b038_project_settings_endpoint_updates_env_setup_and_cleanup(tmp_path) 
             f"/projects/{project.id}/settings",
             json={
                 "env": {"HAAO_FLAG": "ok"},
+                "env_allowlist": ["PATH", "PYTHONPATH", "HAAO_FLAG"],
+                "test_allow_network": True,
+                "sandbox_mode": "none",
                 "setup_cmd": "python -c \"print('setup')\"",
                 "cleanup_cmd": "python -c \"print('cleanup')\"",
                 "default_branch": "develop",
@@ -426,6 +435,9 @@ def test_b038_project_settings_endpoint_updates_env_setup_and_cleanup(tmp_path) 
         assert response.status_code == 200
         body = response.json()["project"]
         assert body["env"] == {"HAAO_FLAG": "ok"}
+        assert body["env_allowlist"] == ["PATH", "PYTHONPATH", "HAAO_FLAG"]
+        assert body["test_allow_network"] is True
+        assert body["sandbox_mode"] == "none"
         assert body["setup_cmd"] == "python -c \"print('setup')\""
         assert body["cleanup_cmd"] == "python -c \"print('cleanup')\""
         assert body["default_branch"] == "develop"
@@ -571,3 +583,4 @@ def test_b020_auto_worker_status_endpoint() -> None:
 
     assert response.status_code == 200
     assert response.json()["running"] is False
+    assert response.json()["last_skipped_reason"] == ""

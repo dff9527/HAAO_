@@ -1,8 +1,10 @@
 import { useRef, useState } from 'react';
 import { useDrop } from 'react-dnd';
 import { TicketCard } from './TicketCard';
+import { HelpTip } from './HelpTip';
 import { canManuallyMoveTicket, MANUAL_DROP_HINT } from '../constants';
 import { STATE_COPY } from '../copy';
+import { HELP_TOOLTIPS } from '../dxUtils';
 import type { Ticket, TicketStatus } from '../types';
 
 interface Props {
@@ -147,8 +149,14 @@ export function KanbanColumn({
     >
       <div className="flex shrink-0 items-start justify-between px-3 py-2.5 border-b border-border">
         <div className="min-w-0 pr-2">
-          <span className={`text-xs font-semibold uppercase tracking-wider ${COLUMN_HEADER[status]}`}>
+          <span className={`inline-flex items-center gap-1 text-xs font-semibold uppercase tracking-wider ${COLUMN_HEADER[status]}`}>
             {COLUMN_LABEL[status]}
+            {status === 'Backlog' && (
+              <HelpTip text={HELP_TOOLTIPS.backlog_proposal} label="Backlog proposals help" />
+            )}
+            {status === 'Ready' && (
+              <HelpTip text={HELP_TOOLTIPS.ready_column} label="Ready column help" />
+            )}
           </span>
           {sublabel && (
             <p className="text-[11px] text-muted-foreground/70 mt-0.5 font-normal normal-case tracking-normal leading-snug">

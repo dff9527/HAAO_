@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from orchestrator.context.retrieval import retrieve_related_context
+from orchestrator.context.untrusted import wrap_untrusted_context
 from orchestrator.models.ticket import Context, ContextFile, Ticket
+from orchestrator.redaction import redact_text
 
 DEFAULT_MAX_TOKENS = 8000
 CHARS_PER_TOKEN_ESTIMATE = 4
@@ -19,6 +21,7 @@ class ContextInjector:
     def inject(self, ticket: Ticket) -> Ticket:
         context_files: list[ContextFile] = []
         remaining_tokens = self.max_tokens
+        used_tokens = 0
 
         for relative_path in ticket.task.target_files:
             file_path = self._resolve_repo_path(relative_path)
@@ -36,12 +39,13 @@ class ContextInjector:
             context_files.append(
                 ContextFile(
                     path=relative_path,
-                    content=content,
+                    content=wrap_untrusted_context(label=relative_path, content=redact_text(content)),
                     truncated=truncated,
                     reason=reason,
                 )
             )
             remaining_tokens = max(0, remaining_tokens - file_tokens)
+            used_tokens += file_tokens
 
         related_context = retrieve_related_context(self.repo_root, ticket.task.target_files)
         for related in related_context:
@@ -60,14 +64,15 @@ class ContextInjector:
             context_files.append(
                 ContextFile(
                     path=related.path,
-                    content=content,
+                    content=wrap_untrusted_context(label=related.path, content=redact_text(content)),
                     truncated=truncated,
                     reason=reason,
                 )
             )
             remaining_tokens = max(0, remaining_tokens - file_tokens)
+            used_tokens += file_tokens
 
-        token_estimate = sum(estimate_tokens(file.content) for file in context_files)
+        token_estimate = used_tokens
         related_symbols = list(ticket.context.related_symbols)
         for related in related_context:
             for symbol in related.symbols:

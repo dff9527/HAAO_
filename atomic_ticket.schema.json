@@ -38,7 +38,7 @@
     },
     "dependencies": {
       "type": "array",
-      "description": "Ticket ids that must reach 'done' before this one can start",
+      "description": "Ticket ids that must reach 'done' before this one can start. Dependencies with a Git branch must also be merged into their base branch so their code is available to dependent worktrees.",
       "items": { "type": "string", "pattern": "^T-[0-9]{3,}$" },
       "default": []
     },

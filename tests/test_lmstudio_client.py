@@ -18,6 +18,7 @@ def test_chat_completion_returns_content() -> None:
         payload = json.loads(request.content)
         assert payload["model"] == "qwen3-coder-next"
         assert payload["messages"][0]["content"] == "hello"
+        assert payload["max_tokens"] == 1024
         return httpx.Response(
             200,
             json={
@@ -37,6 +38,7 @@ def test_chat_completion_returns_content() -> None:
         model="qwen3-coder-next",
         messages=[ChatMessage(role="user", content="hello")],
         temperature=0.1,
+        max_tokens=1024,
     )
 
     assert content == "world"
@@ -65,6 +67,52 @@ def test_chat_completion_allows_endpoint_model_ids() -> None:
         model="user-owned-model",
         messages=[ChatMessage(role="user", content="hello")],
     ) == "ok"
+
+
+def test_chat_completion_retries_http_400_once() -> None:
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(400, text="context overflow")
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+        )
+
+    client = LMStudioClient(
+        "http://localhost:1234/v1",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.chat_completion(
+        model="qwen3-coder-next",
+        messages=[ChatMessage(role="user", content="hello")],
+    ) == "ok"
+    assert calls == 2
+
+
+def test_chat_completion_persistent_http_400_raises_after_retry() -> None:
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(400, text="context overflow")
+
+    client = LMStudioClient(
+        "http://localhost:1234/v1",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(LMStudioError, match="HTTP 400 after 2 attempts"):
+        client.chat_completion(
+            model="qwen3-coder-next",
+            messages=[ChatMessage(role="user", content="hello")],
+        )
+    assert calls == 2
 
 
 def test_list_models_returns_openai_compatible_ids() -> None:

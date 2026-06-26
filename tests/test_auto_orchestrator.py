@@ -178,6 +178,87 @@ def test_b020_auto_orchestrator_executes_in_progress_ticket(
     assert repository.get("T-900").status == "awaiting_acceptance"
 
 
+def test_auto_orchestrator_waits_for_done_and_merged_dependencies(
+    workspace_repo: Path,
+    fresh_ticket_dict: dict,
+) -> None:
+    (workspace_repo / "calc.py").write_text(
+        "def add_one(value):\n    return value\n",
+        encoding="utf-8",
+    )
+    init_git_repo(workspace_repo)
+    repository = TicketRepository(connect(workspace_repo.with_suffix(".sqlite3")))
+
+    dependency_payload = make_ticket(fresh_ticket_dict, status="done").to_dict()
+    dependency_payload["id"] = "T-899"
+    dependency_payload["metadata"] = {
+        "git_branch": "haao/T-899",
+        "git_base_branch": "main",
+    }
+    repository.create(Ticket.from_dict(dependency_payload))
+
+    dependent_payload = make_ticket(fresh_ticket_dict).to_dict()
+    dependent_payload["dependencies"] = ["T-899"]
+    repository.create(Ticket.from_dict(dependent_payload))
+    local_model = FakeLocalModel("def add_one(value):\n    return value + 1\n")
+    orchestrator = make_orchestrator(
+        workspace_repo,
+        repository,
+        local_model,
+        FakeTechLead(),
+    )
+
+    waiting = orchestrator.run_once()
+
+    assert waiting.idle is True
+    assert waiting.skipped_reason == "dependencies_pending"
+    assert waiting.waiting_ticket_ids == ["T-900"]
+    assert local_model.calls == 0
+
+    dependency = repository.get("T-899")
+    dependency_json = dependency.to_dict()
+    dependency_json["metadata"]["git_merge_commit"] = "a" * 40
+    repository.save(Ticket.from_dict(dependency_json))
+
+    executed = orchestrator.run_once()
+
+    assert executed.executed_ticket_ids == ["T-900"]
+    assert repository.get("T-900").status == "diff_pending"
+
+
+def test_auto_orchestrator_skips_blocked_dependency_and_runs_independent_ticket(
+    workspace_repo: Path,
+    fresh_ticket_dict: dict,
+) -> None:
+    (workspace_repo / "calc.py").write_text(
+        "def add_one(value):\n    return value\n",
+        encoding="utf-8",
+    )
+    init_git_repo(workspace_repo)
+    repository = TicketRepository(connect(workspace_repo.with_suffix(".sqlite3")))
+
+    waiting_payload = make_ticket(fresh_ticket_dict).to_dict()
+    waiting_payload["id"] = "T-899"
+    waiting_payload["dependencies"] = ["T-777"]
+    repository.create(Ticket.from_dict(waiting_payload))
+
+    independent_payload = make_ticket(fresh_ticket_dict).to_dict()
+    independent_payload["id"] = "T-900"
+    repository.create(Ticket.from_dict(independent_payload))
+    local_model = FakeLocalModel("def add_one(value):\n    return value + 1\n")
+    orchestrator = make_orchestrator(
+        workspace_repo,
+        repository,
+        local_model,
+        FakeTechLead(),
+    )
+
+    result = orchestrator.run_once()
+
+    assert result.executed_ticket_ids == ["T-900"]
+    assert repository.get("T-899").status == "ready"
+
+
 def test_b045_auto_orchestrator_recovers_testing_orphan_before_execution(
     workspace_repo: Path,
     fresh_ticket_dict: dict,

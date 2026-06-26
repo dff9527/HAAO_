@@ -10,8 +10,10 @@ import httpx
 
 from orchestrator.cloud_usage import CloudUsage
 from orchestrator.models.ticket import Ticket, validate_ticket_schema
+from orchestrator.redaction import redact_text
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+DECOMPOSE_JSON_RETRIES = 2
 
 
 class CloudReasonerError(RuntimeError):
@@ -136,9 +138,23 @@ class BaseCloudReasoner:
             repo_conventions=repo_conventions.strip() or "(no repository conventions detected)",
             priority=priority,
         )
-        prompt = apply_additional_instructions(prompt, additional_instructions)
+        prompt = redact_text(apply_additional_instructions(prompt, additional_instructions))
         raw_response = self._complete(prompt)
-        tickets = self._parse_json_payload(raw_response)
+        for retry_number in range(DECOMPOSE_JSON_RETRIES + 1):
+            try:
+                tickets = self._parse_json_payload(raw_response)
+                break
+            except self.error_cls:
+                if retry_number == DECOMPOSE_JSON_RETRIES:
+                    raise
+                repair_prompt = (
+                    prompt
+                    + "\n\nYour previous response was not valid JSON. "
+                    "Return ONLY the valid JSON array of tickets, with no markdown "
+                    "or commentary.\n"
+                    f"Previous response:\n{redact_text(raw_response[:2000])}"
+                )
+                raw_response = self._complete(repair_prompt)
 
         if not isinstance(tickets, list):
             raise self.error_cls("Decompose response must be a JSON array of tickets")
@@ -165,7 +181,7 @@ class BaseCloudReasoner:
             ticket_json=json.dumps(ticket_json, ensure_ascii=False, indent=2),
             diff=diff.strip() or "(empty diff)",
         )
-        prompt = apply_additional_instructions(prompt, additional_instructions)
+        prompt = redact_text(apply_additional_instructions(prompt, additional_instructions))
         raw_response = self._complete(prompt)
         try:
             payload = self._parse_json_payload(raw_response)
@@ -174,7 +190,7 @@ class BaseCloudReasoner:
                 prompt
                 + "\n\nYour previous response was not valid JSON. "
                 "Return ONLY the valid JSON object for the audit result, with no markdown or commentary.\n"
-                f"Previous response:\n{raw_response[:2000]}"
+                f"Previous response:\n{redact_text(raw_response[:2000])}"
             )
             raw_response = self._complete(repair_prompt)
             payload = self._parse_json_payload(raw_response)

@@ -78,6 +78,8 @@ class CrashRecoveryService:
         metadata = ticket.metadata.model_dump(mode="json") if ticket.metadata else {}
         if metadata.get("orphan_recovered_from") == TicketStatus.IN_PROGRESS.value:
             return False
+        if metadata.get("orphan_recovery_reason") == "worker_restart_without_registered_execution":
+            return False
 
         ticket_json = ticket.to_dict()
         metadata = ticket_json.setdefault("metadata", {})

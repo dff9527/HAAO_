@@ -18,7 +18,7 @@ class RequirementStatus(StrEnum):
 class RequirementAttachment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    type: Literal["path", "error_log", "figma", "url", "note"] = "note"
+    type: Literal["path", "error_log", "figma", "url", "note", "file", "image"] = "note"
     value: str
 
 

@@ -8,7 +8,19 @@ import type {
   BackendRoleRouting,
   BackendTicket,
   BackendTicketStatus,
+  RunEvent,
+  InsightsPayload,
+  InsightsRange,
+  InboxNotification,
+  InboxNotificationsResponse,
+  EvalRun,
+  EvalTaskSet,
+  RequirementTemplate,
+  DemoSeedResult,
+  RequirementShareSummary,
 } from './types';
+import type { ChatAttachment, ChatMessage, ChatSegment, CloudModel } from '../types';
+import { getStoredApiToken, promptForApiToken, setStoredApiToken } from './authToken';
 
 const API_PREFIX = '/api';
 
@@ -24,6 +36,18 @@ export interface CloudReasonerConfig {
   providers: CloudReasonerProvider[];
 }
 
+export type IntegrationProvider = 'github' | 'gitlab' | 'slack';
+
+export interface IntegrationCredential {
+  provider: IntegrationProvider;
+  id: string;
+  label: string;
+  scopes: string[];
+  configured: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface AutoWorkerStatus {
   running: boolean;
   interval_sec: number;
@@ -32,6 +56,7 @@ export interface AutoWorkerStatus {
   last_started_at: string | null;
   last_run_at: string | null;
   last_error: string;
+  last_skipped_reason: string;
   project_id: string | null;
 }
 
@@ -66,14 +91,81 @@ async function responseErrorMessage(response: Response): Promise<string> {
   return body;
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+function authHeaders(extra?: HeadersInit): HeadersInit {
+  const headers: Record<string, string> = {};
+  const token = getStoredApiToken();
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  if (extra) {
+    if (extra instanceof Headers) {
+      extra.forEach((value, key) => {
+        headers[key] = value;
+      });
+    } else if (Array.isArray(extra)) {
+      for (const [key, value] of extra) {
+        headers[key] = value;
+      }
+    } else {
+      Object.assign(headers, extra);
+    }
+  }
+  return headers;
+}
+
+async function handleUnauthorized<T>(
+  message: string,
+  retried: boolean,
+  retry: () => Promise<T>,
+): Promise<T | null> {
+  if (retried) {
+    return null;
+  }
+  const token = await promptForApiToken(message);
+  if (!token) {
+    return null;
+  }
+  setStoredApiToken(token);
+  return retry();
+}
+
+async function uploadRequest<T>(path: string, body: FormData, retried = false): Promise<T> {
   const response = await fetch(`${API_PREFIX}${path}`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body,
+  });
+  if (response.status === 401) {
+    const message = await responseErrorMessage(response);
+    const retry = await handleUnauthorized(message, retried, () => uploadRequest<T>(path, body, true));
+    if (retry !== null) {
+      return retry;
+    }
+    throw new ApiError(401, message);
+  }
+  if (!response.ok) {
+    throw new ApiError(response.status, await responseErrorMessage(response));
+  }
+  return (await response.json()) as T;
+}
+
+async function request<T>(path: string, init?: RequestInit, retried = false): Promise<T> {
+  const response = await fetch(`${API_PREFIX}${path}`, {
+    ...init,
     headers: {
       'Content-Type': 'application/json',
-      ...(init?.headers ?? {}),
+      ...authHeaders(init?.headers),
     },
-    ...init,
   });
+
+  if (response.status === 401) {
+    const message = await responseErrorMessage(response);
+    const retry = await handleUnauthorized(message, retried, () => request<T>(path, init, true));
+    if (retry !== null) {
+      return retry;
+    }
+    throw new ApiError(401, message);
+  }
 
   if (!response.ok) {
     throw new ApiError(response.status, await responseErrorMessage(response));
@@ -107,6 +199,9 @@ export const apiClient = {
     projectId: string,
     payload: {
       env?: Record<string, string>;
+      env_allowlist?: string[];
+      test_allow_network?: boolean;
+      sandbox_mode?: 'auto' | 'docker' | 'unshare' | 'none';
       setup_cmd?: string;
       cleanup_cmd?: string;
       default_branch?: string;
@@ -373,8 +468,270 @@ export const apiClient = {
   stopWorker: async (): Promise<AutoWorkerStatus> =>
     request('/orchestrator/worker/stop', { method: 'POST' }),
 
+  uploadChatAttachment: async (projectId: string, file: File): Promise<ChatAttachment> => {
+    const body = new FormData();
+    body.append('project_id', projectId);
+    body.append('file', file);
+    return uploadRequest<ChatAttachment>('/chat/attachments', body);
+  },
+
+  chatAttachmentContentUrl: (attachmentId: string, projectId: string): string =>
+    `${API_PREFIX}/chat/attachments/${encodeURIComponent(attachmentId)}/content?project_id=${encodeURIComponent(projectId)}`,
+
+  sendChatMessage: async (
+    projectId: string,
+    text: string,
+    attachmentIds: string[] = [],
+  ): Promise<{
+    messages: ChatMessage[];
+    filed_requirement_ids: string[];
+  }> =>
+    request('/chat/messages', {
+      method: 'POST',
+      body: JSON.stringify({
+        project_id: projectId,
+        text,
+        attachment_ids: attachmentIds,
+      }),
+    }),
+
+  listChatMessages: async (
+    projectId: string,
+    opts?: { segmentId?: string; after?: string; limit?: number },
+  ): Promise<ChatMessage[]> => {
+    const params = new URLSearchParams({ project_id: projectId });
+    if (opts?.segmentId) params.set('segment_id', opts.segmentId);
+    if (opts?.after) params.set('after', opts.after);
+    if (opts?.limit != null) params.set('limit', String(opts.limit));
+    const data = await request<{ messages: ChatMessage[] }>(
+      `/chat/messages?${params.toString()}`,
+    );
+    return data.messages;
+  },
+
+  createChatSegment: async (projectId: string, title: string): Promise<ChatSegment> =>
+    request('/chat/segments', {
+      method: 'POST',
+      body: JSON.stringify({ project_id: projectId, title }),
+    }),
+
+  listChatSegments: async (projectId: string): Promise<ChatSegment[]> => {
+    const data = await request<{ segments: ChatSegment[] }>(
+      `/chat/segments?project_id=${encodeURIComponent(projectId)}`,
+    );
+    return data.segments;
+  },
+
+  listCloudModels: async (): Promise<CloudModel[]> => {
+    const data = await request<{ models: CloudModel[] }>('/config/cloud-models');
+    return data.models;
+  },
+
+  addCloudModel: async (payload: {
+    label?: string;
+    provider: string;
+    model_id: string;
+    api_key: string;
+  }): Promise<CloudModel> =>
+    request('/config/cloud-models', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  deleteCloudModel: async (modelId: string): Promise<void> => {
+    await request(`/config/cloud-models/${encodeURIComponent(modelId)}`, { method: 'DELETE' });
+  },
+
+  testCloudModel: async (payload: {
+    provider: string;
+    model_id: string;
+    api_key?: string;
+  }): Promise<{ ok: boolean; message: string }> =>
+    request('/config/cloud-models/test', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  listProviderModels: async (payload: {
+    provider: string;
+    api_key?: string;
+  }): Promise<{ ok: boolean; models: string[]; message: string }> =>
+    request('/config/cloud-models/list-models', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  getCloudExecutionSettings: async (): Promise<{ allow_cloud_execution_model: boolean }> =>
+    request('/config/cloud-execution'),
+
+  updateCloudExecutionSettings: async (
+    allowCloudExecutionModel: boolean,
+  ): Promise<{ allow_cloud_execution_model: boolean }> =>
+    request('/config/cloud-execution', {
+      method: 'PUT',
+      body: JSON.stringify({ allow_cloud_execution_model: allowCloudExecutionModel }),
+    }),
+
+  listIntegrations: async (provider?: IntegrationProvider): Promise<IntegrationCredential[]> => {
+    const suffix = provider ? `?provider=${encodeURIComponent(provider)}` : '';
+    const data = await request<{ integrations: IntegrationCredential[] }>(`/config/integrations${suffix}`);
+    return data.integrations;
+  },
+
+  upsertIntegration: async (payload: {
+    provider: IntegrationProvider;
+    token: string;
+    scopes?: string[];
+    label?: string;
+    id?: string;
+  }): Promise<IntegrationCredential> =>
+    request('/config/integrations', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  deleteIntegration: async (provider: IntegrationProvider, credentialId: string): Promise<void> => {
+    await request(`/config/integrations/${encodeURIComponent(provider)}/${encodeURIComponent(credentialId)}`, {
+      method: 'DELETE',
+    });
+  },
+
+  openTicketPr: async (
+    ticketId: string,
+    projectId?: string,
+  ): Promise<{ pr_url: string; status: string }> =>
+    request(`/tickets/${ticketId}/pr${projectQuery(projectId)}`, { method: 'POST' }),
+
+  getInsights: async (projectId: string, range: InsightsRange = '30d'): Promise<InsightsPayload> => {
+    const params = new URLSearchParams({
+      project_id: projectId,
+      range,
+    });
+    return request(`/insights?${params.toString()}`);
+  },
+
+  listEvalTaskSets: async (): Promise<EvalTaskSet[]> => {
+    const data = await request<{ task_sets: EvalTaskSet[] }>('/evals/task-sets');
+    return data.task_sets;
+  },
+
+  listEvalRuns: async (opts?: {
+    modelId?: string;
+    taskSetId?: string;
+    limit?: number;
+  }): Promise<EvalRun[]> => {
+    const params = new URLSearchParams();
+    if (opts?.modelId) params.set('model_id', opts.modelId);
+    if (opts?.taskSetId) params.set('task_set_id', opts.taskSetId);
+    if (opts?.limit != null) params.set('limit', String(opts.limit));
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    const data = await request<{ eval_runs: EvalRun[] }>(`/evals${suffix}`);
+    return data.eval_runs;
+  },
+
+  startEvalRun: async (payload: {
+    model_id: string;
+    task_set_id: string;
+    trials?: number;
+  }): Promise<EvalRun> => {
+    const data = await request<{ eval_run: EvalRun }>('/evals/run', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    return data.eval_run;
+  },
+
+  listNotifications: async (opts?: {
+    projectId?: string;
+    unreadOnly?: boolean;
+    limit?: number;
+  }): Promise<InboxNotificationsResponse> => {
+    const params = new URLSearchParams();
+    if (opts?.projectId) params.set('project_id', opts.projectId);
+    if (opts?.unreadOnly) params.set('unread_only', 'true');
+    if (opts?.limit != null) params.set('limit', String(opts.limit));
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    return request(`/notifications${suffix}`);
+  },
+
+  markNotificationRead: async (notificationId: number): Promise<InboxNotificationsResponse & { notification: InboxNotification }> =>
+    request(`/notifications/${notificationId}/read`, { method: 'POST' }),
+
+  markAllNotificationsRead: async (projectId?: string): Promise<{ updated: number; unread_count: InboxNotificationsResponse['unread_count'] }> => {
+    const suffix = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
+    return request(`/notifications/read-all${suffix}`, { method: 'POST' });
+  },
+
+  listRunEvents: async (opts: {
+    projectId: string;
+    after?: number;
+    limit?: number;
+    ticketId?: string;
+  }): Promise<RunEvent[]> => {
+    const params = new URLSearchParams({ project_id: opts.projectId });
+    if (opts.after != null) params.set('after', String(opts.after));
+    if (opts.limit != null) params.set('limit', String(opts.limit));
+    if (opts.ticketId) params.set('ticket_id', opts.ticketId);
+    const data = await request<{ events: RunEvent[] }>(`/run-events?${params.toString()}`);
+    return data.events;
+  },
+
+  getChatReasonerConfig: async (): Promise<{ mode: 'cloud' | 'local' }> =>
+    request('/config/chat-reasoner'),
+
+  updateChatReasonerConfig: async (
+    mode: 'cloud' | 'local',
+  ): Promise<{ mode: 'cloud' | 'local' }> =>
+    request('/config/chat-reasoner', {
+      method: 'PUT',
+      body: JSON.stringify({ mode }),
+    }),
+
+  seedDemoProject: async (): Promise<DemoSeedResult> => {
+    const data = await request<{ project: DemoSeedResult['project']; requirement: DemoSeedResult['requirement']; proposed_tickets: DemoSeedResult['proposed_tickets'] }>(
+      '/demo/seed',
+      { method: 'POST' },
+    );
+    return data;
+  },
+
+  listRequirementTemplates: async (): Promise<RequirementTemplate[]> => {
+    const data = await request<{ templates: RequirementTemplate[] }>('/requirement-templates');
+    return data.templates;
+  },
+
+  saveRequirementTemplate: async (payload: {
+    id?: string;
+    title: string;
+    prompt: string;
+    scope_paths?: string[];
+    constraints?: string[];
+  }): Promise<RequirementTemplate> => {
+    const data = await request<{ template: RequirementTemplate }>('/requirement-templates', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    return data.template;
+  },
+
+  deleteRequirementTemplate: async (templateId: string): Promise<void> => {
+    await request(`/requirement-templates/${encodeURIComponent(templateId)}`, { method: 'DELETE' });
+  },
+
+  getRequirementSummary: async (requirementId: string): Promise<RequirementShareSummary> => {
+    const data = await request<{ summary: RequirementShareSummary }>(
+      `/requirements/${encodeURIComponent(requirementId)}/summary`,
+    );
+    return data.summary;
+  },
+
   ticketLogsWs: (ticketId: string, projectId?: string): WebSocket => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return new WebSocket(`${protocol}//${window.location.host}${API_PREFIX}/tickets/${ticketId}/logs${projectQuery(projectId)}`);
+    const params = new URLSearchParams();
+    if (projectId) params.set('project_id', projectId);
+    const token = getStoredApiToken();
+    if (token) params.set('token', token);
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    return new WebSocket(`${protocol}//${window.location.host}${API_PREFIX}/tickets/${ticketId}/logs${suffix}`);
   },
 };

@@ -55,6 +55,34 @@ function cloudReasonerMeta(model: string) {
   return { label: `${provider} · Tech Lead`, pillClass: CLOUD_PILL, accent: '#D97706' };
 }
 
+export const CLOUD_PROVIDER_PREFIXES = new Set([
+  'anthropic',
+  'openai',
+  'google',
+  'gemini',
+  'openrouter',
+  'together',
+  'fireworks',
+]);
+
+export function isCloudModel(model: string): boolean {
+  if (model === 'Claude · Tech Lead' || model === 'claude-tech-lead') {
+    return true;
+  }
+  const idx = model.indexOf(':');
+  if (idx <= 0) {
+    return false;
+  }
+  return CLOUD_PROVIDER_PREFIXES.has(model.slice(0, idx).toLowerCase());
+}
+
+export function formatCloudCost(usd?: number): string | null {
+  if (usd === undefined || usd <= 0) {
+    return null;
+  }
+  return `$${usd.toFixed(4)}`;
+}
+
 export function getModelMeta(model: string) {
   // Exact match first (covers the legacy "Claude · Tech Lead" id).
   const direct = MODEL_META[model];

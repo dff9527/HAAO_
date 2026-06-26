@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from orchestrator.db.sqlite import TicketRepository
+from orchestrator.db.sqlite import ChatRepository, RunEventRepository, TicketRepository
 from orchestrator.models.ticket import Ticket, TicketStatus
 
 
@@ -124,7 +124,10 @@ class TicketStateService:
     ) -> TransitionResult:
         ticket = self._require_ticket(ticket_id)
         result = self.state_machine.transition(ticket, to_status)
-        return _with_saved_ticket(result, self.repository.save(result.ticket))
+        saved = self.repository.save(result.ticket)
+        saved_result = _with_saved_ticket(result, saved)
+        self._append_done_report(saved_result)
+        return saved_result
 
     def record_test_failure(self, ticket_id: str) -> TransitionResult:
         ticket = self._require_ticket(ticket_id)
@@ -136,6 +139,38 @@ class TicketStateService:
         if ticket is None:
             raise KeyError(f"Ticket not found: {ticket_id}")
         return ticket
+
+    def _append_done_report(self, result: TransitionResult) -> None:
+        if result.to_status not in {TicketStatus.REVIEW, TicketStatus.DONE}:
+            return
+        project_id = _ticket_project_id(result.ticket)
+        chat_repository = ChatRepository(self.repository.connection)
+        segment_id = chat_repository.active_segment_id(project_id)
+        label = result.ticket.title or result.ticket.id
+        state = "Done" if result.to_status == TicketStatus.DONE else "Review"
+        chat_repository.append_message(
+            project_id=project_id,
+            role="system_report",
+            text=f"{result.ticket.id} done - in {state}: {label}",
+            segment_id=segment_id,
+            ticket_id=result.ticket.id,
+            report_kind="done",
+        )
+        metadata = result.ticket.metadata.model_dump(mode="json") if result.ticket.metadata else {}
+        RunEventRepository(self.repository.connection).append_run_event(
+            project_id=project_id,
+            requirement_id=_ticket_requirement_id(result.ticket),
+            ticket_id=result.ticket.id,
+            run_id=_string_or_none(metadata.get("last_run_id")),
+            event_type="report",
+            payload={
+                "report_kind": "done",
+                "state": state.lower(),
+                "from_status": result.from_status.value,
+                "to_status": result.to_status.value,
+                "title": label,
+            },
+        )
 
 
 def _replace_ticket_fields(ticket: Ticket, **fields: object) -> Ticket:
@@ -152,3 +187,25 @@ def _with_saved_ticket(result: TransitionResult, ticket: Ticket) -> TransitionRe
         escalated=result.escalated,
         escalated_to=result.escalated_to,
     )
+
+
+def _ticket_project_id(ticket: Ticket) -> str:
+    if ticket.metadata is not None:
+        metadata = ticket.metadata.model_dump(mode="json")
+        project_id = metadata.get("project_id")
+        if isinstance(project_id, str) and project_id:
+            return project_id
+    return "default"
+
+
+def _ticket_requirement_id(ticket: Ticket) -> str | None:
+    if ticket.metadata is not None:
+        metadata = ticket.metadata.model_dump(mode="json")
+        requirement_id = metadata.get("requirement_id")
+        if isinstance(requirement_id, str) and requirement_id:
+            return requirement_id
+    return None
+
+
+def _string_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None

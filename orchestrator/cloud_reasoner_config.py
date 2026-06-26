@@ -4,6 +4,7 @@ import httpx
 
 from clients.cloud_reasoner import BaseCloudReasoner
 from clients.factory import OPENAI_COMPAT_BASE_URLS, make_cloud_reasoner, split_provider
+from orchestrator.cloud_models import decrypt_cloud_model_key, get_cloud_model, list_cloud_models
 from orchestrator.config import Settings
 from orchestrator.db.sqlite import SettingsRepository
 
@@ -35,6 +36,14 @@ def selected_cloud_reasoner_id(
     return f"anthropic:{legacy_model}"
 
 
+def default_anthropic_model_id(
+    settings: Settings,
+    settings_repository: SettingsRepository,
+) -> str:
+    legacy_model = settings_repository.get_claude_model(settings.claude_model)
+    return f"anthropic:{legacy_model}"
+
+
 def api_key_for_provider(provider: str, settings: Settings) -> str:
     key = {
         "anthropic": settings.claude_api_key,
@@ -59,6 +68,27 @@ def provider_options(settings: Settings) -> list[dict]:
     return options
 
 
+def cloud_model_inventory(
+    settings: Settings,
+    settings_repository: SettingsRepository,
+) -> list[dict]:
+    default_id = default_anthropic_model_id(settings, settings_repository)
+    default_entry = {
+        "id": default_id,
+        "label": "Claude (Anthropic) · default",
+        "provider": "anthropic",
+        "model_id": default_id.partition(":")[2],
+        "key_configured": bool(api_key_for_provider("anthropic", settings)),
+        "deletable": False,
+    }
+    registry_entries = [
+        {**model.to_public_dict(), "deletable": True}
+        for model in list_cloud_models(settings_repository)
+        if model.id != default_id
+    ]
+    return [default_entry, *registry_entries]
+
+
 def build_cloud_reasoner(
     settings: Settings,
     settings_repository: SettingsRepository,
@@ -70,10 +100,22 @@ def build_cloud_reasoner(
     provider, _ = split_provider(model_id)
     return make_cloud_reasoner(
         model_id,
-        api_key=api_key_for_provider(provider, settings),
+        api_key=api_key_for_model(model_id, provider, settings, settings_repository),
         timeout_sec=timeout_sec,
         http_client=http_client,
     )
+
+
+def api_key_for_model(
+    model_id: str,
+    provider: str,
+    settings: Settings,
+    settings_repository: SettingsRepository,
+) -> str:
+    registered = get_cloud_model(settings_repository, model_id)
+    if registered is not None:
+        return decrypt_cloud_model_key(registered)
+    return api_key_for_provider(provider, settings)
 
 
 def validate_cloud_reasoner_id(model_id: str) -> str:

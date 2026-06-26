@@ -3,6 +3,7 @@ import {
   X, FileCode, ClipboardList, Bot, RefreshCw,
   ChevronRight, AlertTriangle, CheckCircle2, Loader2, XCircle,
   ShieldCheck, UserCheck, Zap, Trash2, Square, Pencil, GitBranch, GitCommit, GitMerge, RotateCcw,
+  GitPullRequest,
 } from 'lucide-react';
 import { DEFAULT_LOCAL_MODELS, getModelMeta, MANUAL_STATUS_TRANSITIONS, STATUS_CLASSES, TYPE_CLASSES } from '../constants';
 import {
@@ -15,7 +16,12 @@ import {
 } from '../copy';
 import { DiffViewer } from './DiffViewer';
 import { InterventionNotice, interventionNoticeForTicket } from './InterventionNotice';
+import { PrLinkBadge } from './PrLinkBadge';
+import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip';
+import { prEligibility, showConnectGithubHint } from '../prEligibility';
 import type { Ticket, TicketStatus, AssignedModel, RequirementSource } from '../types';
+
+type PrActionStatus = 'idle' | 'running' | 'ok' | 'fail';
 
 const LOG_LEVEL_CLASSES = {
   info: 'text-zinc-400',
@@ -52,6 +58,8 @@ interface Props {
   }) => void;
   onDelete: (force?: boolean) => void;
   onEscalate: () => void;
+  onOpenPr?: () => Promise<void>;
+  prIntegrationConfigured?: boolean;
   requirementSource?: RequirementSource;
   onViewRequirement?: () => void;
   localModelIds?: string[];
@@ -60,7 +68,7 @@ interface Props {
 
 type ConfirmAction = 'escalate' | 'backlog' | 'delete' | 'merge' | 'revert' | null;
 
-export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApprove, onAccept, onReject, onRun, onCancel, onApproveDiff, onRejectDiff, onMerge, onRevert, onUpdateAndRerun, onDelete, onEscalate, requirementSource, onViewRequirement, localModelIds = DEFAULT_LOCAL_MODELS, projectPathReady = true }: Props) {
+export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApprove, onAccept, onReject, onRun, onCancel, onApproveDiff, onRejectDiff, onMerge, onRevert, onUpdateAndRerun, onDelete, onEscalate, onOpenPr, prIntegrationConfigured = false, requirementSource, onViewRequirement, localModelIds = DEFAULT_LOCAL_MODELS, projectPathReady = true }: Props) {
   const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null);
   const [rejectFeedback, setRejectFeedback] = useState('');
   const [showRejectInput, setShowRejectInput] = useState(false);
@@ -69,6 +77,8 @@ export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApp
   const [isEditing, setIsEditing] = useState(false);
   const [editDescription, setEditDescription] = useState(ticket.taskDescription ?? '');
   const [editTests, setEditTests] = useState(ticket.definitionOfDone.tests.join('\n'));
+  const [prActionState, setPrActionState] = useState<PrActionStatus>('idle');
+  const [prActionMessage, setPrActionMessage] = useState('');
   const logEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -86,6 +96,8 @@ export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApp
     setRejectFeedback('');
     setDiffRejectFeedback('');
     setIsEditing(false);
+    setPrActionState('idle');
+    setPrActionMessage('');
   }, [ticket.id]);
 
   // Keep the edit draft in sync with incoming ticket data, but never clobber
@@ -143,6 +155,55 @@ export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApp
   const isRunning = ticket.status === 'In Progress' || ticket.testStatus === 'testing';
   const assignableModels = [...new Set([...localModelIds, ticket.assignedModel, CLAUDE_TECH_LEAD])];
   const showLiveLog = isRunning;
+  const prGate = prEligibility(ticket, prIntegrationConfigured);
+  const connectGithubHint = showConnectGithubHint(ticket, prIntegrationConfigured);
+  const showPrAction = ticket.status === 'Awaiting acceptance' || ticket.status === 'Done';
+
+  async function handleOpenPr() {
+    if (!onOpenPr || !prGate.eligible || prActionState === 'running') return;
+    setPrActionState('running');
+    setPrActionMessage('');
+    try {
+      await onOpenPr();
+      setPrActionState('ok');
+    } catch (error) {
+      setPrActionState('fail');
+      setPrActionMessage(error instanceof Error ? error.message : 'Could not open or update PR.');
+    }
+  }
+
+  function renderPrActionButton(compact = false) {
+    if (!showPrAction || !onOpenPr) return null;
+    const label = ticket.prUrl ? 'Update PR' : 'Open PR';
+    const button = (
+      <button
+        type="button"
+        onClick={() => void handleOpenPr()}
+        disabled={!prGate.eligible || prActionState === 'running'}
+        className={`flex items-center gap-1 text-xs px-2.5 py-1 rounded border transition-colors disabled:opacity-50 ${
+          compact
+            ? 'border-violet-200 dark:border-violet-800 text-violet-700 dark:text-violet-300 hover:bg-violet-50 dark:hover:bg-violet-950'
+            : 'border-border hover:bg-muted text-foreground'
+        } focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring`}
+      >
+        {prActionState === 'running' ? <Loader2 size={11} className="animate-spin" /> : <GitPullRequest size={11} />}
+        {label}
+      </button>
+    );
+
+    if (prGate.eligible) {
+      return button;
+    }
+
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex">{button}</span>
+        </TooltipTrigger>
+        <TooltipContent>{prGate.tooltip}</TooltipContent>
+      </Tooltip>
+    );
+  }
 
   useEffect(() => {
     function isTypingTarget(target: EventTarget | null): boolean {
@@ -484,6 +545,31 @@ export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApp
             <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/60 dark:bg-amber-950/30 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
               <p className="font-semibold mb-0.5">Reviewer feedback</p>
               <p className="whitespace-pre-wrap">{ticket.rejectionFeedback}</p>
+            </div>
+          )}
+
+          {(ticket.prUrl || connectGithubHint || showPrAction) && (
+            <div className="rounded-lg border border-border p-3 space-y-2">
+              <div className="flex items-center gap-1.5">
+                <GitPullRequest size={12} className="text-muted-foreground" />
+                <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Pull request</span>
+              </div>
+              {ticket.prUrl ? (
+                <div className="flex flex-wrap items-center gap-2">
+                  <PrLinkBadge prUrl={ticket.prUrl} prStatus={ticket.prStatus} />
+                  {ticket.prStatus && (
+                    <span className="text-[11px] text-muted-foreground capitalize">{ticket.prStatus}</span>
+                  )}
+                </div>
+              ) : connectGithubHint ? (
+                <p className="text-[11px] text-muted-foreground">
+                  Connect GitHub or GitLab in Settings to auto-open a PR when you accept this ticket.
+                </p>
+              ) : null}
+              {renderPrActionButton()}
+              {prActionState === 'fail' && prActionMessage && (
+                <p className="text-[11px] text-red-600 dark:text-red-400">{prActionMessage}</p>
+              )}
             </div>
           )}
 

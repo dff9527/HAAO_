@@ -39,7 +39,7 @@ def test_inject_populates_file_contents(tmp_path: Path) -> None:
     assert updated.context.files[0].path == "src/app.py"
     assert "return 42" in updated.context.files[0].content
     assert updated.context.files[0].truncated is False
-    assert updated.context.token_estimate == estimate_tokens(updated.context.files[0].content)
+    assert updated.context.token_estimate == estimate_tokens("def main():\n    return 42\n")
 
 
 def test_b039_inject_adds_related_import_context(tmp_path: Path) -> None:

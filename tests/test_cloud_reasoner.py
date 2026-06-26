@@ -49,6 +49,51 @@ def test_openai_compat_decompose_parses_and_validates(fresh_ticket_dict) -> None
     assert captured["model"] == "gpt-4o"
 
 
+def test_decompose_retries_invalid_json_twice_then_succeeds(fresh_ticket_dict) -> None:
+    ticket_payload = fresh_ticket_dict.copy()
+    ticket_payload["id"] = "T-502"
+    ticket_payload["status"] = "backlog"
+    ticket_payload.pop("result", None)
+    responses = iter(["not json", "still not json", json.dumps([ticket_payload])])
+    prompts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        prompts.append(body["messages"][0]["content"])
+        return httpx.Response(200, json=_openai_response(next(responses)))
+
+    client = OpenAICompatReasoner(
+        "test-key",
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.decompose("requirement", "context")[0]["id"] == "T-502"
+    assert len(prompts) == 3
+    assert all("Return ONLY the valid JSON array" in prompt for prompt in prompts[1:])
+
+
+def test_decompose_invalid_json_raises_after_two_retries() -> None:
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=_openai_response("not json"))
+
+    client = OpenAICompatReasoner(
+        "test-key",
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(OpenAICompatError, match="did not contain JSON"):
+        client.decompose("requirement", "context")
+    assert calls == 3
+
+
 def test_openai_compat_audit_returns_verdict_and_maps_usage(fresh_ticket_dict) -> None:
     ticket = Ticket.from_dict(fresh_ticket_dict)
 

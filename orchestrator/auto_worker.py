@@ -13,6 +13,7 @@ from orchestrator.db.sqlite import RequirementRepository, SettingsRepository, Ti
 from orchestrator.escalation import EscalationService
 from orchestrator.execution_loop import ExecutionLoop
 from orchestrator.execution_safety import GitWorkspaceGuard
+from orchestrator.policies import ExecutionPolicy
 from orchestrator.review_flow import ReviewService
 from orchestrator.role_routing import role_routing_store
 from orchestrator.runner.dod_runner import TestRunner
@@ -57,6 +58,9 @@ class AutoWorker:
         repo_root: Path,
         database_root: Path,
         env: dict[str, str] | None = None,
+        env_allowlist: list[str] | None = None,
+        test_allow_network: bool = False,
+        sandbox_mode: str = "auto",
         setup_cmd: str = "",
         cleanup_cmd: str = "",
         interval_sec: float = 5.0,
@@ -84,6 +88,9 @@ class AutoWorker:
                 repo_root=repo_root.resolve(),
                 database_root=database_root.resolve(),
                 env=dict(env or {}),
+                env_allowlist=list(env_allowlist or ["PATH", "PYTHONPATH"]),
+                test_allow_network=test_allow_network,
+                sandbox_mode=sandbox_mode,
                 setup_cmd=setup_cmd,
                 cleanup_cmd=cleanup_cmd,
             )
@@ -121,6 +128,9 @@ class AutoWorker:
         repo_root: Path,
         database_root: Path,
         env: dict[str, str],
+        env_allowlist: list[str],
+        test_allow_network: bool,
+        sandbox_mode: str,
         setup_cmd: str,
         cleanup_cmd: str,
     ) -> None:
@@ -134,6 +144,9 @@ class AutoWorker:
                     repo_root,
                     database_root,
                     env,
+                    env_allowlist,
+                    test_allow_network,
+                    sandbox_mode,
                     setup_cmd,
                     cleanup_cmd,
                     self.max_cycles_per_tick,
@@ -156,6 +169,9 @@ def _run_tick(
     repo_root: Path,
     database_root: Path,
     env: dict[str, str],
+    env_allowlist: list[str],
+    test_allow_network: bool,
+    sandbox_mode: str,
     setup_cmd: str,
     cleanup_cmd: str,
     max_cycles_per_tick: int,
@@ -178,10 +194,18 @@ def _run_tick(
             test_runner=TestRunner(
                 cwd=repo_root,
                 env=env,
+                execution_policy=ExecutionPolicy(
+                    test_allow_network=test_allow_network,
+                    env_allowlist=tuple(env_allowlist),
+                    sandbox_mode=sandbox_mode if sandbox_mode in {"auto", "docker", "unshare", "none"} else "auto",
+                ),
                 setup_cmd=setup_cmd,
                 cleanup_cmd=cleanup_cmd,
             ),
             settings_repository=settings_repository,
+            requirement_repository=requirement_repository,
+            max_output_tokens=settings.local_max_output_tokens,
+            patch_mode_threshold_tokens=settings.local_patch_mode_threshold_tokens,
         )
         orchestrator = AutoOrchestrator(
             repository,

@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, KeyboardEvent } from 'react';
 import {
   X, ChevronDown, ChevronRight, Loader2, Sparkles,
   Plus, Trash2, CheckCircle2, FileCode, Circle, CheckSquare, Square,
+  LayoutTemplate, BookmarkPlus,
 } from 'lucide-react';
 import { DEFAULT_LOCAL_MODELS, getModelMeta, TYPE_CLASSES } from '../constants';
 import type {
@@ -9,8 +10,10 @@ import type {
   LogLevel, Priority, ContextFile, DefinitionOfDone, RequirementSource,
   Project, RequirementGranularity, RequirementIntent, RequirementScale,
 } from '../types';
-import type { BackendProjectConventions, BackendRequirementDecomposeRequest, BackendTicket } from '../api/types';
+import type { BackendProjectConventions, BackendRequirementDecomposeRequest, BackendTicket, RequirementTemplate } from '../api/types';
 import { toUiTicket } from '../api/adapter';
+import { apiClient } from '../api/client';
+import { MOCK_REQUIREMENT_TEMPLATES } from '../dxUtils';
 
 // ── Local types ────────────────────────────────────────────────────────────
 
@@ -475,6 +478,7 @@ interface Props {
   localModelIds?: string[];
   projectPathReady?: boolean;
   onDecomposeError?: (message: string) => void;
+  usingMockData?: boolean;
 }
 
 type Step = 1 | 'decomposing' | 2 | 3;
@@ -524,6 +528,7 @@ export function RequirementComposer({
   localModelIds = DEFAULT_LOCAL_MODELS,
   projectPathReady = true,
   onDecomposeError,
+  usingMockData = false,
 }: Props) {
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
   const [form, setForm] = useState<ComposeForm>({
@@ -541,9 +546,66 @@ export function RequirementComposer({
   const [decomposeError, setDecomposeError] = useState('');
   const [isConfirming, setIsConfirming] = useState(false);
   const [isLoadingConventions, setIsLoadingConventions] = useState(false);
+  const [templates, setTemplates] = useState<RequirementTemplate[]>(usingMockData ? MOCK_REQUIREMENT_TEMPLATES : []);
+  const [selectedTemplateId, setSelectedTemplateId] = useState('');
+  const [saveTemplateTitle, setSaveTemplateTitle] = useState('');
+  const [showSaveTemplate, setShowSaveTemplate] = useState(false);
+  const [templateMessage, setTemplateMessage] = useState('');
   const promptRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => { promptRef.current?.focus(); }, []);
+
+  useEffect(() => {
+    if (usingMockData) {
+      setTemplates(MOCK_REQUIREMENT_TEMPLATES);
+      return;
+    }
+    let active = true;
+    apiClient
+      .listRequirementTemplates()
+      .then((items) => {
+        if (active) setTemplates(items);
+      })
+      .catch(() => {
+        if (active) setTemplates(MOCK_REQUIREMENT_TEMPLATES);
+      });
+    return () => {
+      active = false;
+    };
+  }, [usingMockData]);
+
+  function applyTemplate(templateId: string) {
+    setSelectedTemplateId(templateId);
+    const template = templates.find((item) => item.id === templateId);
+    if (!template) return;
+    setForm((current) => ({
+      ...current,
+      prompt: template.prompt,
+      scopePaths: [...template.scope_paths],
+      constraints: [...template.constraints],
+    }));
+    setShowAdvanced(template.scope_paths.length > 0 || template.constraints.length > 0);
+  }
+
+  async function handleSaveTemplate() {
+    const title = saveTemplateTitle.trim() || form.prompt.trim().slice(0, 48);
+    if (!title || !form.prompt.trim()) return;
+    try {
+      const saved = await apiClient.saveRequirementTemplate({
+        title,
+        prompt: form.prompt.trim(),
+        scope_paths: form.scopePaths,
+        constraints: form.constraints,
+      });
+      setTemplates((prev) => [saved, ...prev.filter((item) => item.id !== saved.id)]);
+      setSelectedTemplateId(saved.id);
+      setShowSaveTemplate(false);
+      setSaveTemplateTitle('');
+      setTemplateMessage('Template saved.');
+    } catch (error) {
+      setTemplateMessage(error instanceof Error ? error.message : 'Could not save template.');
+    }
+  }
 
   useEffect(() => {
     setForm((current) => ({
@@ -822,6 +884,65 @@ export function RequirementComposer({
             {/* ─ Step 1: Compose ─ */}
             {(step === 1 || step === 'decomposing') && (
               <div className="p-5 space-y-5">
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <label className="text-xs font-medium text-muted-foreground flex items-center gap-1">
+                    <LayoutTemplate size={12} />
+                    Templates
+                  </label>
+                  <select
+                    value={selectedTemplateId}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      if (!value) {
+                        setSelectedTemplateId('');
+                        return;
+                      }
+                      applyTemplate(value);
+                    }}
+                    disabled={step === 'decomposing'}
+                    className="text-xs bg-muted/40 border border-border rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50 min-w-[180px]"
+                  >
+                    <option value="">Choose a template…</option>
+                    {templates.map((template) => (
+                      <option key={template.id} value={template.id}>
+                        {template.title}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => setShowSaveTemplate((value) => !value)}
+                    disabled={!form.prompt.trim() || step === 'decomposing'}
+                    className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded border border-border hover:bg-muted transition-colors disabled:opacity-50"
+                  >
+                    <BookmarkPlus size={11} />
+                    Save as template
+                  </button>
+                </div>
+
+                {showSaveTemplate && (
+                  <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-muted/20 px-3 py-2">
+                    <input
+                      type="text"
+                      value={saveTemplateTitle}
+                      onChange={(event) => setSaveTemplateTitle(event.target.value)}
+                      placeholder="Template title"
+                      className="flex-1 min-w-[160px] text-xs bg-background border border-border rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-ring"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void handleSaveTemplate()}
+                      className="text-xs px-2.5 py-1.5 rounded bg-primary text-primary-foreground hover:opacity-90"
+                    >
+                      Save
+                    </button>
+                  </div>
+                )}
+
+                {templateMessage && (
+                  <p className="text-[11px] text-muted-foreground">{templateMessage}</p>
+                )}
 
                 {/* Prompt (main field) */}
                 <div>

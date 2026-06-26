@@ -27,6 +27,10 @@ def run_migrations(connection: sqlite3.Connection) -> None:
 
 def ensure_schema_compatibility(connection: sqlite3.Connection) -> None:
     _ensure_projects_table(connection)
+    _ensure_foundational_contract_tables(connection)
+    _ensure_notifications_table(connection)
+    _ensure_eval_runs_table(connection)
+    _ensure_requirement_templates_table(connection)
     connection.commit()
 
 
@@ -68,6 +72,207 @@ def migrate_project_scope(connection: sqlite3.Connection) -> None:
     )
 
 
+def migrate_chat_tables(connection: sqlite3.Connection) -> None:
+    _ensure_chat_tables(connection)
+
+
+def migrate_foundational_contract_tables(connection: sqlite3.Connection) -> None:
+    _ensure_foundational_contract_tables(connection)
+
+
+def migrate_notifications_table(connection: sqlite3.Connection) -> None:
+    _ensure_notifications_table(connection)
+
+
+def migrate_project_execution_policy(connection: sqlite3.Connection) -> None:
+    _ensure_projects_table(connection)
+
+
+def migrate_eval_runs_table(connection: sqlite3.Connection) -> None:
+    _ensure_eval_runs_table(connection)
+
+
+def migrate_requirement_templates_table(connection: sqlite3.Connection) -> None:
+    _ensure_requirement_templates_table(connection)
+
+
+def _ensure_chat_tables(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS chat_segments (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_segments_one_active
+        ON chat_segments(project_id)
+        WHERE is_active = 1;
+
+        CREATE INDEX IF NOT EXISTS idx_chat_segments_project_created
+        ON chat_segments(project_id, created_at, id);
+
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('user', 'agent', 'system_report')),
+            text TEXT NOT NULL,
+            segment_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            requirement_id TEXT NULL,
+            ticket_id TEXT NULL,
+            report_kind TEXT NULL CHECK (report_kind IS NULL OR report_kind IN ('done', 'blocked', 'needs_you'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_project_segment_id
+        ON chat_messages(project_id, segment_id, id);
+
+        CREATE TABLE IF NOT EXISTS chat_attachments (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            mime TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('file', 'image')),
+            stored_path TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chat_attachments_project_id
+        ON chat_attachments(project_id, id);
+
+        CREATE TABLE IF NOT EXISTS chat_message_attachments (
+            message_id TEXT NOT NULL,
+            attachment_id TEXT NOT NULL,
+            PRIMARY KEY (message_id, attachment_id)
+        );
+        """
+    )
+
+
+def _ensure_foundational_contract_tables(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS run_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT NOT NULL,
+            requirement_id TEXT NULL,
+            ticket_id TEXT NULL,
+            run_id TEXT NULL,
+            event_type TEXT NOT NULL CHECK (
+                event_type IN (
+                    'run_started',
+                    'model_call',
+                    'diff_produced',
+                    'dod_check',
+                    'retry',
+                    'escalation',
+                    'egress_attempt',
+                    'report',
+                    'run_finished',
+                    'error'
+                )
+            ),
+            ts TEXT NOT NULL,
+            model_id TEXT NULL,
+            input_tokens INTEGER NULL,
+            output_tokens INTEGER NULL,
+            cost_usd REAL NULL,
+            cost_status TEXT NULL CHECK (
+                cost_status IS NULL OR cost_status IN ('actual', 'estimated', 'unknown')
+            ),
+            payload_json TEXT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_run_events_project_id
+        ON run_events(project_id, id);
+
+        CREATE TABLE IF NOT EXISTS integrations (
+            provider TEXT NOT NULL CHECK (provider IN ('github', 'gitlab', 'slack')),
+            id TEXT NOT NULL,
+            label TEXT NOT NULL,
+            encrypted_token TEXT NOT NULL,
+            scopes_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (provider, id)
+        );
+        """
+    )
+
+
+def _ensure_notifications_table(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT NOT NULL,
+            ticket_id TEXT NULL,
+            requirement_id TEXT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('needs_you', 'done', 'blocked')),
+            title TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            read_at TEXT NULL,
+            dedupe_key TEXT NOT NULL UNIQUE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_notifications_project_created
+        ON notifications(project_id, created_at DESC, id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_notifications_unread
+        ON notifications(project_id, read_at);
+        """
+    )
+
+
+def _ensure_eval_runs_table(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS eval_runs (
+            id TEXT PRIMARY KEY,
+            model_id TEXT NOT NULL,
+            task_set_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+            trials INTEGER NOT NULL DEFAULT 1,
+            started_at TEXT NOT NULL,
+            finished_at TEXT NULL,
+            summary_json TEXT NOT NULL DEFAULT '{}',
+            baseline_run_id TEXT NULL,
+            regressed INTEGER NOT NULL DEFAULT 0,
+            error TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_eval_runs_model_task_started
+        ON eval_runs(model_id, task_set_id, started_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_eval_runs_task_started
+        ON eval_runs(task_set_id, started_at DESC);
+        """
+    )
+
+
+def _ensure_requirement_templates_table(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS requirement_templates (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            scope_paths_json TEXT NOT NULL DEFAULT '[]',
+            constraints_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_requirement_templates_updated
+        ON requirement_templates(updated_at DESC, id ASC);
+        """
+    )
+
+
 def _ensure_projects_table(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
@@ -77,6 +282,9 @@ def _ensure_projects_table(connection: sqlite3.Connection) -> None:
             path TEXT NOT NULL,
             default_branch TEXT NOT NULL,
             env_json TEXT NOT NULL DEFAULT '{}',
+            env_allowlist_json TEXT NOT NULL DEFAULT '["PATH", "PYTHONPATH"]',
+            test_allow_network INTEGER NOT NULL DEFAULT 0,
+            sandbox_mode TEXT NOT NULL DEFAULT 'auto',
             setup_cmd TEXT NOT NULL DEFAULT '',
             cleanup_cmd TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
@@ -90,6 +298,14 @@ def _ensure_projects_table(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE projects ADD COLUMN setup_cmd TEXT NOT NULL DEFAULT ''")
     if "cleanup_cmd" not in columns:
         connection.execute("ALTER TABLE projects ADD COLUMN cleanup_cmd TEXT NOT NULL DEFAULT ''")
+    if "env_allowlist_json" not in columns:
+        connection.execute(
+            "ALTER TABLE projects ADD COLUMN env_allowlist_json TEXT NOT NULL DEFAULT '[\"PATH\", \"PYTHONPATH\"]'"
+        )
+    if "test_allow_network" not in columns:
+        connection.execute("ALTER TABLE projects ADD COLUMN test_allow_network INTEGER NOT NULL DEFAULT 0")
+    if "sandbox_mode" not in columns:
+        connection.execute("ALTER TABLE projects ADD COLUMN sandbox_mode TEXT NOT NULL DEFAULT 'auto'")
 
 
 def _ensure_default_project(connection: sqlite3.Connection) -> None:
@@ -97,10 +313,13 @@ def _ensure_default_project(connection: sqlite3.Connection) -> None:
     project_root = Path(__file__).resolve().parents[2]
     connection.execute(
         """
-        INSERT OR IGNORE INTO projects (id, name, path, default_branch, env_json, setup_cmd, cleanup_cmd, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO projects (
+            id, name, path, default_branch, env_json, env_allowlist_json,
+            test_allow_network, sandbox_mode, setup_cmd, cleanup_cmd, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        ("default", "HAAO", str(project_root), "main", "{}", "", "", now),
+        ("default", "HAAO", str(project_root), "main", "{}", '["PATH", "PYTHONPATH"]', 0, "auto", "", "", now),
     )
 
 
@@ -249,6 +468,12 @@ def _has_composite_primary_key(
 MIGRATIONS: list[Migration] = [
     migrate_escalate_to_tech_lead,
     migrate_project_scope,
+    migrate_chat_tables,
+    migrate_foundational_contract_tables,
+    migrate_notifications_table,
+    migrate_project_execution_policy,
+    migrate_eval_runs_table,
+    migrate_requirement_templates_table,
 ]
 
 

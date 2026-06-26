@@ -1,4 +1,65 @@
-import type { Ticket, LogLevel, RequirementSource } from '../types';
+import type { Ticket, LogLevel, RequirementSource, ChatMessage, ChatAttachment, CloudModel } from '../types';
+
+export const INITIAL_CHAT_ATTACHMENTS: ChatAttachment[] = [
+  {
+    id: 'ATT-mock-notes',
+    filename: 'api-notes.txt',
+    mime: 'text/plain',
+    size: 1280,
+    kind: 'file',
+    stored_path: 'mock/api-notes.txt',
+  },
+];
+
+export const INITIAL_CHAT_MESSAGES: ChatMessage[] = [
+  {
+    id: 'msg-001',
+    project_id: 'default',
+    role: 'agent',
+    text: 'Welcome to HAAO. Tell me what you want built and I will file proposals into your backlog — nothing moves to Ready until you approve.',
+    segment_id: 'seg-default',
+    created_at: '2026-06-25T09:00:00.000Z',
+  },
+  {
+    id: 'msg-002',
+    project_id: 'default',
+    role: 'user',
+    text: 'Harden password storage — switch to bcrypt and reject weak passwords at the API.',
+    segment_id: 'seg-default',
+    created_at: '2026-06-25T09:05:00.000Z',
+    attachment_ids: ['ATT-mock-notes'],
+    attachments: [INITIAL_CHAT_ATTACHMENTS[0]],
+  },
+  {
+    id: 'msg-003',
+    project_id: 'default',
+    role: 'agent',
+    text: 'I heard 1 piece of work and filed it as a proposal in Backlog.',
+    requirement_id: 'R-006',
+    segment_id: 'seg-default',
+    created_at: '2026-06-25T09:05:04.000Z',
+  },
+  {
+    id: 'msg-004',
+    project_id: 'default',
+    role: 'system_report',
+    text: 'T-012 done — moved to Review',
+    ticket_id: 'T-012',
+    report_kind: 'done',
+    segment_id: 'seg-default',
+    created_at: '2026-06-25T09:31:30.000Z',
+  },
+  {
+    id: 'msg-005',
+    project_id: 'default',
+    role: 'system_report',
+    text: 'T-011 needs you — awaiting acceptance (Gate 2)',
+    ticket_id: 'T-011',
+    report_kind: 'needs_you',
+    segment_id: 'seg-default',
+    created_at: '2026-06-25T08:55:38.000Z',
+  },
+];
 
 export const INITIAL_REQUIREMENTS: RequirementSource[] = [
   {
@@ -16,6 +77,26 @@ export const INITIAL_REQUIREMENTS: RequirementSource[] = [
     acceptanceNotes:
       'Security team sign-off required. All existing tests must still pass after the migration.',
     createdAt: '09:25:00',
+    cloudCostUsd: 0.0142,
+  },
+];
+
+export const INITIAL_CLOUD_MODELS: CloudModel[] = [
+  {
+    id: 'anthropic:claude-sonnet-4-6',
+    label: 'Claude (Anthropic) · default',
+    provider: 'anthropic',
+    model_id: 'claude-sonnet-4-6',
+    key_configured: false,
+    deletable: false,
+  },
+  {
+    id: 'openai:gpt-4o-mini',
+    label: 'OpenAI · gpt-4o-mini',
+    provider: 'openai',
+    model_id: 'gpt-4o-mini',
+    key_configured: true,
+    deletable: true,
   },
 ];
 

@@ -1,24 +1,42 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from collections.abc import Generator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
+from starlette.responses import FileResponse
 
 from clients.lmstudio import LMStudioClient
 from clients.claude_po import list_available_claude_models
 from clients.cloud_reasoner import BaseCloudReasoner
-from clients.factory import split_provider
+from clients.factory import (
+    ANTHROPIC_ALIASES,
+    OPENAI_COMPAT_BASE_URLS,
+    make_cloud_reasoner,
+    split_provider,
+)
 from clients.tech_lead import ClaudeTechLeadClient
+from orchestrator.attachments import AttachmentStorage, AttachmentStorageError
 from orchestrator.auto_orchestrator import AutoOrchestrator
 from orchestrator.auto_worker import auto_worker
+from orchestrator.chat_flow import ChatMessage, ChatService, ReasonerTurn, WorkItem
+from orchestrator.cloud_models import (
+    CloudModelRegistryError,
+    add_cloud_model,
+    delete_cloud_model,
+)
 from orchestrator.cloud_reasoner_config import (
+    api_key_for_model,
+    api_key_for_provider,
     build_cloud_reasoner,
+    cloud_model_inventory,
+    default_anthropic_model_id,
     provider_options,
     selected_cloud_reasoner_id,
     validate_cloud_reasoner_id,
@@ -28,26 +46,41 @@ from orchestrator.context.conventions import detect_conventions, detect_test_com
 from orchestrator.context.injector import ContextInjector
 from orchestrator.db.sqlite import (
     AmbiguousTicketError,
+    ChatAttachment,
+    ChatRepository,
     DuplicateTicketError,
+    EvalRunRepository,
+    IntegrationProvider,
+    IntegrationRepository,
+    NotificationRepository,
     ProjectRepository,
     RequirementRepository,
+    RequirementTemplateRepository,
+    RunEventRepository,
     SettingsRepository,
     TicketDeletionError,
     TicketRepository,
     connect,
 )
 from orchestrator.escalation import EscalationService
+from orchestrator.evals import EvalService
+from orchestrator.dx import DemoSeedService, build_requirement_summary
 from orchestrator.diff_review import DiffReviewService
 from orchestrator.execution_loop import ExecutionLoop
 from orchestrator.execution_registry import execution_key, execution_registry
 from orchestrator.execution_safety import GitWorkspaceGuard
 from orchestrator.git_flow import GitTicketFlow, now_iso
+from orchestrator.insights import InsightsService
 from orchestrator.manual_ticket_flow import (
     ManualTicketCreatePayload,
     ManualTicketError,
     ManualTicketService,
 )
-from orchestrator.model_policy import local_execution_model
+from orchestrator.model_policy import (
+    ALLOW_CLOUD_EXECUTION_SETTINGS_KEY,
+    local_execution_model,
+    local_model_fallback_chain,
+)
 from orchestrator.local_models import (
     LocalModelEndpoint,
     cache_local_models,
@@ -57,13 +90,22 @@ from orchestrator.local_models import (
 )
 from orchestrator.models.project import Project
 from orchestrator.models.requirement import Requirement, RequirementAttachment, RequirementStatus
-from orchestrator.models.ticket import TicketStatus
+from orchestrator.models.ticket import Ticket, TicketStatus
 from orchestrator.model_instructions import normalize_model_settings_id
 from orchestrator.notifications import get_notification_webhook, set_notification_webhook
+from orchestrator.policies import ExecutionPolicy
+from orchestrator.pr_flow import (
+    AcceptanceGateError,
+    DirtyWorkspaceError,
+    MissingIntegrationError,
+    PullRequestFlowError,
+    PullRequestService,
+)
 from orchestrator.requirements_flow import RequirementService
 from orchestrator.review_flow import ReviewService
 from orchestrator.role_routing import role_routing_store
 from orchestrator.runner.dod_runner import TestRunner
+from orchestrator.secrets_crypto import SecretEncryptionError
 from orchestrator.state_machine import InvalidTransitionError, TicketStateService
 
 
@@ -122,6 +164,279 @@ class RequirementDetailResponse(BaseModel):
     requirement: dict
 
 
+class RequirementSummaryResponse(BaseModel):
+    summary: dict
+
+
+class ChatMessageCreateRequest(BaseModel):
+    project_id: str = "default"
+    text: str = Field(min_length=1)
+    attachment_ids: list[str] = Field(default_factory=list)
+
+
+class ChatAttachmentResponse(BaseModel):
+    id: str
+    filename: str
+    mime: str
+    size: int
+    kind: Literal["file", "image"]
+    stored_path: str
+
+
+class ChatMessageResponse(BaseModel):
+    id: str
+    project_id: str
+    role: Literal["user", "agent", "system_report"]
+    text: str
+    segment_id: str
+    created_at: str
+    requirement_id: str | None = None
+    ticket_id: str | None = None
+    report_kind: Literal["done", "blocked", "needs_you"] | None = None
+    attachment_ids: list[str] = Field(default_factory=list)
+    attachments: list[ChatAttachmentResponse] = Field(default_factory=list)
+
+
+class ChatMessagesResponse(BaseModel):
+    messages: list[ChatMessageResponse]
+
+
+class ChatTurnResponse(ChatMessagesResponse):
+    filed_requirement_ids: list[str] = Field(default_factory=list)
+
+
+class ChatSegmentCreateRequest(BaseModel):
+    project_id: str = "default"
+    title: str = Field(min_length=1)
+
+
+class ChatSegmentResponse(BaseModel):
+    id: str
+    project_id: str
+    title: str
+    summary: str
+    created_at: str
+    is_active: bool
+
+
+class ChatSegmentsResponse(BaseModel):
+    segments: list[ChatSegmentResponse]
+
+
+def _extract_json_object(raw: str) -> str:
+    """Best-effort extraction of one JSON object from model output.
+
+    Tolerates markdown code fences and surrounding prose that smaller local models
+    sometimes emit around the JSON.
+    """
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+        text = text.strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return text
+
+
+def _parse_reasoner_payload(raw: str) -> ReasonerTurn:
+    try:
+        payload = json.loads(_extract_json_object(raw))
+    except json.JSONDecodeError as exc:
+        raise ValueError("Chat reasoner returned invalid JSON") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("Chat reasoner response must be a JSON object")
+    reply = payload.get("reply", "")
+    if not isinstance(reply, str):
+        raise ValueError("Chat reasoner reply must be a string")
+
+    raw_items = payload.get("work_items", [])
+    if not isinstance(raw_items, list):
+        raise ValueError("Chat reasoner work_items must be a list")
+    work_items: list[WorkItem] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            raise ValueError("Chat reasoner work item must be an object")
+        title = item.get("title", "")
+        prompt = item.get("prompt", "")
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("Chat reasoner work item title cannot be empty")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("Chat reasoner work item prompt cannot be empty")
+        work_items.append(WorkItem(title=title.strip(), prompt=prompt.strip()))
+
+    updated_summary = payload.get("updated_summary")
+    if updated_summary is not None and not isinstance(updated_summary, str):
+        raise ValueError("Chat reasoner updated_summary must be a string or null")
+    return ReasonerTurn(
+        reply=reply.strip(),
+        work_items=work_items,
+        updated_summary=updated_summary,
+    )
+
+
+# Ticket statuses that still represent "open" work the agent should be aware of.
+_OPEN_TICKET_STATUSES = (
+    TicketStatus.BACKLOG,
+    TicketStatus.READY,
+    TicketStatus.IN_PROGRESS,
+    TicketStatus.REVIEW,
+    TicketStatus.AWAITING_ACCEPTANCE,
+)
+_MAX_BOARD_TICKETS = 40
+
+
+def _open_tickets_for_reasoner(ticket_repository: TicketRepository | None) -> list[dict]:
+    if ticket_repository is None:
+        return []
+    project_id = getattr(ticket_repository, "project_id", None)
+    try:
+        tickets = ticket_repository.list(project_id=project_id)
+    except Exception:
+        return []
+    open_states = {str(status) for status in _OPEN_TICKET_STATUSES}
+    rows = [
+        {"id": ticket.id, "status": str(ticket.status), "title": ticket.title}
+        for ticket in tickets
+        if str(ticket.status) in open_states
+    ]
+    return rows[:_MAX_BOARD_TICKETS]
+
+
+class CloudChatReasoner:
+    is_local = False
+
+    def __init__(
+        self,
+        client: BaseCloudReasoner,
+        ticket_repository: TicketRepository | None = None,
+    ) -> None:
+        self.client = client
+        self.ticket_repository = ticket_repository
+
+    def respond(
+        self,
+        *,
+        summary: str,
+        recent: list[ChatMessage],
+        user_text: str,
+    ) -> ReasonerTurn:
+        self.client._ensure_ready()
+        open_tickets = _open_tickets_for_reasoner(self.ticket_repository)
+        raw = self.client._complete(
+            _chat_reasoner_prompt(summary, recent, user_text, open_tickets)
+        )
+        return _parse_reasoner_payload(raw)
+
+
+class LocalChatReasoner:
+    is_local = True
+
+    def __init__(
+        self,
+        client: LMStudioClient,
+        model: str,
+        ticket_repository: TicketRepository | None = None,
+    ) -> None:
+        self.client = client
+        self.model = model
+        self.ticket_repository = ticket_repository
+
+    def respond(
+        self,
+        *,
+        summary: str,
+        recent: list[ChatMessage],
+        user_text: str,
+    ) -> ReasonerTurn:
+        if not self.model:
+            raise ValueError(
+                "No local chat model is available. Start LM Studio (or a local "
+                "endpoint), or switch the chat agent to cloud in Settings."
+            )
+        open_tickets = _open_tickets_for_reasoner(self.ticket_repository)
+        prompt = _chat_reasoner_prompt(summary, recent, user_text, open_tickets)
+        raw = self.client.chat_completion(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You output only valid JSON objects."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        return _parse_reasoner_payload(raw)
+
+
+class RequirementServiceGateway:
+    def __init__(
+        self,
+        service: RequirementService,
+        *,
+        ticket_repository: TicketRepository,
+        requirement_repository: RequirementRepository,
+        tech_lead: BaseCloudReasoner,
+        project_repository: ProjectRepository,
+        settings_repository: SettingsRepository,
+        chat_repository: ChatRepository,
+    ) -> None:
+        self.service = service
+        self.ticket_repository = ticket_repository
+        self.requirement_repository = requirement_repository
+        self.tech_lead = tech_lead
+        self.project_repository = project_repository
+        self.settings_repository = settings_repository
+        self.chat_repository = chat_repository
+
+    def file_backlog_proposal(
+        self,
+        *,
+        project_id: str,
+        title: str,
+        prompt: str,
+        attachment_ids: list[str] | None = None,
+    ) -> str:
+        service = self._service_for_project(project_id)
+        attachments = [
+            RequirementAttachment(type=attachment.kind, value=attachment.stored_path)
+            for attachment in self.chat_repository.attachments_by_ids(
+                project_id,
+                attachment_ids or [],
+            )
+        ]
+        missing_count = len(set(attachment_ids or [])) - len(attachments)
+        if missing_count > 0:
+            raise ValueError("One or more attachments were not found")
+        requirement = Requirement(
+            id=service.next_requirement_id(),
+            project_id=project_id,
+            prompt=f"{title.strip()}\n\n{prompt.strip()}".strip(),
+            acceptance_notes="Filed from chat.",
+            attachments=attachments,
+            status=RequirementStatus.DRAFT,
+        )
+        result = service.decompose_preview(requirement)
+        return result.requirement.id
+
+    def _service_for_project(self, project_id: str) -> RequirementService:
+        if project_id == getattr(self.service, "project_id", None):
+            return self.service
+        project = _resolve_project(self.project_repository, project_id)
+        repo_root = Path(project.path)
+        return RequirementService(
+            self.ticket_repository.scoped(project.id),
+            self.requirement_repository.scoped(project.id),
+            self.tech_lead,
+            repo_root=repo_root,
+            project_id=project.id,
+            context_injector=ContextInjector(repo_root),
+            settings_repository=self.settings_repository,
+        )
+
+
 class ProjectCreateRequest(BaseModel):
     name: str = Field(min_length=1)
     path: str = Field(min_length=1)
@@ -131,6 +446,9 @@ class ProjectCreateRequest(BaseModel):
 
 class ProjectSettingsRequest(BaseModel):
     env: dict[str, str] | None = None
+    env_allowlist: list[str] | None = None
+    test_allow_network: bool | None = None
+    sandbox_mode: Literal["auto", "docker", "unshare", "none"] | None = None
     setup_cmd: str | None = None
     cleanup_cmd: str | None = None
     default_branch: str | None = None
@@ -138,6 +456,12 @@ class ProjectSettingsRequest(BaseModel):
 
 class ProjectResponse(BaseModel):
     project: dict
+
+
+class DemoSeedResponse(BaseModel):
+    project: dict
+    requirement: dict
+    proposed_tickets: list[dict]
 
 
 class ProjectConventionsResponse(BaseModel):
@@ -153,6 +477,27 @@ class ProjectsResponse(BaseModel):
 class DeleteProjectResponse(BaseModel):
     deleted: bool
     project_id: str
+
+
+class RequirementTemplateRequest(BaseModel):
+    id: str | None = None
+    title: str = Field(min_length=1)
+    prompt: str = Field(min_length=1)
+    scope_paths: list[str] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+
+
+class RequirementTemplateResponse(BaseModel):
+    template: dict
+
+
+class RequirementTemplatesResponse(BaseModel):
+    templates: list[dict]
+
+
+class RequirementTemplateDeleteResponse(BaseModel):
+    deleted: bool
+    id: str
 
 
 class ManualTicketCreateRequest(BaseModel):
@@ -235,6 +580,116 @@ class CloudReasonerResponse(BaseModel):
     model_id: str
     provider: str
     providers: list[dict] = Field(default_factory=list)
+    registry: list[dict] = Field(default_factory=list)
+
+
+class CloudModelCreateRequest(BaseModel):
+    label: str = ""
+    provider: str = Field(min_length=1)
+    model_id: str = Field(min_length=1)
+    api_key: str = Field(min_length=1)
+
+
+class CloudModelResponse(BaseModel):
+    id: str
+    label: str
+    provider: str
+    model_id: str
+    key_configured: bool
+    deletable: bool = True
+
+
+class CloudModelsResponse(BaseModel):
+    models: list[CloudModelResponse]
+
+
+class CloudModelDeleteResponse(BaseModel):
+    deleted: bool
+    model_id: str
+
+
+class CloudModelTestRequest(BaseModel):
+    provider: str = Field(min_length=1)
+    model_id: str = Field(min_length=1)
+    api_key: str | None = None
+
+
+class CloudModelTestResponse(BaseModel):
+    ok: bool
+    message: str
+
+
+class CloudModelListRequest(BaseModel):
+    provider: str = Field(min_length=1)
+    api_key: str | None = None
+
+
+class CloudModelListResponse(BaseModel):
+    ok: bool
+    models: list[str] = Field(default_factory=list)
+    message: str = ""
+
+
+class IntegrationCredentialRequest(BaseModel):
+    provider: Literal["github", "gitlab", "slack"]
+    token: str = Field(min_length=1)
+    scopes: list[str] = Field(default_factory=list)
+    label: str = ""
+    id: str | None = None
+
+
+class IntegrationCredentialResponse(BaseModel):
+    provider: Literal["github", "gitlab", "slack"]
+    id: str
+    label: str
+    scopes: list[str]
+    configured: bool
+    created_at: str
+    updated_at: str
+
+
+class IntegrationCredentialsResponse(BaseModel):
+    integrations: list[IntegrationCredentialResponse]
+
+
+class IntegrationDeleteResponse(BaseModel):
+    deleted: bool
+    provider: str
+    id: str
+
+
+class RunEventsResponse(BaseModel):
+    events: list[dict]
+
+
+class InsightsResponse(BaseModel):
+    project_id: str
+    range: Literal["7d", "30d", "all"]
+    generated_at: str
+    throughput: dict
+    cycle_time: dict
+    escalation_rate: dict
+    local_vs_cloud: dict
+    cost: dict
+    model_scorecard: list[dict]
+
+
+class EvalRunRequest(BaseModel):
+    model_id: str = Field(min_length=1)
+    task_set_id: str = "r102-smoke"
+    trials: int = Field(default=1, ge=1, le=10)
+
+
+class EvalRunResponse(BaseModel):
+    eval_run: dict
+
+
+class EvalRunsResponse(BaseModel):
+    eval_runs: list[dict]
+
+
+class EvalTaskSetsResponse(BaseModel):
+    task_sets: list[dict]
 
 
 class NotificationSettingsRequest(BaseModel):
@@ -243,6 +698,29 @@ class NotificationSettingsRequest(BaseModel):
 
 class NotificationSettingsResponse(BaseModel):
     webhook_url: str
+
+
+class NotificationsResponse(BaseModel):
+    notifications: list[dict]
+    unread_count: dict
+
+
+class NotificationReadResponse(BaseModel):
+    notification: dict
+    unread_count: dict
+
+
+class NotificationReadAllResponse(BaseModel):
+    updated: int
+    unread_count: dict
+
+
+class CloudExecutionSettingsRequest(BaseModel):
+    allow_cloud_execution_model: bool = False
+
+
+class CloudExecutionSettingsResponse(BaseModel):
+    allow_cloud_execution_model: bool
 
 
 class TicketResponse(BaseModel):
@@ -255,6 +733,11 @@ class TicketsResponse(BaseModel):
 
 class OperationResponse(BaseModel):
     ticket: dict
+
+
+class PullRequestResponse(BaseModel):
+    pr_url: str
+    status: str
 
 
 class DeleteTicketResponse(BaseModel):
@@ -286,6 +769,7 @@ class AutoWorkerResponse(BaseModel):
     last_started_at: str | None
     last_run_at: str | None
     last_error: str
+    last_skipped_reason: str = ""
     project_id: str | None = None
 
 
@@ -350,6 +834,70 @@ def get_requirement_repository(
         connection.close()
 
 
+def get_chat_repository(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Generator[ChatRepository]:
+    connection = connect(_sqlite_path(settings.database_url))
+    try:
+        yield ChatRepository(connection)
+    finally:
+        connection.close()
+
+
+def get_run_event_repository(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Generator[RunEventRepository]:
+    connection = connect(_sqlite_path(settings.database_url))
+    try:
+        yield RunEventRepository(connection)
+    finally:
+        connection.close()
+
+
+def get_notification_repository(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Generator[NotificationRepository]:
+    connection = connect(_sqlite_path(settings.database_url))
+    try:
+        yield NotificationRepository(connection)
+    finally:
+        connection.close()
+
+
+def get_eval_repository(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Generator[EvalRunRepository]:
+    connection = connect(_sqlite_path(settings.database_url))
+    try:
+        yield EvalRunRepository(connection)
+    finally:
+        connection.close()
+
+
+def get_requirement_template_repository(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Generator[RequirementTemplateRepository]:
+    connection = connect(_sqlite_path(settings.database_url))
+    try:
+        yield RequirementTemplateRepository(connection)
+    finally:
+        connection.close()
+
+
+def get_integration_repository(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Generator[IntegrationRepository]:
+    connection = connect(_sqlite_path(settings.database_url))
+    try:
+        yield IntegrationRepository(connection)
+    finally:
+        connection.close()
+
+
+def get_attachment_storage() -> AttachmentStorage:
+    return AttachmentStorage(PROJECT_ROOT / ".haao" / "attachments")
+
+
 def get_project_repository(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> Generator[ProjectRepository]:
@@ -405,6 +953,73 @@ def get_requirement_service(
     )
 
 
+# Which model drives the conversational agent: "cloud" (default) or "local".
+CHAT_REASONER_MODE_SETTINGS_KEY = "chat_reasoner_mode"
+
+
+def _local_chat_model(settings_repository: SettingsRepository) -> str | None:
+    chain = local_model_fallback_chain(settings_repository)
+    return chain[0] if chain else None
+
+
+def _build_chat_reasoner(
+    *,
+    tech_lead: BaseCloudReasoner,
+    ticket_repository: TicketRepository,
+    settings: Settings,
+    settings_repository: SettingsRepository,
+):
+    """Cloud by default; local only when explicitly selected.
+
+    When local is selected we never silently fall back to cloud — a user who chose a
+    local model (typically for privacy or cost) must not have their conversation
+    quietly routed to a cloud model. If the local model is unavailable the reasoner
+    raises a clear error at send time instead. Reading chat history stays available
+    either way, since the reasoner is only invoked when sending a message.
+    """
+    mode = settings_repository.get_json(CHAT_REASONER_MODE_SETTINGS_KEY, "cloud")
+    if mode == "local":
+        endpoint = get_local_model_endpoints(settings_repository, settings)[0]
+        client = LMStudioClient(endpoint.base_url, api_key=endpoint.api_key)
+        return LocalChatReasoner(
+            client, _local_chat_model(settings_repository) or "", ticket_repository
+        )
+    return CloudChatReasoner(tech_lead, ticket_repository)
+
+
+def get_chat_service(
+    chat_repository: Annotated[ChatRepository, Depends(get_chat_repository)],
+    requirement_service: Annotated[RequirementService, Depends(get_requirement_service)],
+    repository: Annotated[TicketRepository, Depends(get_repository)],
+    requirement_repository: Annotated[
+        RequirementRepository,
+        Depends(get_requirement_repository),
+    ],
+    tech_lead: Annotated[BaseCloudReasoner, Depends(get_tech_lead_client)],
+    project_repository: Annotated[ProjectRepository, Depends(get_project_repository)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    settings_repository: Annotated[SettingsRepository, Depends(get_settings_repository)],
+) -> ChatService:
+    return ChatService(
+        repository=chat_repository,
+        reasoner=_build_chat_reasoner(
+            tech_lead=tech_lead,
+            ticket_repository=repository,
+            settings=settings,
+            settings_repository=settings_repository,
+        ),
+        requirements=RequirementServiceGateway(
+            requirement_service,
+            ticket_repository=repository,
+            requirement_repository=requirement_repository,
+            tech_lead=tech_lead,
+            project_repository=project_repository,
+            settings_repository=settings_repository,
+            chat_repository=chat_repository,
+        ),
+    )
+
+
 def get_state_service(
     repository: Annotated[TicketRepository, Depends(get_repository)],
 ) -> TicketStateService:
@@ -431,8 +1046,13 @@ def get_execution_loop(
     repository: Annotated[TicketRepository, Depends(get_repository)],
     state_service: Annotated[TicketStateService, Depends(get_state_service)],
     lmstudio: Annotated[LMStudioClient, Depends(get_lmstudio_client)],
+    requirement_repository: Annotated[
+        RequirementRepository,
+        Depends(get_requirement_repository),
+    ],
     project_repository: Annotated[ProjectRepository, Depends(get_project_repository)],
     settings_repository: Annotated[SettingsRepository, Depends(get_settings_repository)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> ExecutionLoop:
     project = _resolve_project(project_repository, repository.project_id)
     repo_root = Path(project.path)
@@ -445,10 +1065,18 @@ def get_execution_loop(
         test_runner=TestRunner(
             cwd=repo_root,
             env=project.env,
+            execution_policy=ExecutionPolicy(
+                test_allow_network=project.test_allow_network,
+                env_allowlist=tuple(project.env_allowlist),
+                sandbox_mode=project.sandbox_mode,
+            ),
             setup_cmd=project.setup_cmd,
             cleanup_cmd=project.cleanup_cmd,
         ),
         settings_repository=settings_repository,
+        requirement_repository=requirement_repository,
+        max_output_tokens=settings.local_max_output_tokens,
+        patch_mode_threshold_tokens=settings.local_patch_mode_threshold_tokens,
     )
 
 
@@ -492,6 +1120,23 @@ def get_git_ticket_flow(
     return GitTicketFlow(repo_root, workspace_guard=GitWorkspaceGuard(repo_root))
 
 
+def get_pull_request_service(
+    repository: Annotated[TicketRepository, Depends(get_repository)],
+    integrations: Annotated[IntegrationRepository, Depends(get_integration_repository)],
+    run_events: Annotated[RunEventRepository, Depends(get_run_event_repository)],
+    project_repository: Annotated[ProjectRepository, Depends(get_project_repository)],
+) -> PullRequestService:
+    project = _resolve_project(project_repository, repository.project_id)
+    return PullRequestService(
+        repository=repository,
+        integrations=integrations,
+        run_events=run_events,
+        repo_root=Path(project.path),
+        base_branch=project.default_branch,
+        workspace_guard=GitWorkspaceGuard(project.path),
+    )
+
+
 def get_escalation_service(
     repository: Annotated[TicketRepository, Depends(get_repository)],
     tech_lead: Annotated[ClaudeTechLeadClient, Depends(get_tech_lead_client)],
@@ -518,6 +1163,18 @@ def get_auto_orchestrator(
         workspace_guard=GitWorkspaceGuard(repo_root),
         allow_dirty_workspace=False,
     )
+
+
+@router.post("/api/demo/seed", response_model=DemoSeedResponse)
+@router.post("/demo/seed", response_model=DemoSeedResponse)
+def seed_demo_project(
+    repository: Annotated[ProjectRepository, Depends(get_project_repository)],
+) -> DemoSeedResponse:
+    try:
+        seeded = DemoSeedService(repository.connection).seed()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return DemoSeedResponse(**seeded)
 
 
 @router.post("/projects", response_model=ProjectResponse)
@@ -554,6 +1211,9 @@ def update_project_settings(
         project = repository.update_settings(
             project_id,
             env=request.env,
+            env_allowlist=request.env_allowlist,
+            test_allow_network=request.test_allow_network,
+            sandbox_mode=request.sandbox_mode,
             setup_cmd=request.setup_cmd,
             cleanup_cmd=request.cleanup_cmd,
             default_branch=request.default_branch,
@@ -670,6 +1330,59 @@ def delete_ticket(
     except TicketDeletionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return DeleteTicketResponse(deleted=True, ticket_id=ticket_id)
+
+
+@router.get("/api/requirement-templates", response_model=RequirementTemplatesResponse)
+@router.get("/requirement-templates", response_model=RequirementTemplatesResponse)
+def list_requirement_templates(
+    repository: Annotated[
+        RequirementTemplateRepository,
+        Depends(get_requirement_template_repository),
+    ],
+) -> RequirementTemplatesResponse:
+    return RequirementTemplatesResponse(
+        templates=[template.to_dict() for template in repository.list()]
+    )
+
+
+@router.post("/api/requirement-templates", response_model=RequirementTemplateResponse)
+@router.post("/requirement-templates", response_model=RequirementTemplateResponse)
+def upsert_requirement_template(
+    request: RequirementTemplateRequest,
+    repository: Annotated[
+        RequirementTemplateRepository,
+        Depends(get_requirement_template_repository),
+    ],
+) -> RequirementTemplateResponse:
+    try:
+        template = repository.upsert(
+            template_id=request.id,
+            title=request.title,
+            prompt=request.prompt,
+            scope_paths=request.scope_paths,
+            constraints=request.constraints,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return RequirementTemplateResponse(template=template.to_dict())
+
+
+@router.delete("/api/requirement-templates/{template_id}", response_model=RequirementTemplateDeleteResponse)
+@router.delete("/requirement-templates/{template_id}", response_model=RequirementTemplateDeleteResponse)
+def delete_requirement_template(
+    template_id: str,
+    repository: Annotated[
+        RequirementTemplateRepository,
+        Depends(get_requirement_template_repository),
+    ],
+) -> RequirementTemplateDeleteResponse:
+    try:
+        repository.delete(template_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return RequirementTemplateDeleteResponse(deleted=True, id=template_id)
 
 
 @router.post("/requirements", response_model=RequirementResponse)
@@ -828,6 +1541,290 @@ def get_requirement(
     return RequirementDetailResponse(requirement=requirement.to_dict())
 
 
+@router.get("/api/requirements/{requirement_id}/summary", response_model=RequirementSummaryResponse)
+@router.get("/requirements/{requirement_id}/summary", response_model=RequirementSummaryResponse)
+def get_requirement_summary(
+    requirement_id: str,
+    repository: Annotated[RequirementRepository, Depends(get_requirement_repository)],
+    project_id: str | None = None,
+) -> RequirementSummaryResponse:
+    try:
+        summary = build_requirement_summary(
+            repository.connection,
+            requirement_id=requirement_id,
+            project_id=project_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return RequirementSummaryResponse(summary=summary)
+
+
+@router.post("/api/chat/attachments", response_model=ChatAttachmentResponse)
+@router.post("/chat/attachments", response_model=ChatAttachmentResponse)
+async def upload_chat_attachment(
+    repository: Annotated[ChatRepository, Depends(get_chat_repository)],
+    storage: Annotated[AttachmentStorage, Depends(get_attachment_storage)],
+    project_id: str = Form("default"),
+    file: UploadFile = File(...),
+) -> ChatAttachmentResponse:
+    content = await file.read()
+    try:
+        upload = storage.store(
+            project_id=project_id,
+            filename=file.filename or "attachment",
+            mime=file.content_type,
+            content=content,
+        )
+        attachment = repository.create_attachment(project_id=project_id, upload=upload)
+    except AttachmentStorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _chat_attachment_response(attachment)
+
+
+@router.get("/api/chat/attachments/{attachment_id}/content")
+@router.get("/chat/attachments/{attachment_id}/content")
+def get_chat_attachment_content(
+    attachment_id: str,
+    repository: Annotated[ChatRepository, Depends(get_chat_repository)],
+    project_id: str = "default",
+) -> FileResponse:
+    attachments = repository.attachments_by_ids(project_id, [attachment_id])
+    if not attachments:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    attachment = attachments[0]
+    path = Path(attachment.stored_path)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Attachment file missing")
+    return FileResponse(path, media_type=attachment.mime, filename=attachment.filename)
+
+
+@router.post("/api/chat/messages", response_model=ChatTurnResponse)
+@router.post("/chat/messages", response_model=ChatTurnResponse)
+def create_chat_message(
+    request: ChatMessageCreateRequest,
+    service: Annotated[ChatService, Depends(get_chat_service)],
+    repository: Annotated[ChatRepository, Depends(get_chat_repository)],
+) -> ChatTurnResponse:
+    try:
+        try:
+            result = service.handle_user_message(
+                request.project_id,
+                request.text,
+                attachment_ids=request.attachment_ids,
+            )
+        except TypeError:
+            if request.attachment_ids:
+                raise
+            result = service.handle_user_message(request.project_id, request.text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ChatTurnResponse(
+        messages=[
+            _chat_message_response(message, repository)
+            for message in result.messages
+        ],
+        filed_requirement_ids=result.filed_requirement_ids,
+    )
+
+
+@router.get("/api/chat/messages", response_model=ChatMessagesResponse)
+@router.get("/chat/messages", response_model=ChatMessagesResponse)
+def list_chat_messages(
+    repository: Annotated[ChatRepository, Depends(get_chat_repository)],
+    project_id: str,
+    segment_id: str | None = None,
+    after: str | None = None,
+    limit: int | None = None,
+) -> ChatMessagesResponse:
+    return ChatMessagesResponse(
+        messages=[
+            _chat_message_response(message, repository)
+            for message in repository.list_messages(
+                project_id,
+                segment_id=segment_id,
+                after=after,
+                limit=limit,
+            )
+        ]
+    )
+
+
+@router.post("/api/chat/segments", response_model=ChatSegmentResponse)
+@router.post("/chat/segments", response_model=ChatSegmentResponse)
+def create_chat_segment(
+    request: ChatSegmentCreateRequest,
+    repository: Annotated[ChatRepository, Depends(get_chat_repository)],
+) -> ChatSegmentResponse:
+    try:
+        segment = repository.create_segment(project_id=request.project_id, title=request.title)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ChatSegmentResponse(**segment.to_dict())
+
+
+@router.get("/api/chat/segments", response_model=ChatSegmentsResponse)
+@router.get("/chat/segments", response_model=ChatSegmentsResponse)
+def list_chat_segments(
+    repository: Annotated[ChatRepository, Depends(get_chat_repository)],
+    project_id: str,
+) -> ChatSegmentsResponse:
+    return ChatSegmentsResponse(
+        segments=[
+            ChatSegmentResponse(**segment.to_dict())
+            for segment in repository.list_segments(project_id)
+        ]
+    )
+
+
+@router.get("/api/run-events", response_model=RunEventsResponse)
+@router.get("/run-events", response_model=RunEventsResponse)
+def list_run_events(
+    repository: Annotated[RunEventRepository, Depends(get_run_event_repository)],
+    project_id: str,
+    after: int | None = None,
+    limit: int | None = None,
+    ticket_id: str | None = None,
+) -> RunEventsResponse:
+    return RunEventsResponse(
+        events=[
+            event.to_dict()
+            for event in repository.list_run_events(
+                project_id,
+                after=after,
+                limit=limit,
+                ticket_id=ticket_id,
+            )
+        ]
+    )
+
+
+@router.get("/api/insights", response_model=InsightsResponse)
+@router.get("/insights", response_model=InsightsResponse)
+def get_insights(
+    repository: Annotated[TicketRepository, Depends(get_repository)],
+    project_id: str,
+    range_name: Annotated[Literal["7d", "30d", "all"], Query(alias="range")] = "30d",
+) -> InsightsResponse:
+    return InsightsResponse(
+        **InsightsService(repository.connection).aggregate(
+            project_id=project_id,
+            range_name=range_name,
+        )
+    )
+
+
+@router.get("/api/evals/task-sets", response_model=EvalTaskSetsResponse)
+@router.get("/evals/task-sets", response_model=EvalTaskSetsResponse)
+def list_eval_task_sets(
+    repository: Annotated[EvalRunRepository, Depends(get_eval_repository)],
+) -> EvalTaskSetsResponse:
+    try:
+        service = EvalService(repository)
+        return EvalTaskSetsResponse(task_sets=[task_set.to_dict() for task_set in service.list_task_sets()])
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/api/evals", response_model=EvalRunsResponse)
+@router.get("/evals", response_model=EvalRunsResponse)
+def list_eval_runs(
+    repository: Annotated[EvalRunRepository, Depends(get_eval_repository)],
+    model_id: str | None = Query(default=None),
+    task_set_id: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=500),
+) -> EvalRunsResponse:
+    return EvalRunsResponse(
+        eval_runs=[
+            run.to_dict()
+            for run in repository.list(
+                model_id=model_id,
+                task_set_id=task_set_id,
+                limit=limit,
+            )
+        ]
+    )
+
+
+@router.post("/api/evals/run", response_model=EvalRunResponse)
+@router.post("/evals/run", response_model=EvalRunResponse)
+def start_eval_run(
+    request: EvalRunRequest,
+    background_tasks: BackgroundTasks,
+    repository: Annotated[EvalRunRepository, Depends(get_eval_repository)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> EvalRunResponse:
+    try:
+        service = EvalService(repository)
+        run = service.start_run(
+            model_id=request.model_id,
+            task_set_id=request.task_set_id,
+            trials=request.trials,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    background_tasks.add_task(
+        _run_eval_background,
+        settings.database_url,
+        run.id,
+        settings,
+    )
+    return EvalRunResponse(eval_run=run.to_dict())
+
+
+@router.get("/api/notifications", response_model=NotificationsResponse)
+@router.get("/notifications", response_model=NotificationsResponse)
+def list_notifications(
+    repository: Annotated[NotificationRepository, Depends(get_notification_repository)],
+    project_id: str | None = None,
+    unread_only: bool = False,
+    limit: int | None = None,
+) -> NotificationsResponse:
+    return NotificationsResponse(
+        notifications=[
+            notification.to_dict()
+            for notification in repository.list(
+                project_id=project_id,
+                unread_only=unread_only,
+                limit=limit,
+            )
+        ],
+        unread_count=repository.unread_counts(),
+    )
+
+
+@router.post("/api/notifications/{notification_id}/read", response_model=NotificationReadResponse)
+@router.post("/notifications/{notification_id}/read", response_model=NotificationReadResponse)
+def mark_notification_read(
+    notification_id: int,
+    repository: Annotated[NotificationRepository, Depends(get_notification_repository)],
+) -> NotificationReadResponse:
+    try:
+        notification = repository.mark_read(notification_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return NotificationReadResponse(
+        notification=notification.to_dict(),
+        unread_count=repository.unread_counts(),
+    )
+
+
+@router.post("/api/notifications/read-all", response_model=NotificationReadAllResponse)
+@router.post("/notifications/read-all", response_model=NotificationReadAllResponse)
+def mark_all_notifications_read(
+    repository: Annotated[NotificationRepository, Depends(get_notification_repository)],
+    project_id: str | None = None,
+) -> NotificationReadAllResponse:
+    updated = repository.mark_all_read(project_id=project_id)
+    return NotificationReadAllResponse(
+        updated=updated,
+        unread_count=repository.unread_counts(),
+    )
+
+
 @router.post("/tickets/{ticket_id}/move", response_model=OperationResponse)
 def move_ticket(
     ticket_id: str,
@@ -879,10 +1876,23 @@ def accept_ticket(
     ticket_id: str,
     repository: Annotated[TicketRepository, Depends(get_repository)],
     service: Annotated[TicketStateService, Depends(get_state_service)],
+    pr_service: Annotated[PullRequestService, Depends(get_pull_request_service)],
 ) -> OperationResponse:
     ticket = repository.get(ticket_id)
     if ticket is None:
         raise HTTPException(status_code=404, detail="Ticket not found")
+    if pr_service.has_pr_integration():
+        try:
+            pr_service.open_or_update_pr(ticket_id)
+        except AcceptanceGateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except DirtyWorkspaceError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PullRequestFlowError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        ticket = repository.get(ticket_id)
+        if ticket is None:
+            raise HTTPException(status_code=404, detail="Ticket not found")
     ticket_json = ticket.to_dict()
     metadata = ticket_json.setdefault("metadata", {})
     metadata["accepted_by"] = "product-owner"
@@ -894,6 +1904,27 @@ def accept_ticket(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     repository.append_log(ticket_id, "Product Owner accepted ticket")
     return OperationResponse(ticket=result.ticket.to_dict())
+
+
+@router.post("/api/tickets/{ticket_id}/pr", response_model=PullRequestResponse)
+@router.post("/tickets/{ticket_id}/pr", response_model=PullRequestResponse)
+def open_ticket_pr(
+    ticket_id: str,
+    service: Annotated[PullRequestService, Depends(get_pull_request_service)],
+) -> PullRequestResponse:
+    try:
+        result = service.open_or_update_pr(ticket_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except AcceptanceGateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DirtyWorkspaceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except MissingIntegrationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except PullRequestFlowError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return PullRequestResponse(pr_url=result.pr_url, status=result.status)
 
 
 @router.post("/tickets/{ticket_id}/reject", response_model=OperationResponse)
@@ -950,6 +1981,7 @@ def assign_model(
 def retry_ticket(
     ticket_id: str,
     repository: Annotated[TicketRepository, Depends(get_repository)],
+    run_events: Annotated[RunEventRepository, Depends(get_run_event_repository)],
 ) -> OperationResponse:
     ticket = repository.get(ticket_id)
     if ticket is None:
@@ -969,6 +2001,19 @@ def retry_ticket(
     metadata["manual_retry"] = True
     updated = repository.save(type(ticket).from_dict(ticket_json))
     repository.append_log(ticket_id, "Manual retry requested")
+    run_events.append_run_event(
+        project_id=_ticket_project_id(updated),
+        requirement_id=_ticket_requirement_id(updated),
+        ticket_id=updated.id,
+        run_id=_ticket_run_id(updated),
+        event_type="retry",
+        model_id=updated.execution.assigned_model,
+        payload={
+            "reason": "manual_retry",
+            "attempt": 0,
+            "retry_budget": updated.execution.retry_budget,
+        },
+    )
     return OperationResponse(ticket=updated.to_dict())
 
 
@@ -977,6 +2022,7 @@ def escalate_ticket(
     ticket_id: str,
     request: EscalateRequest,
     repository: Annotated[TicketRepository, Depends(get_repository)],
+    run_events: Annotated[RunEventRepository, Depends(get_run_event_repository)],
 ) -> OperationResponse:
     ticket = repository.get(ticket_id)
     if ticket is None:
@@ -988,6 +2034,19 @@ def escalate_ticket(
     metadata["escalation_reason"] = request.reason
     updated = repository.save(type(ticket).from_dict(ticket_json))
     repository.append_log(ticket_id, f"Manual escalation: {request.reason}", level="warn")
+    run_events.append_run_event(
+        project_id=_ticket_project_id(updated),
+        requirement_id=_ticket_requirement_id(updated),
+        ticket_id=updated.id,
+        run_id=_ticket_run_id(updated),
+        event_type="escalation",
+        model_id=updated.execution.assigned_model,
+        payload={
+            "reason": request.reason,
+            "escalated_to": metadata["escalated_to"],
+            "manual": True,
+        },
+    )
     return OperationResponse(ticket=updated.to_dict())
 
 
@@ -1235,6 +2294,9 @@ async def start_auto_worker(
         repo_root=Path(project.path),
         database_root=PROJECT_ROOT,
         env=project.env,
+        env_allowlist=project.env_allowlist,
+        test_allow_network=project.test_allow_network,
+        sandbox_mode=project.sandbox_mode,
         setup_cmd=project.setup_cmd,
         cleanup_cmd=project.cleanup_cmd,
         interval_sec=request.interval_sec,
@@ -1389,6 +2451,33 @@ def list_available_cloud_models(
     )
 
 
+class ChatReasonerConfigResponse(BaseModel):
+    mode: Literal["cloud", "local"]
+
+
+class ChatReasonerConfigRequest(BaseModel):
+    mode: Literal["cloud", "local"]
+
+
+@router.get("/config/chat-reasoner", response_model=ChatReasonerConfigResponse)
+def get_chat_reasoner_config(
+    settings_repository: Annotated[SettingsRepository, Depends(get_settings_repository)],
+) -> ChatReasonerConfigResponse:
+    mode = settings_repository.get_json(CHAT_REASONER_MODE_SETTINGS_KEY, "cloud")
+    if mode not in ("cloud", "local"):
+        mode = "cloud"
+    return ChatReasonerConfigResponse(mode=mode)
+
+
+@router.put("/config/chat-reasoner", response_model=ChatReasonerConfigResponse)
+def update_chat_reasoner_config(
+    request: ChatReasonerConfigRequest,
+    settings_repository: Annotated[SettingsRepository, Depends(get_settings_repository)],
+) -> ChatReasonerConfigResponse:
+    settings_repository.set_json(CHAT_REASONER_MODE_SETTINGS_KEY, request.mode)
+    return ChatReasonerConfigResponse(mode=request.mode)
+
+
 @router.post("/config/claude-model/test", response_model=ClaudeConnectionTestResponse)
 def test_claude_connection(
     request: ClaudeConnectionTestRequest,
@@ -1433,6 +2522,7 @@ def get_cloud_reasoner_config(
         model_id=model_id,
         provider=provider,
         providers=provider_options(settings),
+        registry=cloud_model_inventory(settings, settings_repository),
     )
 
 
@@ -1452,7 +2542,173 @@ def update_cloud_reasoner_config(
         model_id=cleaned,
         provider=provider,
         providers=provider_options(settings),
+        registry=cloud_model_inventory(settings, settings_repository),
     )
+
+
+@router.get("/api/config/cloud-models", response_model=CloudModelsResponse)
+@router.get("/config/cloud-models", response_model=CloudModelsResponse)
+def get_cloud_models(
+    settings: Annotated[Settings, Depends(get_settings)],
+    settings_repository: Annotated[SettingsRepository, Depends(get_settings_repository)],
+) -> CloudModelsResponse:
+    return CloudModelsResponse(
+        models=[
+            CloudModelResponse(**model)
+            for model in cloud_model_inventory(settings, settings_repository)
+        ],
+    )
+
+
+@router.post("/api/config/cloud-models", response_model=CloudModelResponse)
+@router.post("/config/cloud-models", response_model=CloudModelResponse)
+def create_cloud_model(
+    request: CloudModelCreateRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    settings_repository: Annotated[SettingsRepository, Depends(get_settings_repository)],
+) -> CloudModelResponse:
+    try:
+        if _cloud_model_request_id(request) == default_anthropic_model_id(settings, settings_repository):
+            raise CloudModelRegistryError("The default Claude model is built in and cannot be overwritten")
+        model = add_cloud_model(
+            settings_repository,
+            label=request.label,
+            provider=request.provider,
+            model_id=request.model_id,
+            api_key=request.api_key,
+        )
+    except (CloudModelRegistryError, SecretEncryptionError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return CloudModelResponse(**model.to_public_dict(), deletable=True)
+
+
+@router.post("/api/config/cloud-models/test", response_model=CloudModelTestResponse)
+@router.post("/config/cloud-models/test", response_model=CloudModelTestResponse)
+def test_cloud_model_connection(
+    request: CloudModelTestRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    settings_repository: Annotated[SettingsRepository, Depends(get_settings_repository)],
+) -> CloudModelTestResponse:
+    provider = request.provider.strip().lower()
+    model_id = request.model_id.strip()
+    qualified_id = f"{provider}:{model_id}"
+    api_key = (request.api_key or "").strip()
+    if not api_key:
+        try:
+            api_key = api_key_for_model(qualified_id, provider, settings, settings_repository)
+        except Exception as exc:
+            return CloudModelTestResponse(ok=False, message=str(exc))
+    if not api_key:
+        return CloudModelTestResponse(ok=False, message="API key is not configured")
+    try:
+        client = make_cloud_reasoner(qualified_id, api_key=api_key, timeout_sec=15.0)
+        try:
+            client._ensure_ready()
+            client._complete("Reply with OK.")
+        finally:
+            client.close()
+    except Exception as exc:
+        return CloudModelTestResponse(ok=False, message=str(exc))
+    return CloudModelTestResponse(ok=True, message="Connection OK")
+
+
+@router.post("/api/config/cloud-models/list-models", response_model=CloudModelListResponse)
+@router.post("/config/cloud-models/list-models", response_model=CloudModelListResponse)
+def list_provider_models(
+    request: CloudModelListRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> CloudModelListResponse:
+    """List the models a provider exposes for a given key, so the UI can offer a
+    pick-list instead of making the user type a model id."""
+    provider = request.provider.strip().lower()
+    api_key = (request.api_key or "").strip() or api_key_for_provider(provider, settings)
+    if not api_key:
+        return CloudModelListResponse(ok=False, message="API key is not configured")
+    try:
+        if provider in ANTHROPIC_ALIASES:
+            models = list_available_claude_models(api_key)
+        elif provider in OPENAI_COMPAT_BASE_URLS:
+            client = LMStudioClient(OPENAI_COMPAT_BASE_URLS[provider], api_key=api_key, timeout_sec=15.0)
+            try:
+                models = client.list_models()
+            finally:
+                client.close()
+        else:
+            return CloudModelListResponse(
+                ok=False,
+                message=f"Unknown provider '{provider}'. Supported: anthropic, "
+                + ", ".join(sorted(OPENAI_COMPAT_BASE_URLS)),
+            )
+    except Exception as exc:
+        return CloudModelListResponse(ok=False, message=str(exc))
+    return CloudModelListResponse(ok=True, models=sorted(models))
+
+
+@router.delete("/api/config/cloud-models/{model_id:path}", response_model=CloudModelDeleteResponse)
+@router.delete("/config/cloud-models/{model_id:path}", response_model=CloudModelDeleteResponse)
+def remove_cloud_model(
+    model_id: str,
+    settings: Annotated[Settings, Depends(get_settings)],
+    settings_repository: Annotated[SettingsRepository, Depends(get_settings_repository)],
+) -> CloudModelDeleteResponse:
+    if model_id == default_anthropic_model_id(settings, settings_repository):
+        raise HTTPException(status_code=400, detail="The default Claude model cannot be deleted")
+    deleted = delete_cloud_model(settings_repository, model_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Cloud model not found")
+    return CloudModelDeleteResponse(deleted=True, model_id=model_id)
+
+
+@router.get("/api/config/integrations", response_model=IntegrationCredentialsResponse)
+@router.get("/config/integrations", response_model=IntegrationCredentialsResponse)
+def list_integrations(
+    repository: Annotated[IntegrationRepository, Depends(get_integration_repository)],
+    provider: Literal["github", "gitlab", "slack"] | None = None,
+) -> IntegrationCredentialsResponse:
+    return IntegrationCredentialsResponse(
+        integrations=[
+            IntegrationCredentialResponse(**credential.to_public_dict())
+            for credential in repository.list(provider)
+        ]
+    )
+
+
+@router.post("/api/config/integrations", response_model=IntegrationCredentialResponse)
+@router.post("/config/integrations", response_model=IntegrationCredentialResponse)
+def upsert_integration(
+    request: IntegrationCredentialRequest,
+    repository: Annotated[IntegrationRepository, Depends(get_integration_repository)],
+) -> IntegrationCredentialResponse:
+    try:
+        credential = repository.upsert(
+            provider=request.provider,
+            credential_id=request.id,
+            label=request.label,
+            scopes=request.scopes,
+            token=request.token,
+        )
+    except SecretEncryptionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return IntegrationCredentialResponse(**credential.to_public_dict())
+
+
+@router.delete(
+    "/api/config/integrations/{provider}/{credential_id}",
+    response_model=IntegrationDeleteResponse,
+)
+@router.delete(
+    "/config/integrations/{provider}/{credential_id}",
+    response_model=IntegrationDeleteResponse,
+)
+def delete_integration(
+    provider: Literal["github", "gitlab", "slack"],
+    credential_id: str,
+    repository: Annotated[IntegrationRepository, Depends(get_integration_repository)],
+) -> IntegrationDeleteResponse:
+    deleted = repository.delete(provider, credential_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Integration credential not found")
+    return IntegrationDeleteResponse(deleted=True, provider=provider, id=credential_id)
 
 
 @router.get("/config/notifications", response_model=NotificationSettingsResponse)
@@ -1474,14 +2730,43 @@ def update_notification_settings(
     )
 
 
+@router.get("/config/cloud-execution", response_model=CloudExecutionSettingsResponse)
+def get_cloud_execution_settings(
+    settings_repository: Annotated[SettingsRepository, Depends(get_settings_repository)],
+) -> CloudExecutionSettingsResponse:
+    return CloudExecutionSettingsResponse(
+        allow_cloud_execution_model=bool(
+            settings_repository.get_json(ALLOW_CLOUD_EXECUTION_SETTINGS_KEY, False),
+        ),
+    )
+
+
+@router.put("/config/cloud-execution", response_model=CloudExecutionSettingsResponse)
+def update_cloud_execution_settings(
+    request: CloudExecutionSettingsRequest,
+    settings_repository: Annotated[SettingsRepository, Depends(get_settings_repository)],
+) -> CloudExecutionSettingsResponse:
+    settings_repository.set_json(
+        ALLOW_CLOUD_EXECUTION_SETTINGS_KEY,
+        request.allow_cloud_execution_model,
+    )
+    return CloudExecutionSettingsResponse(
+        allow_cloud_execution_model=request.allow_cloud_execution_model,
+    )
+
+
 @router.websocket("/tickets/{ticket_id}/logs")
 async def ticket_logs(
     websocket: WebSocket,
     ticket_id: str,
     project_id: str | None = None,
 ) -> None:
-    await websocket.accept()
     settings = get_settings()
+    token = settings.haao_api_token.strip()
+    if token and not _websocket_token_valid(websocket, token):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
     connection = connect(_sqlite_path(settings.database_url))
     repository = TicketRepository(connection, project_id=project_id)
     sent = 0
@@ -1496,6 +2781,107 @@ async def ticket_logs(
         return
     finally:
         connection.close()
+
+
+def _chat_message_response(
+    message: ChatMessage,
+    repository: ChatRepository | None = None,
+) -> ChatMessageResponse:
+    attachments: list[ChatAttachmentResponse] = []
+    if repository is not None and message.attachment_ids:
+        attachments = [
+            _chat_attachment_response(attachment)
+            for attachment in repository.attachments_by_ids(
+                message.project_id,
+                message.attachment_ids,
+            )
+        ]
+    return ChatMessageResponse(
+        id=message.id,
+        project_id=message.project_id,
+        role=message.role,
+        text=message.text,
+        segment_id=message.segment_id,
+        created_at=message.created_at,
+        requirement_id=message.requirement_id,
+        ticket_id=message.ticket_id,
+        report_kind=message.report_kind,
+        attachment_ids=message.attachment_ids,
+        attachments=attachments,
+    )
+
+
+def _chat_attachment_response(attachment: ChatAttachment) -> ChatAttachmentResponse:
+    return ChatAttachmentResponse(**attachment.to_public_dict())
+
+
+def _chat_reasoner_prompt(
+    summary: str,
+    recent: list[ChatMessage],
+    user_text: str,
+    open_tickets: list[dict] | None = None,
+) -> str:
+    recent_json = [
+        {
+            "role": message.role,
+            "text": message.text,
+            "requirement_id": message.requirement_id,
+            "ticket_id": message.ticket_id,
+            "report_kind": message.report_kind,
+            "created_at": message.created_at,
+        }
+        for message in recent
+    ]
+    board_json = open_tickets or []
+    return (
+        "You are the HAAO conversational product agent for an indie developer or small "
+        "team. You talk with the user about what they want built and turn committed work "
+        "into backlog proposals. A separate Tech Lead later splits each proposal into "
+        "atomic tickets, so you do NOT break work down yourself.\n\n"
+        "Decide whether the latest user message contains committed implementation work.\n"
+        "FILE work_items when the user's intent to build, change, or fix something is "
+        "clear — including reasonable inference from the recent conversation.\n"
+        "Do NOT file (use an empty work_items array) for: questions, status checks, "
+        "brainstorming or weighing options, vague wishes with no decision yet, or anything "
+        "already covered by an open ticket on the board below. When you are genuinely "
+        "unsure, do not file — ask a short clarifying question in 'reply' instead.\n\n"
+        "Granularity: each work_item is ONE requirement-level piece (a feature, a fix, a "
+        "change) — never pre-split into tiny tasks. Emit multiple work_items only when the "
+        "user clearly described separate, unrelated pieces of work.\n"
+        "'title' is a short label. 'prompt' is a clear, self-contained description of the "
+        "work for the Tech Lead (what to build and what 'done' means), written in the "
+        "user's language.\n\n"
+        "'reply' is a short, conversational message. When you file work_items the system "
+        "automatically tells the user what is being filed, so 'reply' must NOT restate the "
+        "items — keep it a brief follow-up (e.g. a clarifying question) or empty.\n"
+        "'updated_summary' is a rolling summary of the project conversation (decisions, "
+        "what has been filed, open threads). Return the new summary, or null if unchanged.\n\n"
+        "Return ONLY valid JSON (no markdown, no code fences, no text outside the object) "
+        "with this exact shape:\n"
+        "{"
+        "\"reply\":\"short user-facing reply\","
+        "\"work_items\":[{\"title\":\"short title\",\"prompt\":\"requirement description\"}],"
+        "\"updated_summary\":\"running summary or null\""
+        "}\n\n"
+        f"Running summary:\n{summary.strip() or '(empty)'}\n\n"
+        f"Open tickets on the board (avoid duplicating these):\n"
+        f"{json.dumps(board_json, ensure_ascii=False)}\n\n"
+        f"Recent messages JSON:\n{json.dumps(recent_json, ensure_ascii=False)}\n\n"
+        f"Latest user message:\n{user_text.strip()}"
+    )
+
+
+def _cloud_model_request_id(request: CloudModelCreateRequest) -> str:
+    provider = request.provider.strip().lower()
+    if provider in ANTHROPIC_ALIASES or provider == "claude":
+        provider = "anthropic"
+    return f"{provider}:{request.model_id.strip()}"
+
+
+def _websocket_token_valid(websocket: WebSocket, token: str) -> bool:
+    authorization = websocket.headers.get("authorization")
+    query_token = websocket.query_params.get("token")
+    return authorization == f"Bearer {token}" or query_token == token
 
 
 def _sqlite_path(database_url: str) -> str:
@@ -1526,6 +2912,33 @@ def _resolve_project(
     if project is None:
         raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
     return project
+
+
+def _ticket_project_id(ticket: Ticket) -> str:
+    if ticket.metadata is not None:
+        metadata = ticket.metadata.model_dump(mode="json")
+        project_id = metadata.get("project_id")
+        if isinstance(project_id, str) and project_id:
+            return project_id
+    return "default"
+
+
+def _ticket_requirement_id(ticket: Ticket) -> str | None:
+    if ticket.metadata is not None:
+        metadata = ticket.metadata.model_dump(mode="json")
+        requirement_id = metadata.get("requirement_id")
+        if isinstance(requirement_id, str) and requirement_id:
+            return requirement_id
+    return None
+
+
+def _ticket_run_id(ticket: Ticket) -> str | None:
+    if ticket.metadata is not None:
+        metadata = ticket.metadata.model_dump(mode="json")
+        run_id = metadata.get("last_run_id")
+        if isinstance(run_id, str) and run_id:
+            return run_id
+    return None
 
 
 def _body_project_manual_ticket_service(
@@ -1572,6 +2985,14 @@ def _body_project_requirement_service(
         context_injector=ContextInjector(repo_root),
         settings_repository=settings_repository,
     )
+
+
+def _run_eval_background(database_url: str, eval_id: str, settings: Settings) -> None:
+    connection = connect(_sqlite_path(database_url))
+    try:
+        EvalService(EvalRunRepository(connection)).run_to_completion(eval_id, settings=settings)
+    finally:
+        connection.close()
 
 
 def _now() -> str:

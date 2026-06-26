@@ -2,7 +2,7 @@ import type { TicketStatus } from './types';
 
 export const CLAUDE_TECH_LEAD = 'Claude · Tech Lead';
 
-export const CLOUD_ONLY_ROUTE_IDS = new Set(['po', 'escalation']);
+export const CLOUD_ONLY_ROUTE_IDS = new Set(['tech_lead', 'escalation']);
 
 export function formatAuditVerdict(verdict: string): string {
   const normalized = verdict.trim().toLowerCase();

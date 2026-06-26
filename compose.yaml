@@ -1,0 +1,54 @@
+name: haao
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: sqlite:////data/haao.sqlite3
+      LMSTUDIO_BASE_URL: ${DOCKER_LMSTUDIO_BASE_URL:-http://host.docker.internal:1234/v1}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      # HAAO must be able to modify the repository it orchestrates.
+      - .:/workspace
+      - ${HAAO_PROJECTS_DIR:-.}:/projects
+      - haao-data:/data
+    working_dir: /workspace
+    ports:
+      - "${HAAO_API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: frontend
+      dockerfile: Dockerfile
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${HAAO_PORT:-3001}:80"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  haao-data:

@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator.models.ticket import TestCommand, Ticket
+from orchestrator.policies import ExecutionPolicy
 from orchestrator.runner.dod_runner import (
     TestRunner,
     TestRunnerError,
@@ -104,7 +105,13 @@ def test_run_test_uses_argument_array_not_shell(tmp_path: Path) -> None:
 
 
 def test_run_test_injects_project_env() -> None:
-    runner = TestRunner(env={"HAAO_FLAG": "ok"})
+    runner = TestRunner(
+        env={"HAAO_FLAG": "ok"},
+        execution_policy=ExecutionPolicy(
+            test_allow_network=True,
+            env_allowlist=("PATH", "PYTHONPATH", "HAAO_FLAG"),
+        ),
+    )
 
     result = runner.run_test_safe(
         TestCommand(
@@ -116,6 +123,31 @@ def test_run_test_injects_project_env() -> None:
 
     assert result.status == "pass"
     assert result.stdout.strip() == "ok"
+
+
+def test_run_test_filters_env_to_allowlist() -> None:
+    runner = TestRunner(
+        env={"HAAO_FLAG": "ok", "SECRET_TOKEN": "nope"},
+        execution_policy=ExecutionPolicy(
+            test_allow_network=True,
+            env_allowlist=("PATH", "PYTHONPATH", "HAAO_FLAG"),
+        ),
+    )
+
+    result = runner.run_test_safe(
+        TestCommand(
+            command=(
+                f"{sys.executable} -c \"import os; "
+                "print(os.environ.get('HAAO_FLAG')); "
+                "print(os.environ.get('SECRET_TOKEN', 'missing'))\""
+            ),
+            expect="pass",
+            timeout_sec=5,
+        )
+    )
+
+    assert result.status == "pass"
+    assert result.stdout.splitlines() == ["ok", "missing"]
 
 
 def test_run_ticket_tests_runs_setup_and_cleanup(tmp_path: Path, fresh_ticket_dict) -> None:

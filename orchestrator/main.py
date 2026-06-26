@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from orchestrator.api import _sqlite_path, router
 from orchestrator.auto_worker import auto_worker
@@ -30,6 +31,21 @@ app = FastAPI(
 )
 
 app.include_router(router)
+
+
+@app.middleware("http")
+async def api_token_auth(request: Request, call_next):
+    settings = get_settings()
+    token = settings.haao_api_token.strip()
+    # Gate every route except the unauthenticated health check. Endpoints are
+    # dual-registered at both `/api/...` and bare `/...`, so gating only the
+    # `/api/` prefix left the bare paths (e.g. /config/integrations, /chat/messages)
+    # open — an auth bypass. Token-set => everything but /health requires it.
+    if token and request.url.path != "/health":
+        expected = f"Bearer {token}"
+        if request.headers.get("authorization") != expected:
+            return JSONResponse({"detail": "Invalid or missing API token"}, status_code=401)
+    return await call_next(request)
 
 
 @app.get("/health")

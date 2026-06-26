@@ -135,12 +135,48 @@ def next_local_fallback_model(
     return chain[index + 1]
 
 
+# Opt-in flag: when truthy, ticket execution models are NOT forced to local,
+# allowing every role (incl. the dev/execution role) to run on a cloud model.
+# Default (absent / falsey) preserves the original local-forcing behaviour.
+ALLOW_CLOUD_EXECUTION_SETTINGS_KEY = "allow_cloud_execution_model"
+
+
+def cloud_execution_allowed(repository: SettingsRepository | None = None) -> bool:
+    if repository is None:
+        return False
+    return bool(repository.get_json(ALLOW_CLOUD_EXECUTION_SETTINGS_KEY, False))
+
+
+def explicit_cloud_execution_model(
+    model_id: str | None,
+    repository: SettingsRepository | None = None,
+) -> bool:
+    if not is_cloud_reasoner_model(model_id):
+        return False
+    routed = role_routing_store.get().get("dev_team")
+    routed_models = routed if isinstance(routed, list) else [routed]
+    if model_id not in routed_models:
+        return False
+    if repository is None:
+        return True
+    try:
+        from orchestrator.cloud_models import get_cloud_model
+
+        return get_cloud_model(repository, model_id or "") is not None
+    except Exception:
+        return False
+
+
 def enforce_local_execution_model(
     ticket_dict: dict,
     repository: SettingsRepository | None = None,
 ) -> bool:
+    if cloud_execution_allowed(repository):
+        return False
     execution = ticket_dict.setdefault("execution", {})
     original = execution.get("assigned_model")
+    if explicit_cloud_execution_model(original if isinstance(original, str) else None, repository):
+        return False
     sanitized = local_execution_model(
         original if isinstance(original, str) else None,
         repository=repository,

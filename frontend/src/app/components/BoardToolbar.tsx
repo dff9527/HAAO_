@@ -2,15 +2,19 @@ import { forwardRef } from 'react';
 import { AlertTriangle, Circle, Filter, Loader2, Play, Search, Settings, Square, X } from 'lucide-react';
 import type { BoardFilters, BoardPriorityFilter, BoardTypeFilter } from '../boardFilters';
 import { hasActiveBoardFilters } from '../boardFilters';
+import { AddWorkMenu } from './AddWorkMenu';
 
 interface Props {
+  boardLive: boolean;
   attentionCount: number;
   attentionFilter: boolean;
   onToggleAttentionFilter: () => void;
-  boardLive: boolean;
+  onNewRequirement: () => void;
+  onNewTicket: () => void;
   autoRunRunning: boolean;
   autoRunPending: boolean;
   autoRunError: string;
+  autoRunNotice: string;
   onToggleAutoRun: () => void;
   projectPathReady: boolean;
   modelsConfigured: boolean;
@@ -24,13 +28,16 @@ interface Props {
 }
 
 export const BoardToolbar = forwardRef<HTMLInputElement, Props>(function BoardToolbar({
+  boardLive,
   attentionCount,
   attentionFilter,
   onToggleAttentionFilter,
-  boardLive,
+  onNewRequirement,
+  onNewTicket,
   autoRunRunning,
   autoRunPending,
   autoRunError,
+  autoRunNotice,
   onToggleAutoRun,
   projectPathReady,
   modelsConfigured,
@@ -97,27 +104,6 @@ export const BoardToolbar = forwardRef<HTMLInputElement, Props>(function BoardTo
           <option value="low">Low</option>
         </select>
 
-        <button
-          type="button"
-          onClick={onToggleAttentionFilter}
-          className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
-            attentionFilter
-              ? 'border-primary bg-primary/10 text-primary'
-              : 'border-border text-muted-foreground hover:bg-muted hover:text-foreground'
-          }`}
-        >
-          <Filter size={12} />
-          Needs you
-          {attentionCount > 0 && (
-            <span className={`tabular-nums px-1.5 py-0 rounded-full text-[10px] ${
-              attentionFilter ? 'bg-primary text-primary-foreground' : 'bg-muted text-foreground'
-            }`}
-            >
-              {attentionCount}
-            </span>
-          )}
-        </button>
-
         {filtersActive && (
           <button
             type="button"
@@ -127,6 +113,33 @@ export const BoardToolbar = forwardRef<HTMLInputElement, Props>(function BoardTo
             Clear filters
           </button>
         )}
+
+        <button
+          type="button"
+          onClick={onToggleAttentionFilter}
+          title={attentionFilter ? 'Clear needs-you filter' : 'Show tickets that need you'}
+          className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+            attentionFilter
+              ? 'border-primary bg-primary/10 text-primary'
+              : attentionCount > 0
+                ? 'border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200'
+                : 'border-border text-muted-foreground hover:bg-muted hover:text-foreground'
+          }`}
+        >
+          <Filter size={12} />
+          <span className="hidden sm:inline">Needs you</span>
+          {attentionCount > 0 && (
+            <span
+              className={`tabular-nums min-w-[1.1rem] text-center px-1 py-0 rounded-full text-[10px] ${
+                attentionFilter
+                  ? 'bg-primary text-primary-foreground'
+                  : 'bg-amber-200 text-amber-900 dark:bg-amber-900 dark:text-amber-100'
+              }`}
+            >
+              {attentionCount}
+            </span>
+          )}
+        </button>
 
         <button
           type="button"
@@ -163,10 +176,19 @@ export const BoardToolbar = forwardRef<HTMLInputElement, Props>(function BoardTo
           )}
         </button>
 
+        <AddWorkMenu onNewRequirement={onNewRequirement} onNewTicket={onNewTicket} />
+
         {boardLive && (
           <span className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
             <Circle size={8} className="fill-emerald-500 text-emerald-500 animate-pulse" />
             Live updates
+          </span>
+        )}
+
+        {autoRunRunning && autoRunNotice === 'dependencies_pending' && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-amber-700 dark:text-amber-300">
+            <AlertTriangle size={12} />
+            Waiting for dependencies to finish and merge
           </span>
         )}
 

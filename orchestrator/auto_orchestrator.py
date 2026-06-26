@@ -21,6 +21,7 @@ class AutoRunResult:
     escalated_ticket_ids: list[str] = field(default_factory=list)
     recovered_ticket_ids: list[str] = field(default_factory=list)
     cleaned_worktrees: list[str] = field(default_factory=list)
+    waiting_ticket_ids: list[str] = field(default_factory=list)
     final_tickets: list[dict] = field(default_factory=list)
 
 
@@ -63,14 +64,21 @@ class AutoOrchestrator:
             escalation = self.escalation_service.handle_blocked_ticket(blocked_ticket.id)
             return _result_for_escalation(escalation, recovery)
 
-        execution_ticket = self._first_ticket(TicketStatus.READY)
+        ready_tickets = self.repository.list(status=TicketStatus.READY)
+        execution_ticket = next(
+            (ticket for ticket in ready_tickets if self._dependencies_satisfied(ticket)),
+            None,
+        )
         if execution_ticket is None:
             execution_ticket = self._first_ticket(TicketStatus.IN_PROGRESS)
         if execution_ticket is None:
+            waiting_ticket_ids = [ticket.id for ticket in ready_tickets]
             return AutoRunResult(
                 idle=not recovery.changed,
+                skipped_reason="dependencies_pending" if waiting_ticket_ids else "",
                 recovered_ticket_ids=recovery.recovered_ticket_ids,
                 cleaned_worktrees=recovery.removed_worktrees,
+                waiting_ticket_ids=waiting_ticket_ids,
             )
 
         if not self.allow_dirty_workspace and self.workspace_guard.is_dirty():
@@ -136,6 +144,19 @@ class AutoOrchestrator:
                 if metadata.get("escalation_handled_by") != "claude-tech-lead":
                     return ticket
         return None
+
+    def _dependencies_satisfied(self, ticket: Ticket) -> bool:
+        for dependency_id in ticket.dependencies:
+            dependency = self.repository.get(dependency_id)
+            if dependency is None or dependency.status != TicketStatus.DONE.value:
+                return False
+
+            # A completed ticket with a Git branch is not available to a
+            # dependent worktree until that branch has been merged to base.
+            metadata = dependency.metadata.model_dump(mode="json") if dependency.metadata else {}
+            if metadata.get("git_branch") and not metadata.get("git_merge_commit"):
+                return False
+        return True
 
 
 def _result_for_escalation(escalation: EscalationResult, recovery) -> AutoRunResult:

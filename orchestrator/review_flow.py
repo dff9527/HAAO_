@@ -5,7 +5,7 @@ from typing import Protocol
 
 from clients.claude_po import AuditResult
 from orchestrator.cloud_usage import CloudUsage, apply_usage_to_requirement
-from orchestrator.db.sqlite import RequirementRepository, SettingsRepository, TicketRepository
+from orchestrator.db.sqlite import RequirementRepository, RunEventRepository, SettingsRepository, TicketRepository
 from orchestrator.model_instructions import call_auditor, tech_lead_additional_instructions
 from orchestrator.models.ticket import Audit, Ticket, TicketStatus
 from orchestrator.notifications import NotificationService
@@ -52,6 +52,7 @@ class ReviewService:
                 diff,
                 additional_instructions=tech_lead_additional_instructions(self.settings_repository),
             )
+            self._record_model_call(ticket, diff)
         except Exception as exc:
             self._record_audit_error(ticket, exc)
             raise
@@ -128,3 +129,61 @@ class ReviewService:
         metadata["technical_audit_error"] = str(exc)
         self.repository.save(Ticket.from_dict(ticket_json))
         self.repository.append_log(ticket.id, message, level="error")
+        RunEventRepository(self.repository.connection).append_run_event(
+            project_id=_ticket_project_id(ticket),
+            requirement_id=_ticket_requirement_id(ticket),
+            ticket_id=ticket.id,
+            run_id=_ticket_run_id(ticket),
+            event_type="error",
+            model_id="claude-tech-lead",
+            payload={"stage": "technical_audit", "error": str(exc)},
+        )
+
+    def _record_model_call(self, ticket: Ticket, diff: str) -> None:
+        usage = getattr(self.auditor, "last_usage", CloudUsage())
+        if not isinstance(usage, CloudUsage):
+            usage = CloudUsage()
+        RunEventRepository(self.repository.connection).append_run_event(
+            project_id=_ticket_project_id(ticket),
+            requirement_id=_ticket_requirement_id(ticket),
+            ticket_id=ticket.id,
+            run_id=_ticket_run_id(ticket),
+            event_type="model_call",
+            model_id="claude-tech-lead",
+            input_tokens=usage.input_tokens or None,
+            output_tokens=usage.output_tokens or None,
+            cost_usd=usage.cost_usd if usage.total_tokens else None,
+            cost_status=usage.cost_status if usage.total_tokens else "unknown",
+            payload={
+                "stage": "technical_audit",
+                "diff_line_count": len(diff.splitlines()),
+                "verdict_source": "auditor",
+            },
+        )
+
+
+def _ticket_project_id(ticket: Ticket) -> str:
+    if ticket.metadata is not None:
+        metadata = ticket.metadata.model_dump(mode="json")
+        project_id = metadata.get("project_id")
+        if isinstance(project_id, str) and project_id:
+            return project_id
+    return "default"
+
+
+def _ticket_requirement_id(ticket: Ticket) -> str | None:
+    if ticket.metadata is not None:
+        metadata = ticket.metadata.model_dump(mode="json")
+        requirement_id = metadata.get("requirement_id")
+        if isinstance(requirement_id, str) and requirement_id:
+            return requirement_id
+    return None
+
+
+def _ticket_run_id(ticket: Ticket) -> str | None:
+    if ticket.metadata is not None:
+        metadata = ticket.metadata.model_dump(mode="json")
+        run_id = metadata.get("last_run_id")
+        if isinstance(run_id, str) and run_id:
+            return run_id
+    return None

@@ -3,6 +3,7 @@ import {
   ChevronDown, ChevronRight, Loader2, AlertTriangle, RotateCcw, Save,
 } from 'lucide-react';
 import { getModelMeta } from '../constants';
+import { modelConfigDisplayName, modelStatusDotClass } from '../modelDisplay';
 import type { ModelConfig, ModelParams } from '../types';
 
 function normalizeParams(params: ModelParams): ModelParams {
@@ -114,13 +115,14 @@ export function ModelCard({
         onClick={onToggleExpand}
         aria-expanded={isExpanded}
       >
-        <div className={`w-2 h-2 rounded-full shrink-0 ${
-          config.backend === 'Cloud API' ? 'bg-amber-500' : 'bg-emerald-500'
-        }`} />
+        <div className={`w-2 h-2 rounded-full shrink-0 ${modelStatusDotClass(config)}`} />
 
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="font-mono text-sm font-medium text-foreground">{config.name}</span>
+            <span className="text-sm font-medium text-foreground">{modelConfigDisplayName(config)}</span>
+            <span className="font-mono text-[10px] text-muted-foreground truncate" title={config.id}>
+              {config.id}
+            </span>
             {instructionsDirty && (
               <span className="text-[10px] px-1.5 py-0 rounded bg-amber-50 text-amber-600 dark:bg-amber-950 dark:text-amber-400 border border-amber-200 dark:border-amber-800">
                 unsaved instructions

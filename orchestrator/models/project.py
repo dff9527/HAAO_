@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -15,6 +16,9 @@ class Project(BaseModel):
     path: str = Field(min_length=1)
     default_branch: str = Field(default="main", min_length=1)
     env: dict[str, str] = Field(default_factory=dict)
+    env_allowlist: list[str] = Field(default_factory=lambda: ["PATH", "PYTHONPATH"])
+    test_allow_network: bool = False
+    sandbox_mode: Literal["auto", "docker", "unshare", "none"] = "auto"
     setup_cmd: str = ""
     cleanup_cmd: str = ""
     created_at: datetime | None = None
@@ -23,6 +27,16 @@ class Project(BaseModel):
     @classmethod
     def validate_env(cls, value: dict[str, str]) -> dict[str, str]:
         return {str(key): str(env_value) for key, env_value in value.items()}
+
+    @field_validator("env_allowlist")
+    @classmethod
+    def validate_env_allowlist(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for item in value:
+            name = str(item).strip()
+            if name and name not in cleaned:
+                cleaned.append(name)
+        return cleaned or ["PATH", "PYTHONPATH"]
 
     @field_validator("path")
     @classmethod

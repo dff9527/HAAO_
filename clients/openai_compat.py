@@ -76,6 +76,7 @@ def _usage_from_openai_payload(body: dict[str, Any]) -> CloudUsage:
     return CloudUsage(
         input_tokens=int(usage.get("prompt_tokens") or 0),
         output_tokens=int(usage.get("completion_tokens") or 0),
+        cost_status="estimated",
     )
 
 

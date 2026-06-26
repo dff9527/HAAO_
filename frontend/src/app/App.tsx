@@ -1,31 +1,40 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Maximize2, Minimize2 } from 'lucide-react';
 import { DndProvider } from 'react-dnd';
 import { HTML5Backend } from 'react-dnd-html5-backend';
 import { TopBar } from './components/TopBar';
 import { NavSidebar } from './components/NavSidebar';
 import { KanbanBoard } from './components/KanbanBoard';
+import { ChatPanel, type ChatLayoutMode } from './components/ChatPanel';
 import { BoardToolbar } from './components/BoardToolbar';
 import { TicketDetail } from './components/TicketDetail';
 import { RequirementComposer } from './components/RequirementComposer';
 import { RequirementSummaryModal } from './components/RequirementSummaryModal';
 import { NewTicketModal } from './components/NewTicketModal';
 import { ToastStack, type ToastMessage } from './components/Toast';
+import { ApiTokenPrompt } from './components/ApiTokenPrompt';
 import { ModelsPage } from './components/ModelsPage';
+import { ActivityPage } from './components/ActivityPage';
+import { InsightsPage } from './components/InsightsPage';
+import { InboxPage } from './components/InboxPage';
+import { OnboardingWizard } from './components/OnboardingWizard';
 import { RequirementsPage } from './components/RequirementsPage';
 import { INITIAL_MODEL_CONFIGS, INITIAL_ROLE_ROUTES } from './data/modelsData';
-import { INITIAL_REQUIREMENTS, INITIAL_TICKETS } from './data/mockData';
-import type { AssignedModel, ModelConfig, Project, RequirementSource, RoleRoute, Ticket, TicketStatus } from './types';
+import { INITIAL_REQUIREMENTS, INITIAL_TICKETS, INITIAL_CHAT_MESSAGES, INITIAL_CLOUD_MODELS } from './data/mockData';
+import type { AssignedModel, ChatMessage, CloudModel, ModelConfig, Project, RequirementSource, RoleRoute, Ticket, TicketStatus } from './types';
 import type { Page } from './components/NavSidebar';
-import { apiClient, type AutoWorkerStatus, type CloudReasonerConfig } from './api/client';
+import { apiClient, type AutoWorkerStatus, type CloudReasonerConfig, type IntegrationCredential } from './api/client';
 import { roleRoutingToRoutes, routesToRoleRouting, devTeamChainFromRouting, toBackendStatus, toUiProject, toUiTicket, toUiRequirement } from './api/adapter';
-import type { BackendLocalModelEndpoint, BackendManualTicketCreateRequest, BackendTicket } from './api/types';
+import type { BackendLocalModelEndpoint, BackendManualTicketCreateRequest, BackendTicket, InboxUnreadCount } from './api/types';
+import { MOCK_INBOX_UNREAD_COUNT } from './inboxUtils';
+import { ONBOARDING_DISMISSED_KEY } from './dxUtils';
 import { DEFAULT_LOCAL_MODELS } from './constants';
 import { boardHasActiveWork, countNeedsAttention } from './ticketAttention';
 import { EMPTY_BOARD_FILTERS, matchesBoardFilters, type BoardFilters } from './boardFilters';
 import { useBoardKeyboardShortcuts } from './useBoardKeyboardShortcuts';
 
 export default function App() {
-  const [currentPage, setCurrentPage] = useState<Page>('board');
+  const [currentPage, setCurrentPage] = useState<Page>('home');
   const [darkMode, setDarkMode] = useState(false);
   const [tickets, setTickets] = useState<Ticket[]>(INITIAL_TICKETS);
   const [selectedTicketId, setSelectedTicketId] = useState<string | null>(null);
@@ -41,6 +50,7 @@ export default function App() {
   const [localModelEndpoints, setLocalModelEndpoints] = useState<BackendLocalModelEndpoint[]>([]);
   const [claudeModel, setClaudeModel] = useState('claude-sonnet-4-6');
   const [cloudReasoner, setCloudReasoner] = useState<CloudReasonerConfig | null>(null);
+  const [cloudModels, setCloudModels] = useState<CloudModel[]>(INITIAL_CLOUD_MODELS);
   const [devFallbackChain, setDevFallbackChain] = useState<string[]>(DEFAULT_LOCAL_MODELS.slice(0, 1));
   const [notificationWebhook, setNotificationWebhook] = useState('');
   const [usingMockData, setUsingMockData] = useState(false);
@@ -54,6 +64,19 @@ export default function App() {
     { id: 'default', name: 'HAAO', path: '', defaultBranch: 'main', env: {}, setupCmd: '', cleanupCmd: '' },
   ]);
   const [selectedProjectId, setSelectedProjectId] = useState('default');
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(INITIAL_CHAT_MESSAGES);
+  const [chatSending, setChatSending] = useState(false);
+  const [chatLayoutMode, setChatLayoutMode] = useState<ChatLayoutMode>('balanced');
+  const [allowCloudExecutionModel, setAllowCloudExecutionModel] = useState(false);
+  const [integrations, setIntegrations] = useState<IntegrationCredential[]>([]);
+  const [inboxUnreadCount, setInboxUnreadCount] = useState<InboxUnreadCount>({ total: 0, by_project: {} });
+  const [chatReasonerMode, setChatReasonerMode] = useState<'cloud' | 'local'>('cloud');
+  const [onboardingOpen, setOnboardingOpen] = useState(false);
+  const [onboardingDismissed, setOnboardingDismissed] = useState(
+    () => typeof window !== 'undefined' && window.localStorage.getItem(ONBOARDING_DISMISSED_KEY) === '1',
+  );
+  const [seedingDemo, setSeedingDemo] = useState(false);
+  const lastChatMessageIdRef = useRef<string | undefined>(INITIAL_CHAT_MESSAGES.at(-1)?.id);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -61,6 +84,7 @@ export default function App() {
   );
   const projectPathReady = Boolean(selectedProject?.path?.trim());
   const modelsConfigured = localModelEndpoints.length > 0;
+  const needsSetup = !projectPathReady || !modelsConfigured;
   const attentionCount = useMemo(() => countNeedsAttention(tickets), [tickets]);
   const filteredTicketCount = useMemo(
     () => tickets.filter((ticket) => matchesBoardFilters(ticket, boardFilters, attentionFilter)).length,
@@ -76,6 +100,11 @@ export default function App() {
   const projectNameById = useMemo(
     () => Object.fromEntries(projects.map((project) => [project.id, project.name])),
     [projects],
+  );
+
+  const prIntegrationConfigured = useMemo(
+    () => integrations.some((item) => item.configured && (item.provider === 'github' || item.provider === 'gitlab')),
+    [integrations],
   );
 
   const pushToast = useCallback((text: string, tone: ToastMessage['tone'] = 'error') => {
@@ -105,10 +134,10 @@ export default function App() {
   }, [selectedTicketId, showNewReq, showNewTicket]);
 
   useBoardKeyboardShortcuts({
-    enabled: currentPage === 'board',
+    enabled: currentPage === 'home',
     searchInputRef: boardSearchRef,
     onCloseOverlay: closeTopOverlay,
-    onFocusSearch: () => setCurrentPage('board'),
+    onFocusSearch: () => setCurrentPage('home'),
   });
 
   function messageFromError(error: unknown, fallback: string): string {
@@ -166,21 +195,70 @@ export default function App() {
     }
   }, [projectNameById, selectedProjectId, usingMockData]);
 
+  const loadChatMessages = useCallback(async () => {
+    if (usingMockData) {
+      setChatMessages(INITIAL_CHAT_MESSAGES);
+      return;
+    }
+    try {
+      const messages = await apiClient.listChatMessages(selectedProjectId);
+      setChatMessages(messages);
+    } catch {
+      setChatMessages(INITIAL_CHAT_MESSAGES);
+    }
+  }, [selectedProjectId, usingMockData]);
+
+  const refreshChatMessages = useCallback(async () => {
+    if (usingMockData) return;
+    const after = lastChatMessageIdRef.current;
+    try {
+      const messages = await apiClient.listChatMessages(selectedProjectId, after ? { after } : undefined);
+      if (messages.length) {
+        setChatMessages((prev) => [...prev, ...messages]);
+      }
+    } catch {
+      // Keep the last known chat state during transient refresh failures.
+    }
+  }, [selectedProjectId, usingMockData]);
+
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
   }, [darkMode]);
 
   useEffect(() => {
-    if (currentPage !== 'board') setSelectedTicketId(null);
+    if (currentPage !== 'home') setSelectedTicketId(null);
   }, [currentPage]);
 
   useEffect(() => {
+    lastChatMessageIdRef.current = chatMessages.at(-1)?.id;
+  }, [chatMessages]);
+
+  useEffect(() => {
     loadTickets();
-  }, [loadTickets]);
+    void loadChatMessages();
+  }, [loadTickets, loadChatMessages]);
+
+  useEffect(() => {
+    if (currentPage !== 'home' || usingMockData) {
+      setBoardLive(false);
+      return;
+    }
+
+    const pollActive = hasActiveBoardWork || tickets.length > 0 || chatMessages.length > 0;
+    setBoardLive(pollActive);
+    if (!pollActive) return;
+
+    const intervalId = window.setInterval(() => {
+      void refreshTickets();
+      void refreshChatMessages();
+    }, 5000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [chatMessages.length, currentPage, hasActiveBoardWork, refreshChatMessages, refreshTickets, tickets.length, usingMockData]);
 
   // Load persisted requirements for the active project from the backend.
-  // Without this the Requirements page only reflected in-memory session state,
-  // so requirements from earlier sessions / other projects appeared to vanish.
   useEffect(() => {
     if (usingMockData) return;
     let active = true;
@@ -198,32 +276,13 @@ export default function App() {
   }, [selectedProjectId, usingMockData]);
 
   useEffect(() => {
-    if (currentPage !== 'board' || usingMockData) {
-      setBoardLive(false);
-      return;
-    }
-
-    const pollActive = hasActiveBoardWork || tickets.length > 0;
-    setBoardLive(pollActive);
-    if (!pollActive) return;
-
-    const intervalId = window.setInterval(() => {
-      void refreshTickets();
-    }, 4000);
-
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [currentPage, hasActiveBoardWork, refreshTickets, tickets.length, usingMockData]);
-
-  useEffect(() => {
     if (attentionCount === 0 && attentionFilter) {
       setAttentionFilter(false);
     }
   }, [attentionCount, attentionFilter]);
 
   useEffect(() => {
-    if (currentPage !== 'board' || usingMockData) return;
+    if (currentPage !== 'home' || usingMockData) return;
     let active = true;
     const poll = () => {
       apiClient
@@ -240,6 +299,33 @@ export default function App() {
       window.clearInterval(intervalId);
     };
   }, [currentPage, usingMockData]);
+
+  useEffect(() => {
+    if (usingMockData) {
+      setInboxUnreadCount(MOCK_INBOX_UNREAD_COUNT);
+      return;
+    }
+    let active = true;
+    const poll = () => {
+      apiClient
+        .listNotifications({ projectId: selectedProjectId, limit: 1 })
+        .then((data) => {
+          if (active) setInboxUnreadCount(data.unread_count);
+        })
+        .catch(() => {});
+    };
+    poll();
+    const intervalId = window.setInterval(poll, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, [selectedProjectId, usingMockData]);
+
+  useEffect(() => {
+    if (usingMockData || onboardingDismissed || ticketsLoading) return;
+    if (needsSetup) setOnboardingOpen(true);
+  }, [needsSetup, onboardingDismissed, ticketsLoading, usingMockData]);
 
   // Auto-run follows the active board project: if the worker is running but
   // bound to a different project, rebind it to the selected one so the new
@@ -275,6 +361,45 @@ export default function App() {
     }
   }, [pushToast, selectedProjectId, workerStatus?.running]);
 
+  const dismissOnboarding = useCallback(() => {
+    setOnboardingDismissed(true);
+    window.localStorage.setItem(ONBOARDING_DISMISSED_KEY, '1');
+    setOnboardingOpen(false);
+  }, []);
+
+  const handleSeedDemo = useCallback(async () => {
+    if (usingMockData) {
+      pushToast('Connect to the API to seed the demo project.', 'error');
+      return;
+    }
+    setSeedingDemo(true);
+    try {
+      const seeded = await apiClient.seedDemoProject();
+      const backendProjects = await apiClient.listProjects();
+      const uiProjects = backendProjects.map(toUiProject);
+      setProjects(uiProjects);
+      const demoProjectId = seeded.project.id;
+      setSelectedProjectId(demoProjectId);
+      const [backendTickets, backendRequirements] = await Promise.all([
+        apiClient.listTickets(demoProjectId),
+        apiClient.listRequirements(demoProjectId),
+      ]);
+      setTickets(
+        backendTickets.map((ticket) =>
+          toUiTicket(ticket, seeded.project.name),
+        ),
+      );
+      setRequirements(backendRequirements.map(toUiRequirement));
+      setViewingRequirementId(seeded.requirement.id);
+      dismissOnboarding();
+      pushToast('Demo project ready — review R-001 to approve tickets.', 'success');
+    } catch (error) {
+      pushToast(messageFromError(error, 'Could not seed demo project.'));
+    } finally {
+      setSeedingDemo(false);
+    }
+  }, [dismissOnboarding, pushToast, usingMockData]);
+
   useEffect(() => {
     apiClient
       .listProjects()
@@ -287,6 +412,43 @@ export default function App() {
       })
       .catch(() => {
       });
+  }, []);
+
+  useEffect(() => {
+    apiClient
+      .listCloudModels()
+      .then((models) => {
+        setCloudModels(models);
+      })
+      .catch(() => {
+      });
+  }, []);
+
+  useEffect(() => {
+    apiClient
+      .getCloudExecutionSettings()
+      .then((settings) => {
+        setAllowCloudExecutionModel(settings.allow_cloud_execution_model);
+      })
+      .catch(() => {
+      });
+  }, []);
+
+  useEffect(() => {
+    apiClient
+      .getChatReasonerConfig()
+      .then((config) => setChatReasonerMode(config.mode))
+      .catch(() => {});
+  }, []);
+
+  const handleToggleChatReasoner = useCallback(() => {
+    setChatReasonerMode((current) => {
+      const next = current === 'cloud' ? 'local' : 'cloud';
+      apiClient.updateChatReasonerConfig(next).catch(() => {
+        setChatReasonerMode(current);
+      });
+      return next;
+    });
   }, []);
 
   useEffect(() => {
@@ -325,6 +487,13 @@ export default function App() {
       .catch(() => {
       });
   }, []);
+
+  useEffect(() => {
+    apiClient
+      .listIntegrations()
+      .then((items) => setIntegrations(items))
+      .catch(() => setIntegrations([]));
+  }, [currentPage]);
 
   useEffect(() => {
     apiClient
@@ -463,6 +632,33 @@ export default function App() {
     (ticketId: string) => runAndReplace(ticketId, apiClient.revertTicket, 'Merge reverted.'),
     [runAndReplace],
   );
+  const handleOpenPr = useCallback(async (ticketId: string) => {
+    try {
+      const result = await apiClient.openTicketPr(ticketId, selectedProjectId);
+      const ticket = await apiClient.getTicket(ticketId, selectedProjectId);
+      replaceTicketFromBackend(ticket);
+      pushToast(`PR ${result.status}: ${result.pr_url}`, 'success');
+    } catch (error) {
+      pushToast(messageFromError(error, 'Could not open or update PR.'));
+      throw error;
+    }
+  }, [pushToast, replaceTicketFromBackend, selectedProjectId]);
+
+  const handleInboxOpenTicket = useCallback((ticketId: string, notificationProjectId: string) => {
+    if (notificationProjectId !== selectedProjectId) {
+      setSelectedProjectId(notificationProjectId);
+    }
+    setCurrentPage('home');
+    setSelectedTicketId(ticketId);
+  }, [selectedProjectId]);
+
+  const handleInboxOpenRequirement = useCallback((requirementId: string, notificationProjectId: string) => {
+    if (notificationProjectId !== selectedProjectId) {
+      setSelectedProjectId(notificationProjectId);
+    }
+    setViewingRequirementId(requirementId);
+  }, [selectedProjectId]);
+
   const handleRejectDiff = useCallback(
     (ticketId: string, feedback: string) => runAndReplace(
       ticketId,
@@ -680,15 +876,97 @@ export default function App() {
     return config;
   }, []);
 
+  const handleAddCloudModel = useCallback(async (payload: {
+    label?: string;
+    provider: string;
+    model_id: string;
+    api_key: string;
+  }) => {
+    const model = await apiClient.addCloudModel(payload);
+    const models = await apiClient.listCloudModels();
+    setCloudModels(models);
+    return model;
+  }, []);
+
+  const handleDeleteCloudModel = useCallback(async (modelId: string) => {
+    await apiClient.deleteCloudModel(modelId);
+    const models = await apiClient.listCloudModels();
+    setCloudModels(models);
+  }, []);
+
+  const handleUpdateAllowCloudExecutionModel = useCallback(async (enabled: boolean) => {
+    const saved = await apiClient.updateCloudExecutionSettings(enabled);
+    setAllowCloudExecutionModel(saved.allow_cloud_execution_model);
+  }, []);
+
+  const handleToggleAttentionFilter = useCallback(() => {
+    if (currentPage !== 'home') {
+      setCurrentPage('home');
+    }
+    setAttentionFilter((value) => !value);
+  }, [currentPage]);
+
+  const handleSendChatMessage = useCallback(async (text: string, attachmentIds: string[] = []) => {
+    setChatSending(true);
+    const now = new Date().toISOString();
+    try {
+      if (usingMockData) {
+        const userMessage: ChatMessage = {
+          id: `msg-${Date.now()}`,
+          project_id: selectedProjectId,
+          role: 'user',
+          text,
+          segment_id: 'seg-default',
+          created_at: now,
+          attachment_ids: attachmentIds,
+        };
+        const agentMessage: ChatMessage = {
+          id: `msg-${Date.now() + 1}`,
+          project_id: selectedProjectId,
+          role: 'agent',
+          text: 'Got it — I will file this as a proposal when the backend is connected. For now this is demo mode.',
+          segment_id: 'seg-default',
+          created_at: now,
+        };
+        setChatMessages((prev) => [...prev, userMessage, agentMessage]);
+        return;
+      }
+      const result = await apiClient.sendChatMessage(selectedProjectId, text, attachmentIds);
+      setChatMessages((prev) => [...prev, ...result.messages]);
+      if (result.filed_requirement_ids.length > 0) {
+        void loadTickets();
+        const reqs = await apiClient.listRequirements(selectedProjectId);
+        setRequirements(reqs.map(toUiRequirement));
+      }
+    } catch (error) {
+      pushToast(messageFromError(error, 'Could not send chat message.'));
+    } finally {
+      setChatSending(false);
+    }
+  }, [loadTickets, pushToast, selectedProjectId, usingMockData]);
+
+  const handleChatCollapse = useCallback(() => {
+    setChatLayoutMode((mode) => (mode === 'rail' ? 'hidden' : 'rail'));
+  }, []);
+
+  const handleChatExpand = useCallback(() => {
+    setChatLayoutMode((mode) => (mode === 'hidden' ? 'rail' : 'balanced'));
+  }, []);
+
+  const handleBoardExpandToggle = useCallback(() => {
+    setChatLayoutMode((mode) => {
+      if (mode === 'balanced') return 'rail';
+      if (mode === 'hidden') return 'rail';
+      return 'balanced';
+    });
+  }, []);
+
   return (
     <DndProvider backend={HTML5Backend}>
       <div className="h-screen flex flex-col bg-background text-foreground overflow-hidden">
         <TopBar
           darkMode={darkMode}
           onToggleDark={() => setDarkMode((value) => !value)}
-          onNewReq={() => setShowNewReq(true)}
-          onNewTicket={() => setShowNewTicket(true)}
-          showBoardControls={currentPage === 'board'}
           boardLive={boardLive}
           projects={projects}
           selectedProjectId={selectedProjectId}
@@ -696,6 +974,7 @@ export default function App() {
           onCreateProject={handleCreateProject}
           onDeleteProject={handleDeleteProject}
           onUpdateProjectSettings={handleUpdateProjectSettings}
+          onOpenSetupWizard={() => setOnboardingOpen(true)}
         />
         {usingMockData && (
           <div className="px-4 py-2 text-xs bg-amber-50 text-amber-800 border-b border-amber-200 dark:bg-amber-950 dark:text-amber-200 dark:border-amber-900">
@@ -705,41 +984,104 @@ export default function App() {
 
         <div className="flex flex-1 overflow-hidden flex-col min-w-0">
           <div className="flex flex-1 overflow-hidden min-h-0">
-            <NavSidebar currentPage={currentPage} onNavigate={setCurrentPage} />
-            {currentPage === 'board' ? (
-              <div className="flex flex-1 flex-col min-w-0 overflow-hidden">
-                <BoardToolbar
-                  ref={boardSearchRef}
-                  attentionCount={attentionCount}
-                  attentionFilter={attentionFilter}
-                  onToggleAttentionFilter={() => setAttentionFilter((value) => !value)}
-                  boardLive={boardLive}
-                  autoRunRunning={Boolean(workerStatus?.running)}
-                  autoRunPending={workerPending}
-                  autoRunError={workerStatus?.last_error ?? ''}
-                  onToggleAutoRun={handleToggleAutoRun}
-                  projectPathReady={projectPathReady}
-                  modelsConfigured={modelsConfigured}
-                  ticketCount={tickets.length}
-                  filteredCount={filteredTicketCount}
-                  loading={ticketsLoading}
-                  filters={boardFilters}
-                  onFiltersChange={setBoardFilters}
-                  onClearFilters={() => setBoardFilters(EMPTY_BOARD_FILTERS)}
-                  onOpenSetup={() => setCurrentPage('models')}
-                />
-                <KanbanBoard
+            <NavSidebar
+              currentPage={currentPage}
+              inboxUnreadCount={inboxUnreadCount.by_project[selectedProjectId] ?? 0}
+              onNavigate={setCurrentPage}
+            />
+            {currentPage === 'home' ? (
+              <div className="flex flex-1 min-w-0 overflow-hidden">
+                <ChatPanel
+                  messages={chatMessages}
+                  requirements={requirements}
                   tickets={tickets}
-                  loading={ticketsLoading}
-                  selectedTicketId={selectedTicketId}
-                  attentionFilter={attentionFilter}
-                  boardFilters={boardFilters}
-                  onMoveTicket={handleMoveTicket}
+                  layoutMode={chatLayoutMode}
+                  sending={chatSending}
+                  chatReasonerMode={chatReasonerMode}
+                  projectId={selectedProjectId}
+                  usingMockData={usingMockData}
+                  onSend={handleSendChatMessage}
+                  onToggleReasoner={handleToggleChatReasoner}
+                  onCollapse={handleChatCollapse}
+                  onExpand={handleChatExpand}
                   onSelectTicket={setSelectedTicketId}
-                  onApproveTicket={handleApprove}
-                  onAcceptTicket={handleAccept}
+                  onOpenRequirement={setViewingRequirementId}
+                  onUploadError={(message) => pushToast(message, 'error')}
                 />
+                <div className="flex flex-1 flex-col min-w-0 overflow-hidden relative">
+                  <div className="absolute top-2 right-2 z-10">
+                    <button
+                      type="button"
+                      onClick={handleBoardExpandToggle}
+                      title={chatLayoutMode === 'balanced' ? 'Expand board' : 'Restore split view'}
+                      aria-label={chatLayoutMode === 'balanced' ? 'Expand board to full width' : 'Restore split view'}
+                      className="h-7 w-7 flex items-center justify-center rounded-md border border-border bg-card/90 text-muted-foreground shadow-sm hover:bg-muted hover:text-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      {chatLayoutMode === 'balanced' ? <Maximize2 size={14} /> : <Minimize2 size={14} />}
+                    </button>
+                  </div>
+                  <BoardToolbar
+                    ref={boardSearchRef}
+                    boardLive={boardLive}
+                    attentionCount={attentionCount}
+                    attentionFilter={attentionFilter}
+                    onToggleAttentionFilter={handleToggleAttentionFilter}
+                    onNewRequirement={() => setShowNewReq(true)}
+                    onNewTicket={() => setShowNewTicket(true)}
+                    autoRunRunning={Boolean(workerStatus?.running)}
+                    autoRunPending={workerPending}
+                    autoRunError={workerStatus?.last_error ?? ''}
+                    autoRunNotice={workerStatus?.last_skipped_reason ?? ''}
+                    onToggleAutoRun={handleToggleAutoRun}
+                    projectPathReady={projectPathReady}
+                    modelsConfigured={modelsConfigured}
+                    ticketCount={tickets.length}
+                    filteredCount={filteredTicketCount}
+                    loading={ticketsLoading}
+                    filters={boardFilters}
+                    onFiltersChange={setBoardFilters}
+                    onClearFilters={() => setBoardFilters(EMPTY_BOARD_FILTERS)}
+                    onOpenSetup={() => setCurrentPage('models')}
+                  />
+                  <KanbanBoard
+                    tickets={tickets}
+                    loading={ticketsLoading}
+                    selectedTicketId={selectedTicketId}
+                    attentionFilter={attentionFilter}
+                    boardFilters={boardFilters}
+                    onMoveTicket={handleMoveTicket}
+                    onSelectTicket={setSelectedTicketId}
+                    onApproveTicket={handleApprove}
+                    onAcceptTicket={handleAccept}
+                  />
+                </div>
               </div>
+            ) : currentPage === 'activity' ? (
+              <ActivityPage
+                projectId={selectedProjectId}
+                tickets={tickets}
+                cloudModels={cloudModels}
+                usingMockData={usingMockData}
+                onSelectTicket={(ticketId) => {
+                  setCurrentPage('home');
+                  setSelectedTicketId(ticketId);
+                }}
+              />
+            ) : currentPage === 'insights' ? (
+              <InsightsPage
+                projectId={selectedProjectId}
+                cloudModels={cloudModels}
+                usingMockData={usingMockData}
+              />
+            ) : currentPage === 'inbox' ? (
+              <InboxPage
+                projectId={selectedProjectId}
+                projectNameById={projectNameById}
+                usingMockData={usingMockData}
+                onUnreadCountChange={setInboxUnreadCount}
+                onOpenTicket={handleInboxOpenTicket}
+                onOpenRequirement={handleInboxOpenRequirement}
+              />
             ) : currentPage === 'requirements' ? (
               <RequirementsPage
                 requirements={requirements}
@@ -754,6 +1096,8 @@ export default function App() {
               localModelIds={localModelIds}
               localModelEndpoints={localModelEndpoints}
               cloudReasoner={cloudReasoner}
+              cloudModels={cloudModels}
+              requirements={requirements}
               devFallbackChain={devFallbackChain}
               notificationWebhook={notificationWebhook}
               onUpdateModel={handleUpdateModel}
@@ -762,9 +1106,14 @@ export default function App() {
               onSaveLocalModelEndpoints={handleSaveLocalModelEndpoints}
               onRefreshLocalModels={handleRefreshLocalModels}
               onSaveCloudReasoner={handleSaveCloudReasoner}
+              onAddCloudModel={handleAddCloudModel}
+              onDeleteCloudModel={handleDeleteCloudModel}
               onSaveNotificationWebhook={handleSaveNotificationWebhook}
               onLoadModelAdditionalInstructions={handleLoadModelAdditionalInstructions}
               onSaveModelAdditionalInstructions={handleSaveModelAdditionalInstructions}
+              allowCloudExecutionModel={allowCloudExecutionModel}
+              onUpdateAllowCloudExecutionModel={handleUpdateAllowCloudExecutionModel}
+              usingMockData={usingMockData}
             />
           )}
           </div>
@@ -798,6 +1147,8 @@ export default function App() {
             onReject={(feedback) => handleReject(selectedTicket.id, feedback)}
             onDelete={(force) => handleDelete(selectedTicket.id, force)}
             onEscalate={() => handleEscalate(selectedTicket.id)}
+            onOpenPr={() => handleOpenPr(selectedTicket.id)}
+            prIntegrationConfigured={prIntegrationConfigured}
             requirementSource={
               selectedTicket.requirementId
                 ? requirements.find((requirement) => requirement.id === selectedTicket.requirementId)
@@ -830,6 +1181,7 @@ export default function App() {
             localModelIds={localModelIds}
             projectPathReady={projectPathReady}
             onDecomposeError={(message) => pushToast(message, 'error')}
+            usingMockData={usingMockData}
           />
         )}
 
@@ -846,10 +1198,34 @@ export default function App() {
 
         {viewingRequirementId && (() => {
           const req = requirements.find((item) => item.id === viewingRequirementId);
-          return req ? <RequirementSummaryModal requirement={req} onClose={() => setViewingRequirementId(null)} /> : null;
+          return req ? (
+            <RequirementSummaryModal
+              requirement={req}
+              usingMockData={usingMockData}
+              onClose={() => setViewingRequirementId(null)}
+            />
+          ) : null;
         })()}
 
         <ToastStack toasts={toasts} onDismiss={dismissToast} />
+        <ApiTokenPrompt />
+        <OnboardingWizard
+          open={onboardingOpen}
+          projectPathReady={projectPathReady}
+          modelsConfigured={modelsConfigured}
+          seedingDemo={seedingDemo}
+          onClose={() => setOnboardingOpen(false)}
+          onDismiss={dismissOnboarding}
+          onOpenModels={() => {
+            setOnboardingOpen(false);
+            setCurrentPage('models');
+          }}
+          onNewRequirement={() => {
+            setOnboardingOpen(false);
+            setShowNewReq(true);
+          }}
+          onSeedDemo={() => void handleSeedDemo()}
+        />
       </div>
     </DndProvider>
   );

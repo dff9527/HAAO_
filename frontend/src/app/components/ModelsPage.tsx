@@ -1,12 +1,18 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Loader2, CheckCircle2, XCircle, Info, Plus, RefreshCw, Trash2 } from 'lucide-react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { Loader2, CheckCircle2, XCircle, Info, Plus, RefreshCw, Trash2, Cloud, Link2 } from 'lucide-react';
 import { ModelCard } from './ModelCard';
+import { Switch } from './ui/switch';
 import { DevFallbackChainEditor } from './DevFallbackChainEditor';
-import { DEFAULT_LOCAL_MODELS, getModelMeta } from '../constants';
-import { CLAUDE_TECH_LEAD, CLOUD_ONLY_ROUTE_IDS } from '../copy';
-import type { ModelConfig, RoleRoute, AssignedModel } from '../types';
+import { DEFAULT_LOCAL_MODELS, formatCloudCost, getModelMeta, isCloudModel } from '../constants';
+import { cloudModelDisplayLabel, modelDisplayLabel } from '../modelDisplay';
+import type { ModelConfig, RoleRoute, AssignedModel, CloudModel, RequirementSource } from '../types';
 import type { BackendLocalModelEndpoint } from '../api/types';
-import type { CloudReasonerConfig } from '../api/client';
+import type { CloudReasonerConfig, IntegrationCredential, IntegrationProvider } from '../api/client';
+import { apiClient } from '../api/client';
+import { ModelStatusLegend } from './ModelStatusLegend';
+import { EvalRunPanel } from './EvalRunPanel';
+import { HelpTip } from './HelpTip';
+import { HELP_TOOLTIPS } from '../dxUtils';
 
 type TestStatus = 'idle' | 'running' | 'ok' | 'fail';
 
@@ -16,6 +22,8 @@ interface Props {
   localModelIds: string[];
   localModelEndpoints: BackendLocalModelEndpoint[];
   cloudReasoner: CloudReasonerConfig | null;
+  cloudModels: CloudModel[];
+  requirements: RequirementSource[];
   devFallbackChain: string[];
   notificationWebhook: string;
   onUpdateModel: (id: AssignedModel, updates: Partial<ModelConfig>) => void;
@@ -24,32 +32,156 @@ interface Props {
   onSaveLocalModelEndpoints: (endpoints: BackendLocalModelEndpoint[]) => Promise<void>;
   onRefreshLocalModels: () => Promise<{ models: string[]; endpoints: BackendLocalModelEndpoint[] }>;
   onSaveCloudReasoner: (modelId: string) => Promise<CloudReasonerConfig>;
+  onAddCloudModel: (payload: {
+    label?: string;
+    provider: string;
+    model_id: string;
+    api_key: string;
+  }) => Promise<CloudModel>;
+  onDeleteCloudModel: (modelId: string) => Promise<void>;
   onSaveNotificationWebhook: (webhookUrl: string) => Promise<string>;
   onLoadModelAdditionalInstructions: (modelId: string) => Promise<string>;
   onSaveModelAdditionalInstructions: (modelId: string, text: string) => Promise<string>;
+  allowCloudExecutionModel: boolean;
+  onUpdateAllowCloudExecutionModel: (enabled: boolean) => Promise<void>;
+  usingMockData?: boolean;
 }
 
 function SectionHeader({ num, title, subtitle }: { num: string; title: string; subtitle?: string }) {
   return (
-    <div className="flex items-start gap-3 mb-4">
+    <div className="flex items-start gap-3 mb-3">
       <span className="w-6 h-6 rounded flex items-center justify-center bg-muted text-muted-foreground text-xs font-mono shrink-0 mt-0.5">
         {num}
       </span>
       <div>
         <h2 className="text-sm font-semibold text-foreground">{title}</h2>
-        {subtitle && <p className="text-xs text-muted-foreground mt-0.5">{subtitle}</p>}
+        {subtitle && <p className="text-[11px] text-muted-foreground mt-0.5">{subtitle}</p>}
       </div>
     </div>
   );
 }
 
-function routeModelOptions(routeId: string, localModelOptions: string[], currentModel: AssignedModel): AssignedModel[] {
-  if (routeId === 'dev') return localModelOptions;
-  if (CLOUD_ONLY_ROUTE_IDS.has(routeId)) {
-    return [CLAUDE_TECH_LEAD];
+function ConnectionBlock({
+  title,
+  hint,
+  children,
+  className = '',
+}: {
+  title: string;
+  hint?: string;
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={`rounded-xl border border-border bg-card px-4 py-4 ${className}`}>
+      <div className="mb-3">
+        <h3 className="text-xs font-semibold text-foreground">{title}</h3>
+        {hint && <p className="text-[11px] text-muted-foreground mt-0.5">{hint}</p>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function CollapsibleConnectionBlock({
+  title,
+  hint,
+  children,
+  defaultOpen = false,
+}: {
+  title: string;
+  hint?: string;
+  children: ReactNode;
+  defaultOpen?: boolean;
+}) {
+  return (
+    <details className="rounded-xl border border-border bg-card group" open={defaultOpen}>
+      <summary className="px-4 py-3 cursor-pointer list-none flex items-center gap-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-xl">
+        <span className="text-xs font-semibold text-foreground">{title}</span>
+        {hint && <span className="text-[11px] text-muted-foreground truncate">{hint}</span>}
+      </summary>
+      <div className="px-4 pb-4 border-t border-border pt-3">{children}</div>
+    </details>
+  );
+}
+
+const FORM_INPUT_CLASS =
+  'text-xs bg-muted border border-border rounded px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-ring text-foreground';
+const FORM_INPUT_MONO_CLASS = `font-mono ${FORM_INPUT_CLASS}`;
+
+function routeModelOptions(
+  routeId: string,
+  localModelOptions: string[],
+  cloudModels: CloudModel[],
+  currentModel: AssignedModel,
+): AssignedModel[] {
+  const cloudIds = cloudModels.map((model) => model.id);
+  if (routeId === 'dev') {
+    return [...new Set([...localModelOptions, ...cloudIds, ...(currentModel ? [currentModel] : [])])];
   }
-  const options = [...new Set([...localModelOptions, currentModel])].filter((m) => m !== CLAUDE_TECH_LEAD);
-  return options.length ? options : localModelOptions;
+  if (routeId === 'tech_lead') {
+    return cloudIds.length ? cloudIds : (currentModel ? [currentModel] : []);
+  }
+  const options = [...new Set([...localModelOptions, ...cloudIds, currentModel])];
+  return options.length ? options : [...localModelOptions, ...cloudIds];
+}
+
+function cloudModelOptionLabel(model: CloudModel): string {
+  return cloudModelDisplayLabel(model);
+}
+
+function modelOptionLabel(model: AssignedModel, cloudModels: CloudModel[]): string {
+  return modelDisplayLabel(model, cloudModels);
+}
+
+function cloudModelIsDeletable(model: CloudModel): boolean {
+  return model.deletable !== false;
+}
+
+const INTEGRATION_PROVIDER_OPTIONS: Array<{ id: IntegrationProvider; label: string; tokenPlaceholder: string; scopePlaceholder: string }> = [
+  {
+    id: 'github',
+    label: 'GitHub',
+    tokenPlaceholder: 'Personal access token',
+    scopePlaceholder: 'repo, contents:write, pull_requests:write',
+  },
+  {
+    id: 'gitlab',
+    label: 'GitLab',
+    tokenPlaceholder: 'Personal access token',
+    scopePlaceholder: 'api, write_repository',
+  },
+  {
+    id: 'slack',
+    label: 'Slack',
+    tokenPlaceholder: 'Incoming webhook URL',
+    scopePlaceholder: 'optional — leave empty for webhooks',
+  },
+];
+
+function integrationProviderLabel(provider: IntegrationProvider): string {
+  return INTEGRATION_PROVIDER_OPTIONS.find((item) => item.id === provider)?.label ?? provider;
+}
+
+function cloudModelToConfig(model: CloudModel): ModelConfig {
+  return {
+    id: model.id,
+    name: model.label,
+    backend: 'Cloud API',
+    contextWindow: 200000,
+    status: model.key_configured ? 'Connected' : 'Available',
+    params: {
+      temperature: 0.7,
+      topP: 0.95,
+      maxOutputTokens: 8192,
+      contextWindowCap: 200000,
+      defaultRetryBudget: 2,
+      systemPrompt: '',
+      additionalInstructions: '',
+      fullPromptOverride: '',
+      useFullPromptOverride: false,
+    },
+  };
 }
 
 export function ModelsPage({
@@ -58,6 +190,8 @@ export function ModelsPage({
   localModelIds,
   localModelEndpoints,
   cloudReasoner,
+  cloudModels,
+  requirements,
   devFallbackChain,
   notificationWebhook,
   onUpdateModel,
@@ -66,18 +200,43 @@ export function ModelsPage({
   onSaveLocalModelEndpoints,
   onRefreshLocalModels,
   onSaveCloudReasoner,
+  onAddCloudModel,
+  onDeleteCloudModel,
   onSaveNotificationWebhook,
   onLoadModelAdditionalInstructions,
   onSaveModelAdditionalInstructions,
+  allowCloudExecutionModel,
+  onUpdateAllowCloudExecutionModel,
+  usingMockData = false,
 }: Props) {
   const [expandedModels, setExpandedModels] = useState<Set<AssignedModel>>(new Set());
+  const [cloudExecutionPending, setCloudExecutionPending] = useState(false);
+  const [techLeadSaveState, setTechLeadSaveState] = useState<TestStatus>('idle');
+  const [techLeadSaveMessage, setTechLeadSaveMessage] = useState('');
   const [endpointRows, setEndpointRows] = useState<BackendLocalModelEndpoint[]>(localModelEndpoints);
-  const [cloudProvider, setCloudProvider] = useState('anthropic');
-  const [cloudModelId, setCloudModelId] = useState('');
-  const [cloudSaveState, setCloudSaveState] = useState<TestStatus>('idle');
-  const [cloudSaveMessage, setCloudSaveMessage] = useState('');
+  const [registryProvider, setRegistryProvider] = useState('openai');
+  const [registryModelId, setRegistryModelId] = useState('');
+  const [registryLabel, setRegistryLabel] = useState('');
+  const [registryApiKey, setRegistryApiKey] = useState('');
+  const [registryState, setRegistryState] = useState<TestStatus>('idle');
+  const [registryMessage, setRegistryMessage] = useState('');
+  const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
+  const [discoverState, setDiscoverState] = useState<TestStatus>('idle');
+  const [discoverMessage, setDiscoverMessage] = useState('');
+  const [cloudTestState, setCloudTestState] = useState<Record<string, TestStatus>>({});
+  const [cloudTestMessage, setCloudTestMessage] = useState<Record<string, string>>({});
+  const [deletingCloudId, setDeletingCloudId] = useState<string | null>(null);
   const [webhookInput, setWebhookInput] = useState(notificationWebhook);
   const [webhookState, setWebhookState] = useState<TestStatus>('idle');
+  const [integrations, setIntegrations] = useState<IntegrationCredential[]>([]);
+  const [integrationsLoading, setIntegrationsLoading] = useState(true);
+  const [integrationProvider, setIntegrationProvider] = useState<IntegrationProvider>('github');
+  const [integrationLabel, setIntegrationLabel] = useState('');
+  const [integrationToken, setIntegrationToken] = useState('');
+  const [integrationScopes, setIntegrationScopes] = useState('');
+  const [integrationState, setIntegrationState] = useState<TestStatus>('idle');
+  const [integrationMessage, setIntegrationMessage] = useState('');
+  const [deletingIntegrationKey, setDeletingIntegrationKey] = useState<string | null>(null);
   const [discoveryState, setDiscoveryState] = useState<TestStatus>('idle');
   const [isSavingEndpoints, setIsSavingEndpoints] = useState(false);
   const endpointDirty = JSON.stringify(endpointRows) !== JSON.stringify(localModelEndpoints);
@@ -86,36 +245,156 @@ export function ModelsPage({
     () => (localModelIds.length ? localModelIds : DEFAULT_LOCAL_MODELS),
     [localModelIds],
   );
+  const totalCloudSpend = useMemo(
+    () => requirements.reduce((sum, req) => sum + (req.cloudCostUsd ?? 0), 0),
+    [requirements],
+  );
+  const cloudExecutionAssigned = useMemo(
+    () =>
+      devFallbackChain.some((model) => isCloudModel(model))
+      || roleRoutes.some((route) => route.id === 'gatekeeper' && isCloudModel(route.model)),
+    [devFallbackChain, roleRoutes],
+  );
+  const selectedTechLeadId = cloudReasoner?.model_id ?? '';
+  const selectedTechLeadModel = cloudModels.find((model) => model.id === selectedTechLeadId);
+  const selectedIntegrationProvider = INTEGRATION_PROVIDER_OPTIONS.find((item) => item.id === integrationProvider)
+    ?? INTEGRATION_PROVIDER_OPTIONS[0];
+  const evalModelOptions = useMemo(
+    () => Array.from(new Set([...devFallbackChain, ...localModelOptions, ...cloudModels.map((model) => model.id)])),
+    [cloudModels, devFallbackChain, localModelOptions],
+  );
+
+  useEffect(() => {
+    let active = true;
+    setIntegrationsLoading(true);
+    apiClient
+      .listIntegrations()
+      .then((items) => {
+        if (active) setIntegrations(items);
+      })
+      .catch(() => {
+        if (active) setIntegrations([]);
+      })
+      .finally(() => {
+        if (active) setIntegrationsLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     setEndpointRows(localModelEndpoints);
   }, [localModelEndpoints]);
 
-  useEffect(() => {
-    if (!cloudReasoner) return;
-    const idx = cloudReasoner.model_id.indexOf(':');
-    if (idx > 0) {
-      setCloudProvider(cloudReasoner.model_id.slice(0, idx));
-      setCloudModelId(cloudReasoner.model_id.slice(idx + 1));
-    } else {
-      setCloudProvider(cloudReasoner.provider || 'anthropic');
-      setCloudModelId(cloudReasoner.model_id);
-    }
-  }, [cloudReasoner]);
-
   const cloudProviderOptions = cloudReasoner?.providers ?? [];
-  const providerKeyConfigured = cloudProviderOptions.find((p) => p.id === cloudProvider)?.key_configured ?? true;
 
-  async function saveCloudReasoner() {
-    setCloudSaveState('running');
-    setCloudSaveMessage('');
+  async function saveTechLeadModel(modelId: string) {
+    setTechLeadSaveState('running');
+    setTechLeadSaveMessage('');
     try {
-      await onSaveCloudReasoner(`${cloudProvider}:${cloudModelId.trim()}`);
-      setCloudSaveState('ok');
+      await onSaveCloudReasoner(modelId);
+      setTechLeadSaveState('ok');
     } catch (error) {
-      setCloudSaveState('fail');
-      setCloudSaveMessage(error instanceof Error ? error.message : 'Could not save cloud reasoner.');
+      setTechLeadSaveState('fail');
+      setTechLeadSaveMessage(error instanceof Error ? error.message : 'Could not save Tech Lead model.');
     }
+  }
+
+  async function discoverModels() {
+    setDiscoverState('running');
+    setDiscoverMessage('');
+    try {
+      const result = await apiClient.listProviderModels({
+        provider: registryProvider,
+        api_key: registryApiKey.trim() || undefined,
+      });
+      if (!result.ok) {
+        setDiscoverState('fail');
+        setDiscoverMessage(result.message || 'Could not list models.');
+        setDiscoveredModels([]);
+        return;
+      }
+      setDiscoveredModels(result.models);
+      setDiscoverState('ok');
+      if (result.models.length && !result.models.includes(registryModelId)) {
+        setRegistryModelId(result.models[0]);
+      }
+    } catch (error) {
+      setDiscoverState('fail');
+      setDiscoverMessage(error instanceof Error ? error.message : 'Could not list models.');
+      setDiscoveredModels([]);
+    }
+  }
+
+  async function addRegistryModel() {
+    setRegistryState('running');
+    setRegistryMessage('');
+    try {
+      await onAddCloudModel({
+        label: registryLabel.trim(),
+        provider: registryProvider,
+        model_id: registryModelId.trim(),
+        api_key: registryApiKey.trim(),
+      });
+      setRegistryModelId('');
+      setRegistryLabel('');
+      setRegistryApiKey('');
+      setRegistryState('ok');
+    } catch (error) {
+      setRegistryState('fail');
+      setRegistryMessage(error instanceof Error ? error.message : 'Could not add cloud model.');
+    }
+  }
+
+  async function removeRegistryModel(modelId: string) {
+    setDeletingCloudId(modelId);
+    try {
+      await onDeleteCloudModel(modelId);
+    } catch (error) {
+      setRegistryMessage(error instanceof Error ? error.message : 'Could not remove cloud model.');
+      setRegistryState('fail');
+    } finally {
+      setDeletingCloudId(null);
+    }
+  }
+
+  async function testCloudModelEntry(
+    key: string,
+    payload: { provider: string; model_id: string; api_key?: string },
+  ) {
+    setCloudTestState((prev) => ({ ...prev, [key]: 'running' }));
+    setCloudTestMessage((prev) => ({ ...prev, [key]: '' }));
+    try {
+      const result = await apiClient.testCloudModel(payload);
+      setCloudTestState((prev) => ({ ...prev, [key]: result.ok ? 'ok' : 'fail' }));
+      setCloudTestMessage((prev) => ({ ...prev, [key]: result.message }));
+    } catch (error) {
+      setCloudTestState((prev) => ({ ...prev, [key]: 'fail' }));
+      setCloudTestMessage((prev) => ({
+        ...prev,
+        [key]: error instanceof Error ? error.message : 'Connection test failed.',
+      }));
+    }
+  }
+
+  async function testExistingCloudModel(model: CloudModel) {
+    await testCloudModelEntry(model.id, {
+      provider: model.provider,
+      model_id: model.model_id,
+    });
+  }
+
+  async function testAddFormCloudModel() {
+    if (!registryModelId.trim()) return;
+    const payload: { provider: string; model_id: string; api_key?: string } = {
+      provider: registryProvider,
+      model_id: registryModelId.trim(),
+    };
+    if (registryApiKey.trim()) {
+      payload.api_key = registryApiKey.trim();
+    }
+    await testCloudModelEntry('add-form', payload);
   }
 
   useEffect(() => {
@@ -161,6 +440,49 @@ export function ModelsPage({
     }
   }
 
+  async function addIntegrationCredential() {
+    setIntegrationState('running');
+    setIntegrationMessage('');
+    try {
+      const scopes = integrationScopes
+        .split(',')
+        .map((scope) => scope.trim())
+        .filter(Boolean);
+      const saved = await apiClient.upsertIntegration({
+        provider: integrationProvider,
+        token: integrationToken.trim(),
+        scopes,
+        label: integrationLabel.trim() || undefined,
+      });
+      const listed = await apiClient.listIntegrations();
+      setIntegrations(listed);
+      setIntegrationToken('');
+      setIntegrationLabel('');
+      setIntegrationScopes('');
+      setIntegrationState('ok');
+      if (!saved.configured) {
+        setIntegrationMessage('Credential saved but not marked configured.');
+      }
+    } catch (error) {
+      setIntegrationState('fail');
+      setIntegrationMessage(error instanceof Error ? error.message : 'Could not save integration.');
+    }
+  }
+
+  async function removeIntegrationCredential(provider: IntegrationProvider, credentialId: string) {
+    const key = `${provider}:${credentialId}`;
+    setDeletingIntegrationKey(key);
+    try {
+      await apiClient.deleteIntegration(provider, credentialId);
+      setIntegrations((items) => items.filter((item) => !(item.provider === provider && item.id === credentialId)));
+    } catch (error) {
+      setIntegrationMessage(error instanceof Error ? error.message : 'Could not remove integration.');
+      setIntegrationState('fail');
+    } finally {
+      setDeletingIntegrationKey(null);
+    }
+  }
+
   function updateEndpoint(index: number, updates: Partial<BackendLocalModelEndpoint>) {
     setEndpointRows((rows) => rows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...updates } : row)));
   }
@@ -182,7 +504,6 @@ export function ModelsPage({
   }
 
   const localRoster = modelConfigs.filter((cfg) => cfg.backend === 'LM Studio (local)');
-  const cloudRoster = modelConfigs.filter((cfg) => cfg.backend === 'Cloud API');
 
   function renderModelCard(cfg: ModelConfig) {
     return (
@@ -200,191 +521,88 @@ export function ModelsPage({
 
   return (
     <div className="flex-1 overflow-y-auto bg-background">
-      <div className="max-w-3xl mx-auto px-4 sm:px-6 py-8 space-y-10">
+      <div className="max-w-3xl mx-auto px-4 sm:px-6 py-8 space-y-8">
 
         {/* ── Section 1: Connections ── */}
-        <section>
-          <SectionHeader
-            num="1"
-            title="Connections"
-            subtitle="Server endpoints and notification settings. Each section saves independently."
-          />
-          <div className="rounded-xl border border-border bg-card overflow-hidden">
-            <div className="divide-y divide-border">
-              <div className="px-4 py-4">
-                <label className="text-xs font-medium text-foreground block mb-1.5">
-                  Local model server URLs
-                </label>
-                <p className="text-[11px] text-muted-foreground mb-2">
-                  OpenAI-compatible base URLs (for example LM Studio). Saved to the server.
-                </p>
-                <div className="space-y-2">
-                  {endpointRows.map((endpoint, index) => (
-                    <div
-                      key={`${endpoint.id}-${index}`}
-                      className="grid grid-cols-1 sm:grid-cols-[minmax(0,110px)_1fr_minmax(0,130px)_28px] gap-2"
-                    >
-                      <input
-                        type="text"
-                        value={endpoint.label}
-                        onChange={(e) => updateEndpoint(index, { label: e.target.value })}
-                        className="font-mono text-xs bg-muted border border-border rounded px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-ring text-foreground"
-                        placeholder="Label"
-                      />
-                      <input
-                        type="text"
-                        value={endpoint.base_url}
-                        onChange={(e) => updateEndpoint(index, { base_url: e.target.value })}
-                        className="font-mono text-xs bg-muted border border-border rounded px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-ring text-foreground"
-                        placeholder="http://localhost:1234/v1"
-                      />
-                      <input
-                        type="password"
-                        value={endpoint.api_key ?? ''}
-                        onChange={(e) => updateEndpoint(index, { api_key: e.target.value })}
-                        className="font-mono text-xs bg-muted border border-border rounded px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-ring text-foreground"
-                        placeholder="API key (optional)"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => removeEndpoint(index)}
-                        className="h-7 w-7 flex items-center justify-center rounded border border-border text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                        aria-label="Remove endpoint"
-                      >
-                        <Trash2 size={12} />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-                <div className="flex flex-wrap items-center gap-2 mt-2">
-                  <button
-                    type="button"
-                    onClick={addEndpoint}
-                    className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded border border-border hover:bg-muted transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    <Plus size={11} /> Add
-                  </button>
-                  <button
-                    type="button"
-                    onClick={refreshLocalModels}
-                    disabled={discoveryState === 'running'}
-                    className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded border border-border hover:bg-muted transition-colors disabled:opacity-50 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    {discoveryState === 'running' ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
-                    Refresh discovery
-                  </button>
-                  {discoveryState === 'ok' && (
-                    <span className="flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400 shrink-0">
-                      <CheckCircle2 size={12} /> {localModelIds.length} models
-                    </span>
-                  )}
-                  {discoveryState === 'fail' && (
-                    <span className="flex items-center gap-1 text-xs text-red-600 dark:text-red-400 shrink-0">
-                      <XCircle size={12} /> Failed
-                    </span>
-                  )}
-                </div>
-                <details className="mt-1 text-[11px] text-muted-foreground">
-                  <summary className="cursor-pointer select-none">View discovered model IDs</summary>
-                  <p className="mt-1 break-all font-mono">
-                    {(localModelIds.length ? localModelIds : DEFAULT_LOCAL_MODELS).join(', ')}
-                  </p>
-                </details>
-              </div>
+        <section className="space-y-3">
+          <SectionHeader num="1" title="Connections" subtitle="Each block saves independently." />
 
-              <div className="px-4 py-4">
-                <div>
-                  <label className="text-xs font-medium text-foreground block mb-1.5">
-                    Cloud reasoner (Tech Lead)
-                  </label>
-                  <p className="text-[11px] text-muted-foreground mb-1.5">
-                    The cloud model that decomposes requirements and runs the technical audit. Pick a provider and model, then Save.
-                  </p>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <select
-                      value={cloudProvider}
-                      onChange={(e) => { setCloudProvider(e.target.value); setCloudSaveState('idle'); setCloudSaveMessage(''); }}
-                      className="text-xs bg-muted border border-border rounded px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-ring text-foreground"
-                    >
-                      {(cloudProviderOptions.length ? cloudProviderOptions : [{ id: 'anthropic', label: 'Claude (Anthropic)', key_configured: true }]).map((p) => (
-                        <option key={p.id} value={p.id}>{p.label}{p.key_configured ? '' : ' (no key)'}</option>
-                      ))}
-                    </select>
-                    <input
-                      value={cloudModelId}
-                      onChange={(e) => { setCloudModelId(e.target.value); setCloudSaveState('idle'); setCloudSaveMessage(''); }}
-                      placeholder="e.g. gpt-4o, gemini-2.0-flash, claude-sonnet-4-6"
-                      className="flex-1 min-w-[200px] font-mono text-xs bg-muted border border-border rounded px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-ring text-foreground"
-                    />
-                    <button
-                      type="button"
-                      onClick={saveCloudReasoner}
-                      disabled={cloudSaveState === 'running' || !cloudModelId.trim()}
-                      className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded border border-border hover:bg-muted transition-colors disabled:opacity-50 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    >
-                      {cloudSaveState === 'running' ? <Loader2 size={11} className="animate-spin" /> : 'Save'}
-                    </button>
-                    {cloudSaveState === 'ok' && (
-                      <CheckCircle2 size={12} className="text-emerald-600 dark:text-emerald-400 shrink-0" />
-                    )}
-                    {cloudSaveState === 'fail' && (
-                      <XCircle size={12} className="text-red-600 dark:text-red-400 shrink-0" />
-                    )}
-                  </div>
-                  {!providerKeyConfigured && (
-                    <p className="text-[11px] mt-1.5 text-amber-600 dark:text-amber-400">
-                      No API key configured for this provider on the server. Set it in the server environment (e.g. <span className="font-mono">OPENAI_API_KEY</span> / <span className="font-mono">GEMINI_API_KEY</span> / <span className="font-mono">CLAUDE_API_KEY</span>).
-                    </p>
-                  )}
-                  {cloudSaveMessage && (
-                    <p className="text-[11px] mt-1.5 text-red-600 dark:text-red-400">{cloudSaveMessage}</p>
-                  )}
-                </div>
-              </div>
-
-              <div className="px-4 py-4">
-                <label className="text-xs font-medium text-foreground block mb-1.5">
-                  Notify me when attention is needed
-                </label>
-                <p className="text-[11px] text-muted-foreground mb-2">
-                  Optional webhook URL. Leave empty to see alerts only in this app.
-                </p>
-                <div className="flex flex-wrap items-center gap-2">
+          <CollapsibleConnectionBlock title="Local model servers" hint="LM Studio / OpenAI-compatible URLs.">
+            <div className="space-y-2">
+              {endpointRows.map((endpoint, index) => (
+                <div
+                  key={`${endpoint.id}-${index}`}
+                  className="grid grid-cols-1 sm:grid-cols-[minmax(0,110px)_1fr_minmax(0,130px)_28px] gap-2"
+                >
                   <input
-                    type="url"
-                    value={webhookInput}
-                    onChange={(e) => setWebhookInput(e.target.value)}
-                    placeholder="https://hooks.example.com/haao"
-                    className="flex-1 min-w-[200px] font-mono text-xs bg-muted border border-border rounded px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-ring text-foreground"
+                    type="text"
+                    value={endpoint.label}
+                    onChange={(e) => updateEndpoint(index, { label: e.target.value })}
+                    className={FORM_INPUT_MONO_CLASS}
+                    placeholder="Label"
+                  />
+                  <input
+                    type="text"
+                    value={endpoint.base_url}
+                    onChange={(e) => updateEndpoint(index, { base_url: e.target.value })}
+                    className={FORM_INPUT_MONO_CLASS}
+                    placeholder="http://localhost:1234/v1"
+                  />
+                  <input
+                    type="password"
+                    value={endpoint.api_key ?? ''}
+                    onChange={(e) => updateEndpoint(index, { api_key: e.target.value })}
+                    className={FORM_INPUT_MONO_CLASS}
+                    placeholder="API key (optional)"
                   />
                   <button
                     type="button"
-                    onClick={saveNotificationWebhook}
-                    disabled={webhookState === 'running' || !webhookDirty}
-                    className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded border border-border hover:bg-muted transition-colors disabled:opacity-50 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    onClick={() => removeEndpoint(index)}
+                    className="h-7 w-7 flex items-center justify-center rounded border border-border text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    aria-label="Remove endpoint"
                   >
-                    {webhookState === 'running' ? <Loader2 size={11} className="animate-spin" /> : 'Save webhook'}
+                    <Trash2 size={12} />
                   </button>
-                  {webhookState === 'ok' && (
-                    <CheckCircle2 size={12} className="text-emerald-600 dark:text-emerald-400 shrink-0" />
-                  )}
-                  {webhookState === 'fail' && (
-                    <XCircle size={12} className="text-red-600 dark:text-red-400 shrink-0" />
-                  )}
                 </div>
-              </div>
-
-              <div className="px-4 py-4 bg-muted/20">
-                <p className="text-xs font-medium text-foreground">Auto-escalation to the cloud reasoner</p>
-                <p className="text-[11px] text-muted-foreground mt-0.5 leading-relaxed">
-                  When local retry attempts are exhausted, HAAO automatically reassigns the ticket to the Tech Lead. This is always enabled on the server — there is no separate toggle.
-                </p>
-              </div>
+              ))}
             </div>
-
+            <div className="flex flex-wrap items-center gap-2 mt-3">
+              <button
+                type="button"
+                onClick={addEndpoint}
+                className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded border border-border hover:bg-muted transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <Plus size={11} /> Add
+              </button>
+              <button
+                type="button"
+                onClick={refreshLocalModels}
+                disabled={discoveryState === 'running'}
+                className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded border border-border hover:bg-muted transition-colors disabled:opacity-50 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {discoveryState === 'running' ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+                Refresh discovery
+              </button>
+              {discoveryState === 'ok' && (
+                <span className="flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400 shrink-0">
+                  <CheckCircle2 size={12} /> {localModelIds.length} models
+                </span>
+              )}
+              {discoveryState === 'fail' && (
+                <span className="flex items-center gap-1 text-xs text-red-600 dark:text-red-400 shrink-0">
+                  <XCircle size={12} /> Failed
+                </span>
+              )}
+            </div>
+            <details className="mt-2 text-[11px] text-muted-foreground">
+              <summary className="cursor-pointer select-none">Discovered model IDs</summary>
+              <p className="mt-1 break-all font-mono">
+                {(localModelIds.length ? localModelIds : DEFAULT_LOCAL_MODELS).join(', ')}
+              </p>
+            </details>
             {endpointDirty && (
-              <div className="px-4 py-3 border-t border-border bg-amber-50/50 dark:bg-amber-950/20 flex flex-wrap items-center justify-between gap-2">
-                <span className="text-xs text-amber-600 dark:text-amber-400">Unsaved endpoint changes</span>
+              <div className="mt-3 pt-3 border-t border-border flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs text-amber-600 dark:text-amber-400">Unsaved changes</span>
                 <div className="flex gap-2">
                   <button
                     type="button"
@@ -399,12 +617,391 @@ export function ModelsPage({
                     disabled={isSavingEndpoints}
                     className="text-xs px-2.5 py-1 rounded bg-primary text-primary-foreground hover:opacity-90 transition-opacity disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
-                    {isSavingEndpoints ? 'Saving…' : 'Save endpoints'}
+                    {isSavingEndpoints ? 'Saving…' : 'Save'}
                   </button>
                 </div>
               </div>
             )}
-          </div>
+          </CollapsibleConnectionBlock>
+
+          <ConnectionBlock title="Cloud models & API keys" hint="Encrypted on server; Claude default uses env key.">
+                {cloudModels.length > 0 && (
+                  <div className="space-y-2 mb-3">
+                    {cloudModels.map((model) => (
+                      <div
+                        key={model.id}
+                        className="flex flex-wrap items-center gap-2 rounded border border-border bg-background px-2.5 py-2"
+                      >
+                        <Cloud size={12} className="shrink-0 text-sky-600 dark:text-sky-400" />
+                        <span className="text-xs font-medium text-foreground">{cloudModelOptionLabel(model)}</span>
+                        {!cloudModelIsDeletable(model) && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground">
+                            default
+                          </span>
+                        )}
+                        <span className="font-mono text-[11px] text-muted-foreground">{model.id}</span>
+                        <span
+                          className={`text-[10px] px-1.5 py-0.5 rounded-full ${
+                            model.key_configured
+                              ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300'
+                              : 'bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300'
+                          }`}
+                        >
+                          {model.key_configured ? 'key configured' : 'no key'}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => void testExistingCloudModel(model)}
+                          disabled={cloudTestState[model.id] === 'running'}
+                          className="text-[11px] px-2 py-1 rounded border border-border hover:bg-muted transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        >
+                          {cloudTestState[model.id] === 'running' ? (
+                            <Loader2 size={11} className="animate-spin" />
+                          ) : (
+                            'Test'
+                          )}
+                        </button>
+                        {cloudTestState[model.id] === 'ok' && (
+                          <span className="text-[11px] text-emerald-600 dark:text-emerald-400">Connection OK</span>
+                        )}
+                        {cloudTestState[model.id] === 'fail' && cloudTestMessage[model.id] && (
+                          <span className="text-[11px] text-red-600 dark:text-red-400 max-w-[200px] truncate" title={cloudTestMessage[model.id]}>
+                            {cloudTestMessage[model.id]}
+                          </span>
+                        )}
+                        {cloudModelIsDeletable(model) ? (
+                          <button
+                            type="button"
+                            onClick={() => void removeRegistryModel(model.id)}
+                            disabled={deletingCloudId === model.id}
+                            className="ml-auto h-7 w-7 flex items-center justify-center rounded border border-border text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            aria-label={`Remove ${model.label}`}
+                          >
+                            {deletingCloudId === model.id ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
+                          </button>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <select
+                    value={registryProvider}
+                    onChange={(e) => { setRegistryProvider(e.target.value); setRegistryState('idle'); setRegistryMessage(''); setDiscoveredModels([]); setDiscoverState('idle'); setDiscoverMessage(''); }}
+                    className={FORM_INPUT_CLASS}
+                  >
+                    {(cloudProviderOptions.length ? cloudProviderOptions : [{ id: 'openai', label: 'OpenAI', key_configured: true }]).map((provider) => (
+                      <option key={provider.id} value={provider.id}>{provider.label}</option>
+                    ))}
+                  </select>
+                  <input
+                    value={registryModelId}
+                    onChange={(e) => { setRegistryModelId(e.target.value); setRegistryState('idle'); setRegistryMessage(''); }}
+                    placeholder="Model id — or Discover to pick"
+                    list="discovered-cloud-models"
+                    className={FORM_INPUT_MONO_CLASS}
+                  />
+                  <datalist id="discovered-cloud-models">
+                    {discoveredModels.map((model) => (
+                      <option key={model} value={model} />
+                    ))}
+                  </datalist>
+                  <input
+                    value={registryLabel}
+                    onChange={(e) => setRegistryLabel(e.target.value)}
+                    placeholder="Label (optional)"
+                    className={FORM_INPUT_CLASS}
+                  />
+                  <input
+                    type="password"
+                    value={registryApiKey}
+                    onChange={(e) => { setRegistryApiKey(e.target.value); setRegistryState('idle'); setRegistryMessage(''); }}
+                    placeholder="API key"
+                    className={FORM_INPUT_MONO_CLASS}
+                  />
+                </div>
+                <div className="flex flex-wrap items-center gap-2 mt-3">
+                  <button
+                    type="button"
+                    onClick={() => void discoverModels()}
+                    disabled={discoverState === 'running'}
+                    title="List the models this provider exposes for your key"
+                    className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded border border-border hover:bg-muted transition-colors disabled:opacity-50 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    {discoverState === 'running' ? <Loader2 size={11} className="animate-spin" /> : 'Discover models'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void testAddFormCloudModel()}
+                    disabled={cloudTestState['add-form'] === 'running' || !registryModelId.trim()}
+                    className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded border border-border hover:bg-muted transition-colors disabled:opacity-50 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    {cloudTestState['add-form'] === 'running' ? <Loader2 size={11} className="animate-spin" /> : 'Test'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void addRegistryModel()}
+                    disabled={registryState === 'running' || !registryModelId.trim() || !registryApiKey.trim()}
+                    className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded border border-border hover:bg-muted transition-colors disabled:opacity-50 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    {registryState === 'running' ? <Loader2 size={11} className="animate-spin" /> : <Plus size={11} />}
+                    Add cloud model
+                  </button>
+                  {cloudTestState['add-form'] === 'ok' && (
+                    <span className="flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400 shrink-0">
+                      <CheckCircle2 size={12} /> Connection OK
+                    </span>
+                  )}
+                  {cloudTestState['add-form'] === 'fail' && cloudTestMessage['add-form'] && (
+                    <span className="text-xs text-red-600 dark:text-red-400 shrink-0">{cloudTestMessage['add-form']}</span>
+                  )}
+                  {registryState === 'ok' && (
+                    <CheckCircle2 size={12} className="text-emerald-600 dark:text-emerald-400 shrink-0" />
+                  )}
+                  {registryState === 'fail' && (
+                    <XCircle size={12} className="text-red-600 dark:text-red-400 shrink-0" />
+                  )}
+                </div>
+                {registryMessage && (
+                  <p className="text-[11px] mt-1.5 text-red-600 dark:text-red-400">{registryMessage}</p>
+                )}
+                {discoverState === 'ok' && discoveredModels.length > 0 && (
+                  <p className="text-[11px] mt-2 text-muted-foreground">
+                    {discoveredModels.length} model{discoveredModels.length === 1 ? '' : 's'} found — pick from Model id.
+                  </p>
+                )}
+                {discoverState === 'fail' && discoverMessage && (
+                  <p className="text-[11px] mt-2 text-red-600 dark:text-red-400">{discoverMessage}</p>
+                )}
+          </ConnectionBlock>
+
+          <ConnectionBlock title="Tech Lead" hint="Cloud reasoner for decompose and audit.">
+            <div className="flex items-center gap-1.5 mb-2">
+              <span className="text-xs font-medium text-foreground">Tech Lead</span>
+              <HelpTip text={HELP_TOOLTIPS.tech_lead} label="Tech Lead help" />
+            </div>
+            {cloudModels.length === 0 ? (
+              <p className="text-[11px] text-muted-foreground" title="Add a registry model under Cloud models first.">
+                Add a cloud model above first.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <Cloud size={12} className="shrink-0 text-sky-600 dark:text-sky-400" />
+                  <select
+                    value={selectedTechLeadId || cloudModels[0]?.id || ''}
+                    onChange={(e) => void saveTechLeadModel(e.target.value)}
+                    disabled={techLeadSaveState === 'running'}
+                    className={`${FORM_INPUT_CLASS} w-full disabled:opacity-50`}
+                  >
+                    {cloudModels.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {cloudModelOptionLabel(model)}
+                        {!model.key_configured ? ' (no key)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                  {techLeadSaveState === 'running' && (
+                    <Loader2 size={12} className="animate-spin text-muted-foreground shrink-0" />
+                  )}
+                  {techLeadSaveState === 'ok' && (
+                    <CheckCircle2 size={12} className="text-emerald-600 dark:text-emerald-400 shrink-0" />
+                  )}
+                  {techLeadSaveState === 'fail' && (
+                    <XCircle size={12} className="text-red-600 dark:text-red-400 shrink-0" />
+                  )}
+                </div>
+                {selectedTechLeadModel && !selectedTechLeadModel.key_configured && (
+                  <p
+                    className="text-[10px] text-amber-700 dark:text-amber-300"
+                    title={
+                      cloudModelIsDeletable(selectedTechLeadModel)
+                        ? 'Add or update the API key under Cloud models.'
+                        : 'Set CLAUDE_API_KEY on the server, or pick a registry model with a stored key.'
+                    }
+                  >
+                    {cloudModelIsDeletable(selectedTechLeadModel)
+                      ? 'No API key — update under Cloud models.'
+                      : 'No Claude env key — set CLAUDE_API_KEY or pick another model.'}
+                  </p>
+                )}
+                {techLeadSaveMessage && (
+                  <p className="text-[10px] text-red-600 dark:text-red-400">{techLeadSaveMessage}</p>
+                )}
+              </div>
+            )}
+            <details className="mt-3 text-[11px] text-muted-foreground">
+              <summary className="cursor-pointer select-none">Auto-escalation</summary>
+              <p className="mt-1">Retries exhausted → reassigns to Tech Lead (always on).</p>
+            </details>
+          </ConnectionBlock>
+
+          <CollapsibleConnectionBlock title="Integrations" hint="GitHub, GitLab, Slack — encrypted tokens.">
+                {integrationsLoading ? (
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground py-1">
+                    <Loader2 size={12} className="animate-spin" />
+                    Loading integrations…
+                  </div>
+                ) : integrations.length > 0 ? (
+                  <div className="space-y-2 mb-3">
+                    {integrations.map((credential) => (
+                      <div
+                        key={`${credential.provider}-${credential.id}`}
+                        className="flex flex-wrap items-center gap-2 rounded border border-border bg-background px-2.5 py-2"
+                      >
+                        <Link2 size={12} className="shrink-0 text-violet-600 dark:text-violet-400" />
+                        <span className="text-xs font-medium text-foreground">
+                          {credential.label || integrationProviderLabel(credential.provider)}
+                        </span>
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground uppercase">
+                          {credential.provider}
+                        </span>
+                        <span className="font-mono text-[11px] text-muted-foreground">{credential.id}</span>
+                        <span
+                          className={`text-[10px] px-1.5 py-0.5 rounded-full ${
+                            credential.configured
+                              ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300'
+                              : 'bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300'
+                          }`}
+                        >
+                          {credential.configured ? 'configured' : 'not configured'}
+                        </span>
+                        {credential.scopes.length > 0 && (
+                          <span className="text-[10px] text-muted-foreground truncate max-w-[180px]" title={credential.scopes.join(', ')}>
+                            {credential.scopes.join(', ')}
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => void removeIntegrationCredential(credential.provider, credential.id)}
+                          disabled={deletingIntegrationKey === `${credential.provider}:${credential.id}`}
+                          className="ml-auto h-7 w-7 flex items-center justify-center rounded border border-border text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                          aria-label={`Remove ${credential.label || credential.provider}`}
+                        >
+                          {deletingIntegrationKey === `${credential.provider}:${credential.id}`
+                            ? <Loader2 size={12} className="animate-spin" />
+                            : <Trash2 size={12} />}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-[11px] text-muted-foreground mb-3">None configured.</p>
+                )}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <select
+                    value={integrationProvider}
+                    onChange={(e) => {
+                      setIntegrationProvider(e.target.value as IntegrationProvider);
+                      setIntegrationState('idle');
+                      setIntegrationMessage('');
+                    }}
+                    className={FORM_INPUT_CLASS}
+                  >
+                    {INTEGRATION_PROVIDER_OPTIONS.map((provider) => (
+                      <option key={provider.id} value={provider.id}>{provider.label}</option>
+                    ))}
+                  </select>
+                  <input
+                    value={integrationLabel}
+                    onChange={(e) => setIntegrationLabel(e.target.value)}
+                    placeholder="Label (optional)"
+                    className={FORM_INPUT_CLASS}
+                  />
+                  <input
+                    type="password"
+                    value={integrationToken}
+                    onChange={(e) => {
+                      setIntegrationToken(e.target.value);
+                      setIntegrationState('idle');
+                      setIntegrationMessage('');
+                    }}
+                    placeholder={selectedIntegrationProvider.tokenPlaceholder}
+                    className={`${FORM_INPUT_MONO_CLASS} sm:col-span-2`}
+                  />
+                  <input
+                    value={integrationScopes}
+                    onChange={(e) => setIntegrationScopes(e.target.value)}
+                    placeholder={selectedIntegrationProvider.scopePlaceholder}
+                    className={`${FORM_INPUT_MONO_CLASS} sm:col-span-2`}
+                  />
+                </div>
+                <div className="flex flex-wrap items-center gap-2 mt-3">
+                  <button
+                    type="button"
+                    onClick={() => void addIntegrationCredential()}
+                    disabled={integrationState === 'running' || !integrationToken.trim()}
+                    className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded border border-border hover:bg-muted transition-colors disabled:opacity-50 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    {integrationState === 'running' ? <Loader2 size={11} className="animate-spin" /> : <Plus size={11} />}
+                    Add integration
+                  </button>
+                  {integrationState === 'ok' && (
+                    <CheckCircle2 size={12} className="text-emerald-600 dark:text-emerald-400 shrink-0" />
+                  )}
+                  {integrationState === 'fail' && (
+                    <XCircle size={12} className="text-red-600 dark:text-red-400 shrink-0" />
+                  )}
+                </div>
+                {integrationMessage && (
+                  <p className="text-[11px] mt-2 text-red-600 dark:text-red-400">{integrationMessage}</p>
+                )}
+          </CollapsibleConnectionBlock>
+
+          <ConnectionBlock title="Cloud execution">
+            <div className="flex items-start justify-between gap-4">
+              <p
+                className="text-[11px] text-muted-foreground"
+                title="Allows dev/execution on cloud models. Removes hybrid cost routing; off by default."
+              >
+                Let every role run on cloud models (billable).
+              </p>
+              <Switch
+                checked={allowCloudExecutionModel}
+                disabled={cloudExecutionPending}
+                onCheckedChange={(checked) => {
+                  setCloudExecutionPending(true);
+                  void onUpdateAllowCloudExecutionModel(checked).finally(() => {
+                    setCloudExecutionPending(false);
+                  });
+                }}
+                aria-label="Allow cloud execution model"
+              />
+            </div>
+          </ConnectionBlock>
+
+          <EvalRunPanel
+            usingMockData={usingMockData}
+            modelOptions={evalModelOptions}
+            defaultModelId={devFallbackChain[0] ?? evalModelOptions[0]}
+            modelLabel={(modelId) => modelDisplayLabel(modelId, cloudModels)}
+          />
+
+          <CollapsibleConnectionBlock title="Webhook notifications" hint="Optional attention alerts.">
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                type="url"
+                value={webhookInput}
+                onChange={(e) => setWebhookInput(e.target.value)}
+                placeholder="https://hooks.example.com/haao"
+                className={`flex-1 min-w-[200px] ${FORM_INPUT_MONO_CLASS}`}
+              />
+              <button
+                type="button"
+                onClick={saveNotificationWebhook}
+                disabled={webhookState === 'running' || !webhookDirty}
+                className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded border border-border hover:bg-muted transition-colors disabled:opacity-50 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {webhookState === 'running' ? <Loader2 size={11} className="animate-spin" /> : 'Save'}
+              </button>
+              {webhookState === 'ok' && (
+                <CheckCircle2 size={12} className="text-emerald-600 dark:text-emerald-400 shrink-0" />
+              )}
+              {webhookState === 'fail' && (
+                <XCircle size={12} className="text-red-600 dark:text-red-400 shrink-0" />
+              )}
+            </div>
+          </CollapsibleConnectionBlock>
         </section>
 
         {/* ── Section 2: Role routing ── */}
@@ -412,8 +1009,27 @@ export function ModelsPage({
           <SectionHeader
             num="2"
             title="Default model per role"
-            subtitle="Which model HAAO picks for each job. Ticket-level overrides win."
+            subtitle="Ticket overrides win."
           />
+          {(requirements.length > 0 || cloudExecutionAssigned) && (
+            <div className="flex flex-wrap items-center gap-3 rounded-xl border border-border bg-muted/30 px-4 py-3 text-xs mb-3">
+              <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+                <Cloud size={12} />
+                <span className="font-semibold text-foreground tabular-nums">
+                  {formatCloudCost(totalCloudSpend) ?? '$0.0000'}
+                </span>
+                cloud spend (project)
+              </span>
+              {cloudExecutionAssigned && (
+                <>
+                  <span className="text-muted-foreground/40">·</span>
+                  <span className="text-amber-700 dark:text-amber-300" title="No spend cap — costs accrue per ticket.">
+                    Cloud execution active
+                  </span>
+                </>
+              )}
+            </div>
+          )}
           <div className="rounded-xl border border-border overflow-x-auto">
             <table className="w-full text-sm min-w-[480px]">
               <thead>
@@ -424,58 +1040,110 @@ export function ModelsPage({
                 </tr>
               </thead>
               <tbody>
-                {roleRoutes.map((route, i) => (
+                {roleRoutes.filter((route) => route.id !== 'tech_lead').map((route, i) => (
                   <tr
                     key={route.id}
                     className={`border-b border-border last:border-0 ${i % 2 === 0 ? '' : 'bg-muted/20'}`}
                   >
-                    <td className="px-4 py-3 text-xs text-foreground align-top">{route.role}</td>
+                    <td className="px-4 py-3 text-xs text-foreground align-top">
+                      <span className="inline-flex items-center gap-1">
+                        {route.role}
+                        {route.id === 'gatekeeper' && (
+                          <HelpTip text={HELP_TOOLTIPS.gatekeeper} label="Gatekeeper help" />
+                        )}
+                        {route.id === 'escalation' && (
+                          <HelpTip text={HELP_TOOLTIPS.escalation} label="Escalation help" />
+                        )}
+                        {route.id === 'dev' && (
+                          <HelpTip text={HELP_TOOLTIPS.cloud_vs_local} label="Local vs cloud help" />
+                        )}
+                      </span>
+                    </td>
                     <td className="px-3 py-3 align-top">
                       {route.id === 'dev' ? (
                         <DevFallbackChainEditor
                           chain={devFallbackChain}
-                          options={localModelOptions}
+                          localOptions={localModelOptions}
+                          cloudModels={cloudModels}
                           onChange={onUpdateDevFallbackChain}
                         />
-                      ) : CLOUD_ONLY_ROUTE_IDS.has(route.id) ? (
+                      ) : route.id === 'escalation' ? (
                         <div className="flex items-center gap-2">
-                          <span
-                            className="w-1.5 h-1.5 rounded-full shrink-0"
-                            style={{ backgroundColor: getModelMeta(CLAUDE_TECH_LEAD).accent }}
-                          />
-                          <span className="text-xs text-foreground">{getModelMeta(CLAUDE_TECH_LEAD).label}</span>
-                          <span className="text-[10px] text-muted-foreground">(cloud only)</span>
+                          <Cloud size={12} className="shrink-0 text-sky-600 dark:text-sky-400" />
+                          <span className="text-xs text-foreground">
+                            {selectedTechLeadModel
+                              ? cloudModelOptionLabel(selectedTechLeadModel)
+                              : modelOptionLabel(selectedTechLeadId, cloudModels)}
+                          </span>
+                          <span className="text-[10px] text-muted-foreground" title="Follows Tech Lead model from Connections.">
+                            (follows Tech Lead)
+                          </span>
                         </div>
                       ) : (
-                        <div className="flex items-center gap-2">
-                          <span
-                            className="w-1.5 h-1.5 rounded-full shrink-0"
-                            style={{ backgroundColor: getModelMeta(route.model).accent }}
-                          />
-                          <select
-                            value={route.model}
-                            onChange={(e) => onUpdateRoute(route.id, e.target.value as AssignedModel)}
-                            className="text-xs bg-background border border-border rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-ring text-foreground w-full"
-                          >
-                            {routeModelOptions(route.id, localModelOptions, route.model).map((m) => (
-                              <option key={m} value={m}>{getModelMeta(m).label}</option>
-                            ))}
-                          </select>
+                        <div className="space-y-1.5">
+                          <div className="flex items-center gap-2">
+                            {isCloudModel(route.model) ? (
+                              <Cloud size={12} className="shrink-0 text-sky-600 dark:text-sky-400" />
+                            ) : (
+                              <span
+                                className="w-1.5 h-1.5 rounded-full shrink-0"
+                                style={{ backgroundColor: getModelMeta(route.model).accent }}
+                              />
+                            )}
+                            <select
+                              value={route.model}
+                              onChange={(e) => onUpdateRoute(route.id, e.target.value as AssignedModel)}
+                              className="text-xs bg-background border border-border rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-ring text-foreground w-full"
+                            >
+                              {localModelOptions.length > 0 && (
+                                <optgroup label="Local">
+                                  {routeModelOptions(route.id, localModelOptions, cloudModels, route.model)
+                                    .filter((model) => !isCloudModel(model))
+                                    .map((model) => (
+                                      <option key={model} value={model}>{modelOptionLabel(model, cloudModels)}</option>
+                                    ))}
+                                </optgroup>
+                              )}
+                              {cloudModels.length > 0 && (
+                                <optgroup label="Cloud (billable)">
+                                  {routeModelOptions(route.id, localModelOptions, cloudModels, route.model)
+                                    .filter((model) => isCloudModel(model))
+                                    .map((model) => {
+                                      const registry = cloudModels.find((item) => item.id === model);
+                                      return (
+                                        <option key={model} value={model}>
+                                          {modelOptionLabel(model, cloudModels)}
+                                          {registry && !registry.key_configured ? ' (no key)' : ''}
+                                        </option>
+                                      );
+                                    })}
+                                </optgroup>
+                              )}
+                            </select>
+                          </div>
+                          {isCloudModel(route.model) && (
+                            <p className="text-[10px] text-amber-700 dark:text-amber-300" title="Billable — tracked in History.">
+                              Billable cloud
+                            </p>
+                          )}
                         </div>
                       )}
                     </td>
-                    <td className="px-3 py-3 text-xs text-muted-foreground align-top">{route.note}</td>
+                    <td className="px-3 py-3 text-xs text-muted-foreground align-top">
+                      {route.id === 'gatekeeper' && isCloudModel(route.model)
+                        ? `${route.note} · billable cloud`
+                        : route.note}
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
-          <div className="flex items-start gap-1.5 mt-2">
-            <Info size={11} className="text-muted-foreground shrink-0 mt-0.5" />
-            <p className="text-[11px] text-muted-foreground">
-              Changes save immediately. Override the assigned model on an individual ticket when needed.
-            </p>
-          </div>
+          <details className="mt-2 text-[11px] text-muted-foreground">
+            <summary className="cursor-pointer select-none inline-flex items-center gap-1">
+              <Info size={11} /> Saves immediately; override per ticket.
+            </summary>
+          </details>
         </section>
 
         {/* ── Section 3: Per-model instructions ── */}
@@ -483,15 +1151,14 @@ export function ModelsPage({
           <SectionHeader
             num="3"
             title="Per-model instructions"
-            subtitle="Extra guidance appended to each model's prompt. Saved to the server per model."
+            subtitle="Saved per model on the server."
           />
-          <div className="space-y-3">
+          <ModelStatusLegend />
+          <div className="space-y-3 mt-3">
             {localRoster.length === 0 ? (
               <div className="rounded-xl border border-dashed border-border px-4 py-8 text-center">
-                <p className="text-sm text-muted-foreground">No local models discovered yet.</p>
-                <p className="text-xs text-muted-foreground mt-1">
-                  Add a local model server URL in section 1, save, then refresh discovery.
-                </p>
+                <p className="text-sm text-muted-foreground">No local models discovered.</p>
+                <p className="text-xs text-muted-foreground mt-1">Add a server URL in Connections, then refresh.</p>
                 <button
                   type="button"
                   onClick={refreshLocalModels}
@@ -506,10 +1173,10 @@ export function ModelsPage({
               localRoster.map((cfg) => renderModelCard(cfg))
             )}
           </div>
-          {cloudRoster.length > 0 && (
+          {cloudModels.length > 0 && (
             <div className="space-y-3 mt-6">
               <p className="text-xs font-medium text-muted-foreground">Cloud models</p>
-              {cloudRoster.map((cfg) => renderModelCard(cfg))}
+              {cloudModels.map((model) => renderModelCard(cloudModelToConfig(model)))}
             </div>
           )}
         </section>

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -13,6 +15,7 @@ from orchestrator.db.sqlite import RequirementRepository, TicketRepository, conn
 from orchestrator.execution_loop import ExecutionLoop, build_file_rewrite_prompt
 from orchestrator.models.requirement import Requirement
 from orchestrator.models.ticket import Ticket
+from orchestrator.policies import ExecutionPolicy
 from orchestrator.requirements_flow import RequirementService
 from orchestrator.review_flow import ReviewService
 from orchestrator.role_routing import role_routing_store
@@ -121,6 +124,11 @@ def test_b038_execution_loop_preserves_project_runner_settings(
     runner = TestRunner(
         cwd=calc_repo,
         env={"HAAO_FLAG": "ok"},
+        execution_policy=ExecutionPolicy(
+            test_allow_network=False,
+            env_allowlist=("PATH", "PYTHONPATH", "HAAO_FLAG"),
+            sandbox_mode="none",
+        ),
         setup_cmd="python -c \"print('setup')\"",
         cleanup_cmd="python -c \"print('cleanup')\"",
         setup_timeout_sec=7,
@@ -142,6 +150,7 @@ def test_b038_execution_loop_preserves_project_runner_settings(
     assert worktree_runner.cleanup_cmd == runner.cleanup_cmd
     assert worktree_runner.setup_timeout_sec == 7
     assert worktree_runner.cleanup_timeout_sec == 8
+    assert worktree_runner.execution_policy == runner.execution_policy
 
 
 @pytest.fixture
@@ -340,6 +349,68 @@ def test_b010_execution_loop_applies_diff_runs_tests_and_moves_to_review(
     assert "complete updated file content" in model.prompts[0]
 
 
+def test_execution_loop_feeds_each_rewrite_to_the_next_target_prompt(
+    calc_repo: Path,
+    calc_db_path: Path,
+    fresh_ticket_dict: dict,
+) -> None:
+    test_file = calc_repo / "test_calc.py"
+    test_file.write_text("import calc\nassert calc.add_one(1) == 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "test_calc.py"], cwd=calc_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "add test target"],
+        cwd=calc_repo,
+        check=True,
+        capture_output=True,
+        env={
+            "GIT_AUTHOR_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "t@example.com",
+            "GIT_COMMITTER_NAME": "test",
+            "GIT_COMMITTER_EMAIL": "t@example.com",
+            **os.environ,
+        },
+    )
+    repository = TicketRepository(connect(calc_db_path))
+    payload = make_calc_ticket(fresh_ticket_dict, calc_repo, status="ready")
+    payload["task"]["target_files"] = ["calc.py", "test_calc.py"]
+    payload["context"] = {
+        "files": [
+            {"path": "calc.py", "content": "def add_one(value):\n    return value\n"},
+            {"path": "test_calc.py", "content": test_file.read_text(encoding="utf-8")},
+        ]
+    }
+    payload["definition_of_done"]["tests"][0]["command"] = (
+        f"{sys.executable} test_calc.py"
+    )
+    ticket = repository.create(Ticket.from_dict(payload))
+
+    class CoordinatedModel:
+        prompts: list[str]
+
+        def __init__(self) -> None:
+            self.prompts = []
+
+        def chat_completion(self, *, model: str, messages, temperature: float = 0.2) -> str:
+            prompt = messages[0].content
+            self.prompts.append(prompt)
+            if "Requested target file:\ncalc.py" in prompt:
+                return "def add_one(value):\n    return value + 1\n"
+            return "import calc\nassert calc.add_one(1) == 2\n"
+
+    model = CoordinatedModel()
+    result = ExecutionLoop(
+        repository,
+        TicketStateService(repository),
+        model,
+        repo_root=calc_repo,
+        test_runner=TestRunner(cwd=calc_repo),
+    ).run_ticket(ticket.id)
+
+    assert result.passed is True
+    assert len(model.prompts) == 2
+    assert "File: calc.py\n```\ndef add_one(value):\n    return value + 1" in model.prompts[1]
+
+
 def test_b016_execution_loop_rejects_target_file_outside_repo(
     calc_repo: Path,
     calc_db_path: Path,
@@ -414,6 +485,10 @@ def test_b010_execution_loop_rolls_back_workspace_before_retry(
 
     assert len(model.observed_contents) >= 2
     assert all("return value + 1" not in content for content in model.observed_contents)
+    baseline_context = (
+        "File: calc.py\n```\ndef add_one(value):\n    return value\n\n```"
+    )
+    assert all(baseline_context in prompt for prompt in model.prompts)
 
 
 def test_b011_review_approved_moves_to_awaiting_acceptance(

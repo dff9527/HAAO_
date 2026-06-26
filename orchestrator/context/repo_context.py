@@ -4,6 +4,8 @@ import subprocess
 from pathlib import Path
 
 from orchestrator.context.scope import expand_scope, validate_scope_paths
+from orchestrator.context.untrusted import wrap_untrusted_context
+from orchestrator.redaction import redact_text
 
 DEFAULT_MAX_TREE_ENTRIES = 120
 DEFAULT_MAX_RECENT_FILES = 12
@@ -109,7 +111,10 @@ def _build_scoped_file_context(
             content = path.read_text(encoding="utf-8", errors="replace")
             if len(content) > max_file_snippet_chars:
                 content = content[:max_file_snippet_chars] + "\n...[truncated]"
-            chunks.append(f"File: {relative}\n```\n{content}\n```")
+            chunks.append(
+                f"File: {relative}\n"
+                f"{wrap_untrusted_context(label=relative.as_posix(), content=redact_text(content))}"
+            )
     return "\n\n".join(chunks)
 
 
