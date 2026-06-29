@@ -6,6 +6,7 @@ import tempfile
 from contextlib import contextmanager
 from collections.abc import Iterator
 from pathlib import Path
+from typing import TypedDict
 
 DIFF_GIT_RE = re.compile(r"^diff --git a/(.+?) b/(.+?)$")
 PLUS_FILE_RE = re.compile(r"^\+\+\+ b/(.+)$")
@@ -13,6 +14,13 @@ PLUS_FILE_RE = re.compile(r"^\+\+\+ b/(.+)$")
 
 class DiffScopeError(ValueError):
     """Raised when a unified diff touches files outside the allowed target set."""
+
+
+class DiffStats(TypedDict):
+    files_touched: int
+    lines_added: int
+    lines_removed: int
+    out_of_scope_files: list[str]
 
 
 def normalize_repo_path(path: str) -> str:
@@ -49,6 +57,26 @@ def validate_diff_target_files(diff: str, target_files: list[str]) -> None:
             "Diff touches files outside ticket.task.target_files: "
             + ", ".join(sorted(extra))
         )
+
+
+def derive_diff_stats(diff: str, target_files: list[str]) -> DiffStats:
+    allowed = {normalize_repo_path(path) for path in target_files}
+    touched = extract_diff_paths(diff)
+    lines_added = 0
+    lines_removed = 0
+    for line in diff.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            lines_added += 1
+        elif line.startswith("-"):
+            lines_removed += 1
+    return {
+        "files_touched": len(touched),
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
+        "out_of_scope_files": sorted(touched - allowed),
+    }
 
 
 class GitWorkspaceGuard:

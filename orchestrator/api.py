@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import sqlite3
 from collections.abc import Generator
@@ -8,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 from starlette.responses import FileResponse
 
@@ -46,15 +47,19 @@ from orchestrator.context.conventions import detect_conventions, detect_test_com
 from orchestrator.context.injector import ContextInjector
 from orchestrator.db.sqlite import (
     AmbiguousTicketError,
+    AuditRepository,
     ChatAttachment,
     ChatRepository,
     DuplicateTicketError,
     EvalRunRepository,
+    IdentityRepository,
     IntegrationProvider,
     IntegrationRepository,
     NotificationRepository,
     ProjectRepository,
     RequirementRepository,
+    RunnerRepository,
+    RunnerTokenRecord,
     RequirementTemplateRepository,
     RunEventRepository,
     SettingsRepository,
@@ -71,6 +76,12 @@ from orchestrator.execution_registry import execution_key, execution_registry
 from orchestrator.execution_safety import GitWorkspaceGuard
 from orchestrator.git_flow import GitTicketFlow, now_iso
 from orchestrator.insights import InsightsService
+from orchestrator.trust import (
+    build_acceptance_summary,
+    build_decision_center,
+    build_requirement_signals,
+    build_ticket_signals,
+)
 from orchestrator.manual_ticket_flow import (
     ManualTicketCreatePayload,
     ManualTicketError,
@@ -529,6 +540,14 @@ class RejectRequest(BaseModel):
     feedback: str = Field(min_length=1)
 
 
+class SplitTicketRequest(BaseModel):
+    feedback: str = Field(min_length=1)
+
+
+class AbandonTicketRequest(BaseModel):
+    reason: str = Field(min_length=1)
+
+
 class DiffRejectRequest(BaseModel):
     feedback: str = Field(min_length=1)
 
@@ -671,7 +690,29 @@ class InsightsResponse(BaseModel):
     escalation_rate: dict
     local_vs_cloud: dict
     cost: dict
+    time_to_first_pr: dict
+    roi: dict
     model_scorecard: list[dict]
+
+
+class DecisionsResponse(BaseModel):
+    project_id: str
+    generated_at: str
+    groups: list[dict]
+    counts: dict
+    derived_only: bool
+
+
+class TicketSignalsResponse(BaseModel):
+    signals: dict
+
+
+class RequirementSignalsResponse(BaseModel):
+    signals: dict
+
+
+class AcceptanceSummaryResponse(BaseModel):
+    summary: dict
 
 
 class EvalRunRequest(BaseModel):
@@ -715,6 +756,64 @@ class NotificationReadAllResponse(BaseModel):
     unread_count: dict
 
 
+class MembershipUpsertRequest(BaseModel):
+    user_id: str = Field(min_length=1)
+    workspace_id: str = "default"
+    role: Literal["owner", "admin", "member", "viewer"]
+    email: str = ""
+    display_name: str = ""
+
+
+class MembershipResponse(BaseModel):
+    membership: dict
+
+
+class AuditEventsResponse(BaseModel):
+    events: list[dict]
+    next_cursor: int | None = None
+
+
+class RunnerRegisterRequest(BaseModel):
+    workspace_id: str = "default"
+    label: str = Field(default="local-runner", min_length=1)
+
+
+class RunnerRegisterResponse(BaseModel):
+    runner: dict
+    token: str
+
+
+class RunnerJobCreateRequest(BaseModel):
+    workspace_id: str = "default"
+    ticket_id: str | None = None
+    payload: dict = Field(default_factory=dict)
+
+
+class RunnerJobResponse(BaseModel):
+    job: dict | None = None
+
+
+class RunnerHeartbeatResponse(BaseModel):
+    runner: dict
+
+
+class RunnerLeaseRequest(BaseModel):
+    ttl_sec: int = Field(default=300, ge=1, le=3600)
+
+
+class RunnerEventsRequest(BaseModel):
+    events: list[dict]
+
+
+class RunnerEventsResponse(BaseModel):
+    accepted: int
+
+
+class RunnerCompleteRequest(BaseModel):
+    status: Literal["terminal"] = "terminal"
+    result: dict = Field(default_factory=dict)
+
+
 class CloudExecutionSettingsRequest(BaseModel):
     allow_cloud_execution_model: bool = False
 
@@ -733,6 +832,13 @@ class TicketsResponse(BaseModel):
 
 class OperationResponse(BaseModel):
     ticket: dict
+
+
+class SplitTicketResponse(BaseModel):
+    parent_id: str
+    child_ticket_ids: list[str]
+    ticket: dict
+    children: list[dict] = Field(default_factory=list)
 
 
 class PullRequestResponse(BaseModel):
@@ -758,6 +864,7 @@ class AutoWorkerRequest(BaseModel):
     project_id: str | None = None
     interval_sec: float = Field(default=5.0, ge=1.0, le=3600.0)
     max_cycles_per_tick: int = Field(default=10, ge=1, le=100)
+    max_workers: int = Field(default=1, ge=1, le=16)
     allow_dirty_workspace: bool = False
 
 
@@ -771,6 +878,14 @@ class AutoWorkerResponse(BaseModel):
     last_error: str
     last_skipped_reason: str = ""
     project_id: str | None = None
+    max_workers: int = 1
+    worker_statuses: list[dict] = Field(default_factory=list)
+
+
+class TicketGraphResponse(BaseModel):
+    project_id: str
+    nodes: list[dict]
+    edges: list[dict]
 
 
 class LocalModelEndpointRequest(BaseModel):
@@ -850,6 +965,36 @@ def get_run_event_repository(
     connection = connect(_sqlite_path(settings.database_url))
     try:
         yield RunEventRepository(connection)
+    finally:
+        connection.close()
+
+
+def get_identity_repository(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Generator[IdentityRepository]:
+    connection = connect(_sqlite_path(settings.database_url))
+    try:
+        yield IdentityRepository(connection)
+    finally:
+        connection.close()
+
+
+def get_audit_repository(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Generator[AuditRepository]:
+    connection = connect(_sqlite_path(settings.database_url))
+    try:
+        yield AuditRepository(connection)
+    finally:
+        connection.close()
+
+
+def get_runner_repository(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Generator[RunnerRepository]:
+    connection = connect(_sqlite_path(settings.database_url))
+    try:
+        yield RunnerRepository(connection)
     finally:
         connection.close()
 
@@ -1068,7 +1213,7 @@ def get_execution_loop(
             execution_policy=ExecutionPolicy(
                 test_allow_network=project.test_allow_network,
                 env_allowlist=tuple(project.env_allowlist),
-                sandbox_mode=project.sandbox_mode,
+                sandbox_mode=_effective_sandbox_mode(project.sandbox_mode, settings),
             ),
             setup_cmd=project.setup_cmd,
             cleanup_cmd=project.cleanup_cmd,
@@ -1260,6 +1405,41 @@ def list_tickets(
 ) -> TicketsResponse:
     return TicketsResponse(
         tickets=[ticket.to_dict() for ticket in repository.list(status=status)]
+    )
+
+
+@router.get("/api/tickets/graph", response_model=TicketGraphResponse)
+@router.get("/tickets/graph", response_model=TicketGraphResponse)
+def tickets_graph(
+    repository: Annotated[TicketRepository, Depends(get_repository)],
+    project_id: str | None = None,
+) -> TicketGraphResponse:
+    scoped = repository.scoped(project_id) if project_id else repository
+    effective_project_id = project_id or repository.project_id or "default"
+    tickets = scoped.list(project_id=effective_project_id)
+    active_leases = {ticket.id: ticket for ticket in scoped.active_leases(project_id=effective_project_id)}
+    nodes = []
+    edges = []
+    by_id = {ticket.id: ticket for ticket in tickets}
+    for ticket in tickets:
+        dependencies = _ticket_depends_on(ticket)
+        for dependency_id in dependencies:
+            edges.append({"source": dependency_id, "target": ticket.id, "kind": "depends_on"})
+        nodes.append(
+            {
+                "id": ticket.id,
+                "status": ticket.status,
+                "depends_on": dependencies,
+                "target_files": ticket.task.target_files,
+                "ready_state": _ticket_ready_state(ticket, by_id, active_leases),
+                "leased": ticket.id in active_leases,
+                "lease": _ticket_lease_payload(ticket),
+            }
+        )
+    return TicketGraphResponse(
+        project_id=effective_project_id,
+        nodes=nodes,
+        edges=edges,
     )
 
 
@@ -1700,6 +1880,162 @@ def list_run_events(
     )
 
 
+@router.get("/api/audit", response_model=AuditEventsResponse)
+@router.get("/audit", response_model=AuditEventsResponse)
+def list_audit_events(
+    repository: Annotated[AuditRepository, Depends(get_audit_repository)],
+    workspace: str = "default",
+    cursor: int | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+) -> AuditEventsResponse:
+    events = repository.list(workspace_id=workspace, cursor=cursor, limit=limit)
+    return AuditEventsResponse(
+        events=[event.to_dict() for event in events],
+        next_cursor=events[-1].id if events else cursor,
+    )
+
+
+@router.post("/api/memberships", response_model=MembershipResponse)
+@router.post("/memberships", response_model=MembershipResponse)
+def upsert_membership(
+    request: MembershipUpsertRequest,
+    repository: Annotated[IdentityRepository, Depends(get_identity_repository)],
+) -> MembershipResponse:
+    repository.create_user(
+        user_id=request.user_id,
+        email=request.email,
+        display_name=request.display_name,
+    )
+    membership = repository.set_membership(
+        user_id=request.user_id,
+        workspace_id=request.workspace_id,
+        role=request.role,
+    )
+    return MembershipResponse(membership=membership.to_dict())
+
+
+@router.post("/api/runner/register", response_model=RunnerRegisterResponse)
+@router.post("/runner/register", response_model=RunnerRegisterResponse)
+def register_runner(
+    request: RunnerRegisterRequest,
+    repository: Annotated[RunnerRepository, Depends(get_runner_repository)],
+    audit: Annotated[AuditRepository, Depends(get_audit_repository)],
+) -> RunnerRegisterResponse:
+    issued = repository.issue_token(workspace_id=request.workspace_id, label=request.label)
+    audit.append(
+        actor_id="control-plane",
+        workspace_id=request.workspace_id,
+        action="runner.token.issue",
+        target=issued.runner.id,
+        payload={"label": request.label},
+    )
+    return RunnerRegisterResponse(runner=issued.runner.to_dict(), token=issued.token)
+
+
+@router.post("/api/runner/revoke/{runner_id}", response_model=RunnerHeartbeatResponse)
+@router.post("/runner/revoke/{runner_id}", response_model=RunnerHeartbeatResponse)
+def revoke_runner(
+    runner_id: str,
+    repository: Annotated[RunnerRepository, Depends(get_runner_repository)],
+    audit: Annotated[AuditRepository, Depends(get_audit_repository)],
+) -> RunnerHeartbeatResponse:
+    try:
+        runner = repository.revoke(runner_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    audit.append(
+        actor_id="control-plane",
+        workspace_id=runner.workspace_id,
+        action="runner.token.revoke",
+        target=runner.id,
+    )
+    return RunnerHeartbeatResponse(runner=runner.to_dict())
+
+
+@router.post("/api/runner/jobs", response_model=RunnerJobResponse)
+@router.post("/runner/jobs", response_model=RunnerJobResponse)
+def enqueue_runner_job(
+    request: RunnerJobCreateRequest,
+    repository: Annotated[RunnerRepository, Depends(get_runner_repository)],
+) -> RunnerJobResponse:
+    job = repository.enqueue_job(
+        workspace_id=request.workspace_id,
+        ticket_id=request.ticket_id,
+        payload=request.payload,
+    )
+    return RunnerJobResponse(job=job.to_dict())
+
+
+@router.post("/api/runner/heartbeat", response_model=RunnerHeartbeatResponse)
+@router.post("/runner/heartbeat", response_model=RunnerHeartbeatResponse)
+def runner_heartbeat(
+    request: Request,
+    repository: Annotated[RunnerRepository, Depends(get_runner_repository)],
+) -> RunnerHeartbeatResponse:
+    runner = _require_runner(request, repository)
+    refreshed = repository.heartbeat(_runner_token_from_request(request))
+    return RunnerHeartbeatResponse(runner=(refreshed or runner).to_dict())
+
+
+@router.post("/api/runner/lease", response_model=RunnerJobResponse)
+@router.post("/runner/lease", response_model=RunnerJobResponse)
+def lease_runner_job(
+    request_body: RunnerLeaseRequest,
+    request: Request,
+    repository: Annotated[RunnerRepository, Depends(get_runner_repository)],
+) -> RunnerJobResponse:
+    runner = _require_runner(request, repository)
+    job = repository.lease_next_job(runner=runner, ttl_sec=request_body.ttl_sec)
+    return RunnerJobResponse(job=job.to_dict() if job else None)
+
+
+@router.post("/api/runner/events", response_model=RunnerEventsResponse)
+@router.post("/runner/events", response_model=RunnerEventsResponse)
+def ingest_runner_events(
+    request_body: RunnerEventsRequest,
+    request: Request,
+    runner_repository: Annotated[RunnerRepository, Depends(get_runner_repository)],
+    run_events: Annotated[RunEventRepository, Depends(get_run_event_repository)],
+) -> RunnerEventsResponse:
+    runner = _require_runner(request, runner_repository)
+    accepted = 0
+    for event in request_body.events:
+        if not isinstance(event, dict):
+            continue
+        run_events.append_run_event(
+            project_id=str(event.get("project_id") or runner.workspace_id),
+            requirement_id=_string_or_none(event.get("requirement_id")),
+            ticket_id=_string_or_none(event.get("ticket_id")),
+            run_id=_string_or_none(event.get("run_id")),
+            event_type=str(event.get("event_type") or "report"),
+            model_id=_string_or_none(event.get("model_id")),
+            payload=event.get("payload") if isinstance(event.get("payload"), dict) else {},
+        )
+        accepted += 1
+    return RunnerEventsResponse(accepted=accepted)
+
+
+@router.post("/api/runner/jobs/{job_id}/complete", response_model=RunnerJobResponse)
+@router.post("/runner/jobs/{job_id}/complete", response_model=RunnerJobResponse)
+def complete_runner_job(
+    job_id: str,
+    request_body: RunnerCompleteRequest,
+    request: Request,
+    repository: Annotated[RunnerRepository, Depends(get_runner_repository)],
+) -> RunnerJobResponse:
+    runner = _require_runner(request, repository)
+    try:
+        job = repository.complete_job(
+            job_id=job_id,
+            runner=runner,
+            result=request_body.result,
+            status=request_body.status,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return RunnerJobResponse(job=job.to_dict())
+
+
 @router.get("/api/insights", response_model=InsightsResponse)
 @router.get("/insights", response_model=InsightsResponse)
 def get_insights(
@@ -1713,6 +2049,52 @@ def get_insights(
             range_name=range_name,
         )
     )
+
+
+@router.get("/api/decisions", response_model=DecisionsResponse)
+@router.get("/decisions", response_model=DecisionsResponse)
+def get_decisions(
+    repository: Annotated[TicketRepository, Depends(get_repository)],
+    project_id: str = "default",
+) -> DecisionsResponse:
+    return DecisionsResponse(**build_decision_center(repository.connection, project_id=project_id))
+
+
+@router.get("/api/tickets/{ticket_id}/signals", response_model=TicketSignalsResponse)
+@router.get("/tickets/{ticket_id}/signals", response_model=TicketSignalsResponse)
+def get_ticket_signals(
+    ticket_id: str,
+    repository: Annotated[TicketRepository, Depends(get_repository)],
+) -> TicketSignalsResponse:
+    ticket = repository.get(ticket_id)
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    return TicketSignalsResponse(signals=build_ticket_signals(ticket))
+
+
+@router.get("/api/requirements/{requirement_id}/signals", response_model=RequirementSignalsResponse)
+@router.get("/requirements/{requirement_id}/signals", response_model=RequirementSignalsResponse)
+def get_requirement_signals(
+    requirement_id: str,
+    repository: Annotated[RequirementRepository, Depends(get_requirement_repository)],
+    project_id: str | None = None,
+) -> RequirementSignalsResponse:
+    requirement = repository.get(requirement_id, project_id=project_id)
+    if requirement is None:
+        raise HTTPException(status_code=404, detail="Requirement not found")
+    return RequirementSignalsResponse(signals=build_requirement_signals(requirement))
+
+
+@router.get("/api/tickets/{ticket_id}/acceptance-summary", response_model=AcceptanceSummaryResponse)
+@router.get("/tickets/{ticket_id}/acceptance-summary", response_model=AcceptanceSummaryResponse)
+def get_acceptance_summary(
+    ticket_id: str,
+    repository: Annotated[TicketRepository, Depends(get_repository)],
+) -> AcceptanceSummaryResponse:
+    ticket = repository.get(ticket_id)
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    return AcceptanceSummaryResponse(summary=build_acceptance_summary(ticket))
 
 
 @router.get("/api/evals/task-sets", response_model=EvalTaskSetsResponse)
@@ -1954,6 +2336,126 @@ def reject_ticket(
         level="warn",
     )
     return OperationResponse(ticket=result.ticket.to_dict())
+
+
+@router.post("/api/tickets/{ticket_id}/split", response_model=SplitTicketResponse)
+@router.post("/tickets/{ticket_id}/split", response_model=SplitTicketResponse)
+def split_ticket(
+    ticket_id: str,
+    request: SplitTicketRequest,
+    repository: Annotated[TicketRepository, Depends(get_repository)],
+    run_events: Annotated[RunEventRepository, Depends(get_run_event_repository)],
+) -> SplitTicketResponse:
+    ticket = repository.get(ticket_id)
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    if ticket.status in {"in_progress", "testing"}:
+        raise HTTPException(status_code=409, detail="Live tickets must be cancelled before split")
+    if ticket.status in {TicketStatus.DONE, TicketStatus.ABANDONED, TicketStatus.SPLIT}:
+        raise HTTPException(status_code=409, detail="Terminal tickets cannot be split")
+    project_id = _ticket_project_id(ticket)
+    child_payloads = _split_child_ticket_payloads(ticket, request.feedback, repository)
+    children = [repository.create(Ticket.from_dict(payload), project_id=project_id) for payload in child_payloads]
+    ticket_json = ticket.to_dict()
+    ticket_json["status"] = TicketStatus.SPLIT.value
+    metadata = ticket_json.setdefault("metadata", {})
+    metadata["needs_approval"] = False
+    metadata["split_requested"] = True
+    metadata["split_feedback"] = request.feedback
+    metadata["split_requested_by"] = "product-owner"
+    metadata["split_requested_at"] = _now()
+    metadata["previous_status_before_split"] = str(ticket.status)
+    metadata["child_ticket_ids"] = [child.id for child in children]
+    if ticket.result and ticket.result.diff:
+        metadata["previous_rejected_diff"] = ticket.result.diff
+    updated = repository.save(type(ticket).from_dict(ticket_json))
+    repository.append_log(
+        ticket_id,
+        f"Ticket split by Product Owner into {', '.join(child.id for child in children)}: {request.feedback}",
+        level="warn",
+    )
+    run_events.append_run_event(
+        project_id=_ticket_project_id(updated),
+        requirement_id=_ticket_requirement_id(updated),
+        ticket_id=updated.id,
+        run_id=_ticket_run_id(updated),
+        event_type="report",
+        model_id=updated.execution.assigned_model,
+        payload={
+            "report_kind": "needs_you",
+            "action": "split",
+            "reason": request.feedback,
+            "from_status": str(ticket.status),
+            "to_status": TicketStatus.SPLIT.value,
+            "child_ticket_ids": [child.id for child in children],
+        },
+    )
+    for child in children:
+        repository.append_log(child.id, f"Created by split from {ticket.id}: {request.feedback}")
+        run_events.append_run_event(
+            project_id=_ticket_project_id(child),
+            requirement_id=_ticket_requirement_id(child),
+            ticket_id=child.id,
+            run_id=None,
+            event_type="report",
+            model_id=child.execution.assigned_model,
+            payload={
+                "report_kind": "needs_you",
+                "action": "split_from",
+                "parent_ticket_id": ticket.id,
+                "reason": request.feedback,
+            },
+        )
+    return SplitTicketResponse(
+        parent_id=updated.id,
+        child_ticket_ids=[child.id for child in children],
+        ticket=updated.to_dict(),
+        children=[child.to_dict() for child in children],
+    )
+
+
+@router.post("/api/tickets/{ticket_id}/abandon", response_model=OperationResponse)
+@router.post("/tickets/{ticket_id}/abandon", response_model=OperationResponse)
+def abandon_ticket(
+    ticket_id: str,
+    request: AbandonTicketRequest,
+    repository: Annotated[TicketRepository, Depends(get_repository)],
+    run_events: Annotated[RunEventRepository, Depends(get_run_event_repository)],
+) -> OperationResponse:
+    ticket = repository.get(ticket_id)
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    if ticket.status in {"in_progress", "testing"}:
+        raise HTTPException(status_code=409, detail="Live tickets must be cancelled before abandon")
+    if ticket.status in {TicketStatus.DONE, TicketStatus.ABANDONED, TicketStatus.SPLIT}:
+        raise HTTPException(status_code=409, detail="Terminal tickets cannot be abandoned")
+    ticket_json = ticket.to_dict()
+    ticket_json["status"] = TicketStatus.ABANDONED.value
+    metadata = ticket_json.setdefault("metadata", {})
+    metadata["abandoned"] = True
+    metadata["abandoned_by"] = "product-owner"
+    metadata["abandoned_at"] = _now()
+    metadata["abandon_reason"] = request.reason
+    metadata["previous_status_before_abandon"] = str(ticket.status)
+    metadata["needs_approval"] = False
+    updated = repository.save(type(ticket).from_dict(ticket_json))
+    repository.append_log(ticket_id, f"Product Owner abandoned ticket: {request.reason}", level="warn")
+    run_events.append_run_event(
+        project_id=_ticket_project_id(updated),
+        requirement_id=_ticket_requirement_id(updated),
+        ticket_id=updated.id,
+        run_id=_ticket_run_id(updated),
+        event_type="report",
+        model_id=updated.execution.assigned_model,
+        payload={
+            "report_kind": "done",
+            "action": "abandon",
+            "reason": request.reason,
+            "from_status": str(ticket.status),
+            "to_status": TicketStatus.ABANDONED.value,
+        },
+    )
+    return OperationResponse(ticket=updated.to_dict())
 
 
 @router.post("/tickets/{ticket_id}/assign_model", response_model=OperationResponse)
@@ -2296,11 +2798,12 @@ async def start_auto_worker(
         env=project.env,
         env_allowlist=project.env_allowlist,
         test_allow_network=project.test_allow_network,
-        sandbox_mode=project.sandbox_mode,
+        sandbox_mode=_effective_sandbox_mode(project.sandbox_mode, settings),
         setup_cmd=project.setup_cmd,
         cleanup_cmd=project.cleanup_cmd,
         interval_sec=request.interval_sec,
         max_cycles_per_tick=request.max_cycles_per_tick,
+        max_workers=request.max_workers,
         allow_dirty_workspace=request.allow_dirty_workspace,
     )
     return AutoWorkerResponse(**snapshot.__dict__)
@@ -2766,8 +3269,25 @@ async def ticket_logs(
     if token and not _websocket_token_valid(websocket, token):
         await websocket.close(code=1008)
         return
-    await websocket.accept()
     connection = connect(_sqlite_path(settings.database_url))
+    try:
+        identity = IdentityRepository(connection)
+        from orchestrator.authz import AuthorizationError, AuthenticationError, require_action, resolve_auth_context
+
+        try:
+            context = resolve_auth_context(
+                identity,
+                user_id=websocket.headers.get("x-haao-user-id"),
+                workspace_id=websocket.headers.get("x-haao-workspace-id") or project_id,
+            )
+            require_action(context, "read")
+        except (AuthenticationError, AuthorizationError):
+            await websocket.close(code=1008)
+            return
+    except Exception:
+        connection.close()
+        raise
+    await websocket.accept()
     repository = TicketRepository(connection, project_id=project_id)
     sent = 0
     try:
@@ -2939,6 +3459,130 @@ def _ticket_run_id(ticket: Ticket) -> str | None:
         if isinstance(run_id, str) and run_id:
             return run_id
     return None
+
+
+def _runner_token_from_request(request: Request) -> str:
+    header = request.headers.get("x-haao-runner-token", "")
+    if header:
+        return header
+    authorization = request.headers.get("authorization", "")
+    if authorization.startswith("Bearer "):
+        return authorization.removeprefix("Bearer ").strip()
+    return ""
+
+
+def _string_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _require_runner(request: Request, repository: RunnerRepository) -> RunnerTokenRecord:
+    token = _runner_token_from_request(request)
+    runner = repository.authenticate(token) if token else None
+    if runner is None:
+        raise HTTPException(status_code=401, detail="Invalid or missing runner token")
+    return runner
+
+
+def _ticket_depends_on(ticket: Ticket) -> list[str]:
+    dependencies: list[str] = []
+    for dependency in [*ticket.dependencies, *ticket.depends_on]:
+        if dependency not in dependencies:
+            dependencies.append(dependency)
+    return dependencies
+
+
+def _ticket_ready_state(
+    ticket: Ticket,
+    tickets_by_id: dict[str, Ticket],
+    active_leases: dict[str, Ticket],
+) -> str:
+    if ticket.status in {"done", "abandoned", "split"}:
+        return "terminal"
+    if ticket.status != "ready":
+        return "not_ready"
+    for dependency_id in _ticket_depends_on(ticket):
+        dependency = tickets_by_id.get(dependency_id)
+        if dependency is None or dependency.status != "done":
+            return "waiting_dependencies"
+        metadata = dependency.metadata.model_dump(mode="json") if dependency.metadata else {}
+        if metadata.get("git_branch") and not metadata.get("git_merge_commit"):
+            return "waiting_dependencies"
+    target_files = set(ticket.task.target_files)
+    for leased in active_leases.values():
+        if leased.id != ticket.id and target_files.intersection(leased.task.target_files):
+            return "conflict"
+    return "ready"
+
+
+def _ticket_lease_payload(ticket: Ticket) -> dict | None:
+    metadata = ticket.metadata.model_dump(mode="json") if ticket.metadata else {}
+    worker_id = metadata.get("lease_worker_id")
+    if not isinstance(worker_id, str) or not worker_id:
+        return None
+    return {
+        "worker_id": worker_id,
+        "expires_at": metadata.get("lease_expires_at"),
+        "heartbeat_at": metadata.get("lease_heartbeat_at"),
+        "ttl_sec": metadata.get("lease_ttl_sec"),
+    }
+
+
+def _effective_sandbox_mode(project_mode: str, settings: Settings) -> str:
+    override = (getattr(settings, "haao_sandbox_mode", "") or "").strip().lower()
+    if override in {"auto", "docker", "unshare", "none"}:
+        return override
+    return project_mode if project_mode in {"auto", "docker", "unshare", "none"} else "auto"
+
+
+def _split_child_ticket_payloads(
+    ticket: Ticket,
+    feedback: str,
+    repository: TicketRepository,
+) -> list[dict]:
+    parent = ticket.to_dict()
+    project_id = _ticket_project_id(ticket)
+    next_number = repository.next_ticket_number(project_id)
+    target_files = list(parent["task"]["target_files"])
+    context_files = parent.get("context", {}).get("files", [])
+    children: list[dict] = []
+    for index, target_file in enumerate(target_files or parent["task"]["target_files"], start=1):
+        payload = copy.deepcopy(parent)
+        payload["id"] = f"T-{next_number:03d}"
+        next_number += 1
+        payload["title"] = _child_split_title(ticket.title, index, len(target_files), target_file)
+        payload["status"] = TicketStatus.BACKLOG.value
+        payload["dependencies"] = []
+        payload["task"]["target_files"] = [target_file]
+        payload["task"]["description"] = (
+            f"{ticket.task.description}\n\nSplit from {ticket.id}. "
+            f"Product Owner split guidance: {feedback}"
+        ).strip()
+        payload["context"]["files"] = [
+            file
+            for file in context_files
+            if isinstance(file, dict) and file.get("path") == target_file
+        ] or copy.deepcopy(context_files)
+        payload["result"] = {"outcome": "pending"}
+        payload["audit"] = {"verdict": "pending", "feedback": "", "reviewed_by": ""}
+        metadata = payload.setdefault("metadata", {})
+        metadata["project_id"] = project_id
+        metadata["parent_ticket_id"] = ticket.id
+        metadata["split_from"] = ticket.id
+        metadata["split_feedback"] = feedback
+        metadata["split_child_index"] = index
+        metadata["needs_approval"] = True
+        metadata.pop("child_ticket_ids", None)
+        metadata.pop("abandoned", None)
+        metadata.pop("abandoned_at", None)
+        metadata.pop("abandon_reason", None)
+        children.append(payload)
+    return children
+
+
+def _child_split_title(title: str, index: int, total: int, target_file: str) -> str:
+    suffix = f" ({index}/{total}: {target_file})" if total > 1 else f" ({target_file})"
+    max_prefix = max(1, 120 - len(suffix))
+    return (title[:max_prefix].rstrip() + suffix)[:120]
 
 
 def _body_project_manual_ticket_service(

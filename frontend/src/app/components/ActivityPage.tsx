@@ -7,7 +7,10 @@ import {
   Filter,
   Loader2,
   Radio,
+  RotateCcw,
   ShieldAlert,
+  ShieldX,
+  GitMerge,
 } from 'lucide-react';
 import { apiClient } from '../api/client';
 import type { RunEvent } from '../api/types';
@@ -22,6 +25,9 @@ import {
 import { formatCloudCost } from '../constants';
 import { modelDisplayLabel } from '../modelDisplay';
 import { DiffViewer } from './DiffViewer';
+import { RunProvenanceChip, provenanceFromRunStarted } from './RunProvenanceChip';
+import { SandboxBadge } from './SandboxBadge';
+import { formatConflictEventMessage } from '../throughputUtils';
 import type { CloudModel, Ticket } from '../types';
 
 type AttentionFilter = 'all' | 'attention';
@@ -110,6 +116,16 @@ function RunEventItem({
         <div className={`rounded-lg border px-3 py-2 ${shellClass}`}>
           {header}
           <p className="text-xs text-muted-foreground mt-1">Ticket entered execution ({payloadString(payload, 'status') ?? 'started'}).</p>
+          {payloadString(payload, 'reasoner_prompt_version') && (
+            <div className="mt-1.5">
+              <RunProvenanceChip
+                modelId={event.model_id}
+                promptVersion={payloadString(payload, 'reasoner_prompt_version')}
+                cloudModels={cloudModels}
+                compact
+              />
+            </div>
+          )}
         </div>
       );
     case 'model_call':
@@ -157,6 +173,7 @@ function RunEventItem({
             {payloadString(payload, 'command') && (
               <span className="font-mono text-muted-foreground">{payloadString(payload, 'command')}</span>
             )}
+            <SandboxBadge payload={payload} compact />
           </div>
           {payloadString(payload, 'output_tail') && (
             <pre className="mt-2 text-[11px] font-mono bg-muted/50 rounded px-2 py-1.5 overflow-x-auto whitespace-pre-wrap text-foreground">
@@ -191,12 +208,11 @@ function RunEventItem({
         <div className="rounded-lg border border-orange-300 dark:border-orange-800 bg-orange-50/80 dark:bg-orange-950/30 px-3 py-2">
           <div className="flex items-center gap-1.5 text-[11px] text-orange-800 dark:text-orange-200 font-medium">
             <ShieldAlert size={12} />
-            <span>Egress attempt</span>
-            {payloadBoolean(payload, 'blocked') === false ? (
-              <span className="text-red-600 dark:text-red-400">allowed</span>
-            ) : (
-              <span>blocked</span>
-            )}
+            <span>
+              {payloadBoolean(payload, 'blocked') === false
+                ? 'Allowed a network attempt during tests'
+                : 'Blocked a network attempt during tests'}
+            </span>
           </div>
           {payloadString(payload, 'destination') && (
             <p className="text-xs font-mono mt-1 break-all text-orange-900 dark:text-orange-100">
@@ -208,6 +224,48 @@ function RunEventItem({
           )}
           {payloadString(payload, 'reason') && (
             <p className="text-[11px] text-orange-700 dark:text-orange-300 mt-1">{payloadString(payload, 'reason')}</p>
+          )}
+          <div className="mt-1.5">
+            <SandboxBadge payload={payload} compact />
+          </div>
+        </div>
+      );
+    case 'conflict':
+      return (
+        <div className="rounded-lg border border-violet-300 dark:border-violet-800 bg-violet-50/80 dark:bg-violet-950/30 px-3 py-2">
+          <div className="flex items-center gap-1.5 text-[11px] text-violet-800 dark:text-violet-200 font-medium">
+            <GitMerge size={12} />
+            <span>{formatConflictEventMessage(payload)}</span>
+          </div>
+          {payloadString(payload, 'detail') && (
+            <p className="text-[11px] text-violet-700 dark:text-violet-300 mt-1">{payloadString(payload, 'detail')}</p>
+          )}
+        </div>
+      );
+    case 'diff_scope_reject':
+      return (
+        <div className="rounded-lg border border-amber-300 dark:border-amber-800 bg-amber-50/80 dark:bg-amber-950/30 px-3 py-2">
+          <div className="flex items-center gap-1.5 text-[11px] text-amber-800 dark:text-amber-200 font-medium">
+            <ShieldX size={12} />
+            <span>Rejected an out-of-scope edit</span>
+          </div>
+          {payloadString(payload, 'path') && (
+            <p className="text-xs font-mono mt-1 break-all text-amber-900 dark:text-amber-100">{payloadString(payload, 'path')}</p>
+          )}
+          {payloadString(payload, 'detail') && (
+            <p className="text-[11px] text-amber-700 dark:text-amber-300 mt-1">{payloadString(payload, 'detail')}</p>
+          )}
+        </div>
+      );
+    case 'rollback':
+      return (
+        <div className="rounded-lg border border-sky-300 dark:border-sky-800 bg-sky-50/80 dark:bg-sky-950/30 px-3 py-2">
+          <div className="flex items-center gap-1.5 text-[11px] text-sky-800 dark:text-sky-200 font-medium">
+            <RotateCcw size={12} />
+            <span>Rolled back workspace changes after a safety check</span>
+          </div>
+          {payloadString(payload, 'detail') && (
+            <p className="text-[11px] text-sky-700 dark:text-sky-300 mt-1">{payloadString(payload, 'detail')}</p>
           )}
         </div>
       );
@@ -281,6 +339,12 @@ function RunCard({
 }) {
   const duration = formatRunDuration(run.startedAt, run.endedAt);
   const costLabel = formatCloudCost(run.totalCostUsd > 0 ? run.totalCostUsd : undefined);
+  const startedEvent = run.events.find((event) => event.event_type === 'run_started');
+  const provenance = provenanceFromRunStarted(startedEvent?.payload ?? undefined);
+  const sandboxEvent = [...run.events].reverse().find((event) => {
+    const payload = event.payload ?? {};
+    return payload.stage === 'sandbox' || typeof payload.sandbox_primitive === 'string';
+  });
 
   return (
     <div className={`rounded-xl border bg-card overflow-hidden ${run.hasAttention ? 'border-amber-300 dark:border-amber-800' : 'border-border'}`}>
@@ -323,6 +387,15 @@ function RunCard({
               )}
               {costLabel && <span className="tabular-nums">{costLabel}</span>}
               <CostStatusBadge status={run.costStatus} />
+              {(run.models[0] || provenance.promptVersion) && (
+                <RunProvenanceChip
+                  modelId={run.models[0]}
+                  promptVersion={provenance.promptVersion}
+                  cloudModels={cloudModels}
+                  compact
+                />
+              )}
+              {sandboxEvent && <SandboxBadge payload={sandboxEvent.payload ?? {}} compact />}
             </div>
           </div>
         </div>

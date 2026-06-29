@@ -1,0 +1,37 @@
+diff --git a/src/tablib/formats/_csv.py b/src/tablib/formats/_csv.py
+--- a/src/tablib/formats/_csv.py
++++ b/src/tablib/formats/_csv.py
+@@ -5,23 +5,32 @@ import csv
+ from io import StringIO
+ 
+ 
++def escape_formula(value):
++    if isinstance(value, str) and value.startswith(('=', '+', '-', '@')):
++        return "'" + value
++    return value
++
++
+ class CSVFormat:
+     title = 'csv'
+     extensions = ('csv',)
+ 
+     DEFAULT_DELIMITER = ','
+ 
+     @classmethod
+     def export_stream_set(cls, dataset, **kwargs):
+         """Returns CSV representation of Dataset as file-like."""
++        escape = kwargs.pop('escape', False)
+         stream = StringIO()
+ 
+         kwargs.setdefault('delimiter', cls.DEFAULT_DELIMITER)
+ 
+         _csv = csv.writer(stream, **kwargs)
+ 
+         for row in dataset._package(dicts=False):
+-            _csv.writerow(row)
++            if escape:
++                row = [escape_formula(value) for value in row]
++            _csv.writerow(row)
+ 
+         stream.seek(0)
+         return stream

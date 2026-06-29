@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from orchestrator.crash_recovery import CrashRecoveryService
-from orchestrator.db.sqlite import TicketRepository
+from orchestrator.db.sqlite import RunEventRepository, TicketRepository
 from orchestrator.escalation import EscalationResult, EscalationService
 from orchestrator.execution_loop import ExecutionLoop
 from orchestrator.execution_safety import GitWorkspaceGuard
@@ -36,6 +36,8 @@ class AutoOrchestrator:
         repo_root: str | Path,
         workspace_guard: GitWorkspaceGuard | None = None,
         allow_dirty_workspace: bool = False,
+        worker_id: str = "auto-worker-1",
+        lease_ttl_sec: int = 300,
     ) -> None:
         self.repository = repository
         self.execution_loop = execution_loop
@@ -44,7 +46,10 @@ class AutoOrchestrator:
         self.repo_root = Path(repo_root).resolve()
         self.workspace_guard = workspace_guard or GitWorkspaceGuard(self.repo_root)
         self.allow_dirty_workspace = allow_dirty_workspace
+        self.worker_id = worker_id
+        self.lease_ttl_sec = lease_ttl_sec
         self.crash_recovery = CrashRecoveryService(repository, self.workspace_guard)
+        self.run_events = RunEventRepository(repository.connection)
 
     def run_once(self) -> AutoRunResult:
         recovery = self.crash_recovery.recover_orphaned_execution()
@@ -64,21 +69,32 @@ class AutoOrchestrator:
             escalation = self.escalation_service.handle_blocked_ticket(blocked_ticket.id)
             return _result_for_escalation(escalation, recovery)
 
-        ready_tickets = self.repository.list(status=TicketStatus.READY)
-        execution_ticket = next(
-            (ticket for ticket in ready_tickets if self._dependencies_satisfied(ticket)),
-            None,
+        claim = self.repository.claim_next_ready_ticket(
+            worker_id=self.worker_id,
+            ttl_sec=self.lease_ttl_sec,
         )
+        execution_ticket = claim.ticket
         if execution_ticket is None:
-            execution_ticket = self._first_ticket(TicketStatus.IN_PROGRESS)
+            in_progress = self._first_ticket(TicketStatus.IN_PROGRESS)
+            if in_progress is not None:
+                execution_ticket = in_progress
+            else:
+                ready_tickets = self.repository.list(status=TicketStatus.READY)
+                waiting_ticket_ids = [ticket.id for ticket in ready_tickets]
+                if claim.skipped_reason == "target_file_conflict":
+                    self._record_conflicts(claim.conflict_ticket_ids or [])
+                return AutoRunResult(
+                    idle=not recovery.changed,
+                    skipped_reason=claim.skipped_reason or ("dependencies_pending" if waiting_ticket_ids else ""),
+                    recovered_ticket_ids=recovery.recovered_ticket_ids,
+                    cleaned_worktrees=recovery.removed_worktrees,
+                    waiting_ticket_ids=waiting_ticket_ids,
+                )
         if execution_ticket is None:
-            waiting_ticket_ids = [ticket.id for ticket in ready_tickets]
             return AutoRunResult(
                 idle=not recovery.changed,
-                skipped_reason="dependencies_pending" if waiting_ticket_ids else "",
                 recovered_ticket_ids=recovery.recovered_ticket_ids,
                 cleaned_worktrees=recovery.removed_worktrees,
-                waiting_ticket_ids=waiting_ticket_ids,
             )
 
         if not self.allow_dirty_workspace and self.workspace_guard.is_dirty():
@@ -89,7 +105,10 @@ class AutoOrchestrator:
                 cleaned_worktrees=recovery.removed_worktrees,
             )
 
-        execution = self.execution_loop.run_ticket(execution_ticket.id)
+        try:
+            execution = self.execution_loop.run_ticket(execution_ticket.id)
+        finally:
+            self.repository.release_lease(execution_ticket.id, worker_id=self.worker_id)
         executed_ids = [execution_ticket.id]
         final_tickets = [execution.ticket.to_dict()]
         reviewed_ids: list[str] = []
@@ -146,7 +165,7 @@ class AutoOrchestrator:
         return None
 
     def _dependencies_satisfied(self, ticket: Ticket) -> bool:
-        for dependency_id in ticket.dependencies:
+        for dependency_id in [*ticket.dependencies, *ticket.depends_on]:
             dependency = self.repository.get(dependency_id)
             if dependency is None or dependency.status != TicketStatus.DONE.value:
                 return False
@@ -157,6 +176,34 @@ class AutoOrchestrator:
             if metadata.get("git_branch") and not metadata.get("git_merge_commit"):
                 return False
         return True
+
+    def _record_conflicts(self, ticket_ids: list[str]) -> None:
+        for ticket_id in ticket_ids:
+            ticket = self.repository.get(ticket_id)
+            if ticket is None:
+                continue
+            metadata = ticket.metadata.model_dump(mode="json") if ticket.metadata else {}
+            active = self.repository.active_leases()
+            conflicting = [
+                active_ticket.id
+                for active_ticket in active
+                if active_ticket.id != ticket.id
+                and set(active_ticket.task.target_files).intersection(ticket.task.target_files)
+            ]
+            self.run_events.append_run_event(
+                project_id=metadata.get("project_id") if isinstance(metadata.get("project_id"), str) else "default",
+                requirement_id=metadata.get("requirement_id") if isinstance(metadata.get("requirement_id"), str) else None,
+                ticket_id=ticket.id,
+                run_id=None,
+                event_type="conflict",
+                model_id=ticket.execution.assigned_model,
+                payload={
+                    "reason": "target_file_overlap",
+                    "detail": "Ticket held because another leased ticket overlaps target_files",
+                    "target_files": ticket.task.target_files,
+                    "conflicting_ticket_ids": conflicting,
+                },
+            )
 
 
 def _result_for_escalation(escalation: EscalationResult, recovery) -> AutoRunResult:

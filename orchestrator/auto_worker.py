@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -31,24 +31,46 @@ class AutoWorkerSnapshot:
     last_error: str
     last_skipped_reason: str = ""
     project_id: str | None = None
+    max_workers: int = 1
+    worker_statuses: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class WorkerStatus:
+    worker_id: str
+    running: bool = False
+    last_run_at: str | None = None
+    last_error: str = ""
+    last_skipped_reason: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "worker_id": self.worker_id,
+            "running": self.running,
+            "last_run_at": self.last_run_at,
+            "last_error": self.last_error,
+            "last_skipped_reason": self.last_skipped_reason,
+        }
 
 
 class AutoWorker:
     def __init__(self) -> None:
-        self._task: asyncio.Task[None] | None = None
+        self._tasks: list[asyncio.Task[None]] = []
         self._stop_event: asyncio.Event | None = None
         self.interval_sec = 5.0
         self.max_cycles_per_tick = 10
+        self.max_workers = 1
         self.allow_dirty_workspace = False
         self.project_id: str | None = None
         self.last_started_at: str | None = None
         self.last_run_at: str | None = None
         self.last_error = ""
         self.last_skipped_reason = ""
+        self.worker_statuses: dict[str, WorkerStatus] = {}
 
     @property
     def running(self) -> bool:
-        return self._task is not None and not self._task.done()
+        return any(not task.done() for task in self._tasks)
 
     async def start(
         self,
@@ -65,6 +87,7 @@ class AutoWorker:
         cleanup_cmd: str = "",
         interval_sec: float = 5.0,
         max_cycles_per_tick: int = 10,
+        max_workers: int = 1,
         allow_dirty_workspace: bool = False,
     ) -> AutoWorkerSnapshot:
         if self.running:
@@ -77,34 +100,49 @@ class AutoWorker:
         self.project_id = project_id
         self.interval_sec = interval_sec
         self.max_cycles_per_tick = max_cycles_per_tick
+        self.max_workers = max(1, min(int(max_workers), 16))
         self.allow_dirty_workspace = allow_dirty_workspace
         self.last_started_at = _now()
         self.last_error = ""
         self._stop_event = asyncio.Event()
-        self._task = asyncio.create_task(
-            self._run(
-                settings=settings,
-                project_id=project_id,
-                repo_root=repo_root.resolve(),
-                database_root=database_root.resolve(),
-                env=dict(env or {}),
-                env_allowlist=list(env_allowlist or ["PATH", "PYTHONPATH"]),
-                test_allow_network=test_allow_network,
-                sandbox_mode=sandbox_mode,
-                setup_cmd=setup_cmd,
-                cleanup_cmd=cleanup_cmd,
+        self.worker_statuses = {
+            f"worker-{index}": WorkerStatus(worker_id=f"worker-{index}", running=True)
+            for index in range(1, self.max_workers + 1)
+        }
+        self._tasks = [
+            asyncio.create_task(
+                self._run(
+                    worker_id=worker_id,
+                    settings=settings,
+                    project_id=project_id,
+                    repo_root=repo_root.resolve(),
+                    database_root=database_root.resolve(),
+                    env=dict(env or {}),
+                    env_allowlist=list(env_allowlist or ["PATH", "PYTHONPATH"]),
+                    test_allow_network=test_allow_network,
+                    sandbox_mode=sandbox_mode,
+                    setup_cmd=setup_cmd,
+                    cleanup_cmd=cleanup_cmd,
+                )
             )
-        )
+            for worker_id in self.worker_statuses
+        ]
         return self.snapshot()
 
     async def stop(self) -> AutoWorkerSnapshot:
         if self._stop_event is not None:
             self._stop_event.set()
-        if self._task is not None:
+        if self._tasks:
             try:
-                await asyncio.wait_for(self._task, timeout=max(self.interval_sec + 1, 2))
+                await asyncio.wait_for(
+                    asyncio.gather(*self._tasks, return_exceptions=True),
+                    timeout=max(self.interval_sec + 1, 2),
+                )
             except TimeoutError:
-                self._task.cancel()
+                for task in self._tasks:
+                    task.cancel()
+        for status in self.worker_statuses.values():
+            status.running = False
         return self.snapshot()
 
     def snapshot(self) -> AutoWorkerSnapshot:
@@ -118,11 +156,14 @@ class AutoWorker:
             last_error=self.last_error,
             last_skipped_reason=self.last_skipped_reason,
             project_id=self.project_id,
+            max_workers=self.max_workers,
+            worker_statuses=[status.to_dict() for status in self.worker_statuses.values()],
         )
 
     async def _run(
         self,
         *,
+        worker_id: str,
         settings: Settings,
         project_id: str | None,
         repo_root: Path,
@@ -135,9 +176,10 @@ class AutoWorker:
         cleanup_cmd: str,
     ) -> None:
         assert self._stop_event is not None
+        status = self.worker_statuses[worker_id]
         while not self._stop_event.is_set():
             try:
-                self.last_skipped_reason = await asyncio.to_thread(
+                status.last_skipped_reason = await asyncio.to_thread(
                     _run_tick,
                     settings,
                     project_id,
@@ -151,16 +193,22 @@ class AutoWorker:
                     cleanup_cmd,
                     self.max_cycles_per_tick,
                     self.allow_dirty_workspace,
+                    worker_id,
                 ) or ""
-                self.last_run_at = _now()
+                status.last_run_at = _now()
+                status.last_error = ""
+                self.last_run_at = status.last_run_at
+                self.last_skipped_reason = status.last_skipped_reason
                 self.last_error = ""
             except Exception as exc:  # noqa: BLE001 - worker keeps running and reports status
-                self.last_error = str(exc)
+                status.last_error = str(exc)
+                self.last_error = status.last_error
 
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=self.interval_sec)
             except TimeoutError:
                 continue
+        status.running = False
 
 
 def _run_tick(
@@ -176,6 +224,7 @@ def _run_tick(
     cleanup_cmd: str,
     max_cycles_per_tick: int,
     allow_dirty_workspace: bool,
+    worker_id: str = "worker-1",
 ) -> str:
     connection = connect(_sqlite_path(settings.database_url, database_root))
     lmstudio = LMStudioClient(settings.lmstudio_base_url)
@@ -215,6 +264,7 @@ def _run_tick(
             repo_root=repo_root,
             workspace_guard=GitWorkspaceGuard(repo_root),
             allow_dirty_workspace=allow_dirty_workspace,
+            worker_id=worker_id,
         )
         results = orchestrator.run_until_idle(max_cycles=max_cycles_per_tick)
         last = results[-1] if results else None

@@ -11,7 +11,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { BarChart3, Cloud, Cpu, Loader2, TrendingUp } from 'lucide-react';
+import { BarChart3, Cloud, Cpu, Loader2, TrendingUp, GitPullRequest, DollarSign } from 'lucide-react';
 import { apiClient } from '../api/client';
 import type { InsightsPayload, InsightsRange } from '../api/types';
 import {
@@ -23,6 +23,7 @@ import {
   insightsHasData,
   scorecardNeedsCaveat,
 } from '../insightsUtils';
+import { formatHoursSaved } from '../trustUtils';
 import { DEFAULT_LOCAL_MODELS, formatCloudCost } from '../constants';
 import { modelDisplayLabel } from '../modelDisplay';
 import type { CloudModel } from '../types';
@@ -218,7 +219,7 @@ export function InsightsPage({ projectId, cloudModels, usingMockData }: Props) {
               modelLabel={(modelId) => modelDisplayLabel(modelId, cloudModels)}
             />
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
               <MetricCard
                 label="Throughput"
                 value={String(data.throughput.total_done)}
@@ -230,6 +231,12 @@ export function InsightsPage({ projectId, cloudModels, usingMockData }: Props) {
                 value={formatCycleTimeHours(data.cycle_time.median_hours)}
                 note={`n=${data.cycle_time.sample_size} accepted tickets`}
                 icon={BarChart3}
+              />
+              <MetricCard
+                label="Time to first PR"
+                value={formatCycleTimeHours(data.time_to_first_pr?.median_hours ?? 0)}
+                note={`n=${data.time_to_first_pr?.sample_size ?? 0} tickets with PRs`}
+                icon={GitPullRequest}
               />
               <MetricCard
                 label="Escalation rate"
@@ -244,6 +251,36 @@ export function InsightsPage({ projectId, cloudModels, usingMockData }: Props) {
                 icon={Cloud}
               />
             </div>
+
+            {data.roi && (
+              <div className="rounded-xl border border-border bg-card px-4 py-4">
+                <div className="flex items-center gap-1.5 mb-3">
+                  <DollarSign size={13} className="text-emerald-600 dark:text-emerald-400" />
+                  <h2 className="text-xs font-semibold text-foreground">ROI estimate</h2>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
+                  <div>
+                    <p className="text-[10px] uppercase text-muted-foreground">Hours saved</p>
+                    <p className="font-semibold tabular-nums">{formatHoursSaved(data.roi.estimated_hours_saved)}</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] uppercase text-muted-foreground">Cloud spend</p>
+                    <p className="font-semibold tabular-nums">{formatCloudCost(data.roi.cloud_cost_usd) ?? '$0.0000'}</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] uppercase text-muted-foreground">Net value</p>
+                    <p className="font-semibold tabular-nums">{formatCloudCost(data.roi.estimated_net_value_usd) ?? '$0.0000'}</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] uppercase text-muted-foreground">Interventions</p>
+                    <p className="font-semibold tabular-nums">
+                      {data.roi.intervention_count ?? data.escalation_rate.escalations}
+                    </p>
+                  </div>
+                </div>
+                <p className="text-[11px] text-muted-foreground mt-3">{data.roi.method}</p>
+              </div>
+            )}
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
               <div className="rounded-xl border border-border bg-card px-4 py-4">

@@ -28,9 +28,11 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import statistics
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from clients.claude_po import ClaudeTechLeadClient
@@ -43,7 +45,16 @@ from orchestrator.models.ticket import Ticket
 from orchestrator.runner.dod_runner import TestRunner
 from orchestrator.state_machine import TicketStateService
 
-DONE_STATES = {"review", "awaiting_acceptance", "done"}
+# Local execution is finished once tests pass and the diff reaches the human
+# review gate. Later states depend on human/cloud review and are not evidence of
+# local coder failure.
+LOCAL_FINISH_STATES = {"diff_pending", "review", "awaiting_acceptance", "done"}
+
+
+def _classify_trial(status: str, attempts: int) -> str:
+    if status not in LOCAL_FINISH_STATES:
+        return "blocked"
+    return "one_shot" if attempts == 0 else "retry_then_pass"
 
 
 def _clean_path(raw: str) -> Path:
@@ -202,13 +213,22 @@ def main() -> int:
     # One-shot success is a PROBABILITY (the local model runs at temperature>0), so a
     # single trial is a coin flip; repeating and averaging is the only honest measure.
     repeat = max(1, args.repeat)
-    loop = ExecutionLoop(repository, state_service, lmstudio, repo_root=target)
+    loop = ExecutionLoop(
+        repository,
+        state_service,
+        lmstudio,
+        repo_root=target,
+        max_output_tokens=settings.local_max_output_tokens,
+        patch_mode_threshold_tokens=settings.local_patch_mode_threshold_tokens,
+    )
     per_ticket: list[dict] = []
     trials: list[dict] = []
     for tmpl in templates:
         tid, title = tmpl["id"], tmpl.get("title", "")
         outcomes: list[str] = []
         for k in range(repeat):
+            print(f"[{tid}] trial {k + 1}/{repeat} starting", flush=True)
+            started_at = time.monotonic()
             _reset_target(target)
             try:
                 if args.whole_file:
@@ -228,16 +248,21 @@ def main() -> int:
                     loop.run_ticket(tid)
                     t = repository.get(tid)
                     attempts = t.execution.attempts
-                    finished = t.status in DONE_STATES
-                    res = ("one_shot" if (finished and attempts == 0)
-                           else "retry_then_pass" if finished else "blocked")
+                    res = _classify_trial(str(t.status), attempts)
                     detail = (t.result.test_output if t.result else "") or ""
                     empty = not ((t.result.diff if t.result else "") or "").strip()
             except Exception as exc:  # noqa: BLE001 - record any failure, keep measuring
                 res, attempts, detail, empty = "error", None, str(exc), False
+            duration_sec = round(time.monotonic() - started_at, 2)
             outcomes.append(res)
             trials.append({"id": tid, "trial": k + 1, "result": res,
-                           "attempts": attempts, "detail": detail, "empty_diff": empty})
+                           "attempts": attempts, "detail": detail, "empty_diff": empty,
+                           "duration_sec": duration_sec})
+            print(
+                f"[{tid}] trial {k + 1}/{repeat} {res} "
+                f"attempts={attempts} duration={duration_sec:.2f}s",
+                flush=True,
+            )
         per_ticket.append({
             "id": tid, "title": title, "trials": repeat,
             "one_shot": outcomes.count("one_shot"),
@@ -256,6 +281,11 @@ def main() -> int:
     fin = sum(p["finished"] for p in per_ticket)
     blk = sum(p["blocked"] for p in per_ticket)
     err = sum(p["error"] for p in per_ticket)
+    median_duration_sec = (
+        round(statistics.median(t["duration_sec"] for t in trials), 2)
+        if trials
+        else 0.0
+    )
 
     print("-" * 60)
     for p in per_ticket:
@@ -268,6 +298,7 @@ def main() -> int:
         print(f"one-shot rate    = {one}/{total} = {one / total:.0%}   <-- main metric ({repeat}x/ticket)")
         print(f"local finish     = {fin}/{total} = {fin / total:.0%}")
         print(f"escalation rate  = {blk}/{total} = {blk / total:.0%}")
+        print(f"median duration  = {median_duration_sec:.2f}s per trial")
         if err:
             print(f"harness errors   = {err}/{total}")
     else:
@@ -287,7 +318,8 @@ def main() -> int:
     if args.out:
         Path(args.out).write_text(
             json.dumps({"summary": {"trials": total, "one_shot": one, "local_finish": fin,
-                                    "escalated": blk, "errors": err, "repeat": repeat},
+                                    "escalated": blk, "errors": err, "repeat": repeat,
+                                    "median_duration_sec": median_duration_sec},
                         "per_ticket": per_ticket, "trials": trials, "skipped": skipped_rows},
                        ensure_ascii=False, indent=2),
             encoding="utf-8",

@@ -1,0 +1,247 @@
+{
+  "version": 8,
+  "description": "R-102 combined source-only benchmark: every verified probe/reference-patch task not marked NEEDS_REDESIGN, with edit mode selected automatically by the R-112 size threshold, 2 trials each",
+  "repos": {
+    "click": {
+      "github": "https://github.com/pallets/click.git",
+      "ref": "8.1.8",
+      "local_path": "~/Claude/Projects/HAAO-benchmark-repos/click",
+      "default_scope": ["src/click"]
+    },
+    "tablib": {
+      "github": "https://github.com/jazzband/tablib.git",
+      "ref": "v3.8.0",
+      "local_path": "~/Claude/Projects/HAAO-benchmark-repos/tablib",
+      "default_scope": ["src/tablib"]
+    },
+    "marshmallow": {
+      "github": "https://github.com/marshmallow-code/marshmallow.git",
+      "ref": "3.26.2",
+      "local_path": "~/Claude/Projects/HAAO-benchmark-repos/marshmallow",
+      "default_scope": ["src/marshmallow"]
+    }
+  },
+  "tasks": [
+    {
+      "id": "C-01",
+      "repo": "click",
+      "category": "bugfix",
+      "requirement": "In one self-contained ticket, make IntRange and FloatRange reject inverted bounds where min is greater than max with ValueError whose message says minimum cannot be greater than maximum. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/click/types.py.",
+      "dod": "pytest -q tests/haao_r102_C01_probe.py",
+      "existing_tests": "pytest -q tests/test_types.py",
+      "target_files": ["src/click/types.py"],
+      "patch_mode_eligible": true
+    },
+    {
+      "id": "C-03",
+      "repo": "click",
+      "category": "bugfix",
+      "requirement": "In one self-contained ticket, make Click's Path parameter type expand a leading tilde and normalize relative path segments before path validation and conversion. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/click/types.py.",
+      "dod": "pytest -q tests/haao_r102_C03_probe.py",
+      "existing_tests": "pytest -q tests/test_types.py",
+      "target_files": ["src/click/types.py"],
+      "patch_mode_eligible": true
+    },
+    {
+      "id": "C-12",
+      "repo": "click",
+      "category": "cross_module",
+      "requirement": "In one self-contained ticket, fix Click's text wrapper so an ANSI-styled unbroken token is wrapped by visible width without splitting escape sequences or producing visible blank lines. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/click/_textwrap.py.",
+      "dod": "pytest -q tests/haao_r102_C12_probe.py",
+      "existing_tests": "pytest -q tests/test_formatting.py",
+      "target_files": ["src/click/_textwrap.py"]
+    },
+    {
+      "id": "T-01",
+      "repo": "tablib",
+      "category": "bugfix",
+      "requirement": "In one self-contained ticket, add opt-in CSV formula escaping via export(..., escape=True): prefix string cell values starting with =, +, -, or @ with an apostrophe while preserving ordinary values; default CSV export without escape=True must preserve all original cell values. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/tablib/formats/_csv.py.",
+      "dod": "pytest -q tests/haao_r102_T01_probe.py",
+      "existing_tests": "pytest -q tests/test_tablib.py",
+      "target_files": ["src/tablib/formats/_csv.py"]
+    },
+    {
+      "id": "T-03",
+      "repo": "tablib",
+      "category": "bugfix",
+      "requirement": "In one self-contained ticket, make empty Dataset filter and sort operations return empty Dataset objects without raising, including sorting by a missing string column when the dataset has no headers. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/tablib/core.py.",
+      "dod": "pytest -q tests/haao_r102_T03_probe.py",
+      "existing_tests": "pytest -q tests/test_tablib.py",
+      "target_files": ["src/tablib/core.py"],
+      "patch_mode_eligible": true
+    },
+    {
+      "id": "T-07",
+      "repo": "tablib",
+      "category": "cross_module",
+      "requirement": "In one self-contained ticket, normalize Dataset headers by trimming surrounding whitespace consistently during CSV import and later header mutation. Only modify the following implementation files; do not add or modify any test files—validation is handled externally: src/tablib/core.py and src/tablib/formats/_csv.py.",
+      "dod": "pytest -q tests/haao_r102_T07_probe.py",
+      "existing_tests": "pytest -q tests/test_tablib.py",
+      "target_files": ["src/tablib/core.py", "src/tablib/formats/_csv.py"],
+      "patch_mode_eligible": true
+    },
+    {
+      "id": "T-13",
+      "repo": "tablib",
+      "category": "cross_module",
+      "requirement": "In one self-contained ticket, make XLS export sanitize worksheet titles for both Dataset and Databook exports: replace \\, /, *, ?, :, [, and ] with hyphens and truncate the result to 31 characters. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/tablib/formats/_xls.py.",
+      "dod": "pytest -q tests/haao_r102_T13_probe.py",
+      "existing_tests": "pytest -q tests/test_tablib.py",
+      "target_files": ["src/tablib/formats/_xls.py"],
+      "patch_mode_eligible": true
+    },
+    {
+      "id": "T-14",
+      "repo": "tablib",
+      "category": "bugfix",
+      "requirement": "In one self-contained ticket, fix Jira table export so numeric zero and False are serialized as 0 and False, while only empty strings and None use a blank Jira cell. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/tablib/formats/_jira.py.",
+      "dod": "pytest -q tests/haao_r102_T14_probe.py",
+      "existing_tests": "pytest -q tests/test_tablib.py",
+      "target_files": ["src/tablib/formats/_jira.py"]
+    },
+    {
+      "id": "T-15",
+      "repo": "tablib",
+      "category": "bugfix",
+      "requirement": "In one self-contained ticket, fix LaTeX table export so numeric zero and False are preserved as 0 and False, while None remains an empty cell. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/tablib/formats/_latex.py.",
+      "dod": "pytest -q tests/haao_r102_T15_probe.py",
+      "existing_tests": "pytest -q tests/test_tablib.py",
+      "target_files": ["src/tablib/formats/_latex.py"],
+      "patch_mode_eligible": true
+    },
+    {
+      "id": "T-16",
+      "repo": "tablib",
+      "category": "bugfix",
+      "requirement": "In one self-contained ticket, escape Databook sheet titles in HTML export so title text containing <, >, or & cannot become HTML markup, while the generated heading and table structure remain unchanged. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/tablib/formats/_html.py.",
+      "dod": "pytest -q tests/haao_r102_T16_probe.py",
+      "existing_tests": "pytest -q tests/test_tablib.py",
+      "target_files": ["src/tablib/formats/_html.py"]
+    },
+    {
+      "id": "T-17",
+      "repo": "tablib",
+      "category": "cross_module",
+      "requirement": "In one self-contained ticket, make HTML import treat a leading row of th cells as Dataset headers even when the source omits a thead element; the header row must not also appear as data, and existing thead imports must keep working. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/tablib/formats/_html.py.",
+      "dod": "pytest -q tests/haao_r102_T17_probe.py",
+      "existing_tests": "pytest -q tests/test_tablib.py",
+      "target_files": ["src/tablib/formats/_html.py"]
+    },
+    {
+      "id": "T-18",
+      "repo": "tablib",
+      "category": "bugfix",
+      "requirement": "In one self-contained ticket, make JSON export reject unsupported cell objects with the standard TypeError message naming the unsupported type instead of surfacing a misleading circular-reference ValueError; existing Decimal, UUID, date, and datetime serialization must remain unchanged. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/tablib/formats/_json.py.",
+      "dod": "pytest -q tests/haao_r102_T18_probe.py",
+      "existing_tests": "pytest -q tests/test_tablib.py",
+      "target_files": ["src/tablib/formats/_json.py"]
+    },
+    {
+      "id": "T-19",
+      "repo": "tablib",
+      "category": "bugfix",
+      "requirement": "In one self-contained ticket, make YAML format detection return False for documents containing unsupported or unsafe YAML tags instead of leaking a PyYAML constructor exception; valid list, tuple, and mapping documents must retain their current detection behavior. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/tablib/formats/_yaml.py.",
+      "dod": "pytest -q tests/haao_r102_T19_probe.py",
+      "existing_tests": "pytest -q tests/test_tablib.py",
+      "target_files": ["src/tablib/formats/_yaml.py"]
+    },
+    {
+      "id": "T-20",
+      "repo": "tablib",
+      "category": "bugfix",
+      "requirement": "In one self-contained ticket, make JSON format detection accept top-level list documents used by Tablib datasets and databooks but reject scalar JSON documents such as numbers, strings, booleans, and null. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/tablib/formats/_json.py.",
+      "dod": "pytest -q tests/haao_r102_T20_probe.py",
+      "existing_tests": "pytest -q tests/test_tablib.py",
+      "target_files": ["src/tablib/formats/_json.py"]
+    },
+    {
+      "id": "M-01",
+      "repo": "marshmallow",
+      "category": "reasoning",
+      "requirement": "In one self-contained ticket, make validate.Range reject inverted bounds where min is greater than max with ValueError whose message says minimum cannot be greater than maximum. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/marshmallow/validate.py.",
+      "dod": "pytest -q tests/haao_r102_M01_probe.py",
+      "existing_tests": "pytest -q tests/test_validate.py",
+      "target_files": ["src/marshmallow/validate.py"],
+      "patch_mode_eligible": true
+    },
+    {
+      "id": "M-02",
+      "repo": "marshmallow",
+      "category": "bugfix",
+      "requirement": "In one self-contained ticket, make validate.OneOf accept valid members when choices is a one-shot iterator or generator instead of rejecting every value after the display text is built. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/marshmallow/validate.py.",
+      "dod": "pytest -q tests/haao_r102_M02_probe.py",
+      "existing_tests": "pytest -q tests/test_validate.py",
+      "target_files": ["src/marshmallow/validate.py"],
+      "patch_mode_eligible": true
+    },
+    {
+      "id": "M-03",
+      "repo": "marshmallow",
+      "category": "cross_module",
+      "requirement": "In one self-contained ticket, make utils.from_timestamp_ms reject boolean inputs with the same Not a valid POSIX timestamp ValueError that utils.from_timestamp already uses. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/marshmallow/utils.py.",
+      "dod": "pytest -q tests/haao_r102_M03_probe.py",
+      "existing_tests": "pytest -q tests/test_utils.py",
+      "target_files": ["src/marshmallow/utils.py"],
+      "patch_mode_eligible": true
+    },
+    {
+      "id": "M-04",
+      "repo": "marshmallow",
+      "category": "bugfix",
+      "requirement": "In one self-contained ticket, make fields.Float serialize as_string values using the shortest decimal representation so binary-float artifacts such as 0.30000000000000004 become 0.3. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/marshmallow/fields.py.",
+      "dod": "pytest -q tests/haao_r102_M04_probe.py",
+      "existing_tests": "pytest -q tests/test_serialization.py",
+      "target_files": ["src/marshmallow/fields.py"],
+      "patch_mode_eligible": true
+    },
+    {
+      "id": "M-05",
+      "repo": "marshmallow",
+      "category": "cross_module",
+      "requirement": "In one self-contained ticket, make Schema.load partial field lists honor data_key names as well as attribute names when deciding which required fields may be omitted. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/marshmallow/schema.py.",
+      "dod": "pytest -q tests/haao_r102_M05_probe.py",
+      "existing_tests": "pytest -q tests/test_schema.py",
+      "target_files": ["src/marshmallow/schema.py"],
+      "patch_mode_eligible": true
+    },
+    {
+      "id": "M-06",
+      "repo": "marshmallow",
+      "category": "bugfix",
+      "requirement": "In one self-contained ticket, make ValidationError decode bytes messages to UTF-8 strings so error messages remain JSON-serializable. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/marshmallow/exceptions.py.",
+      "dod": "pytest -q tests/haao_r102_M06_probe.py",
+      "existing_tests": "pytest -q tests/test_exceptions.py",
+      "target_files": ["src/marshmallow/exceptions.py"]
+    },
+    {
+      "id": "M-07",
+      "repo": "marshmallow",
+      "category": "reasoning",
+      "requirement": "In one self-contained ticket, make validate.Length reject inverted bounds where min is greater than max with ValueError whose message says minimum cannot be greater than maximum. Only modify the following implementation file; do not add or modify any test files—validation is handled externally: src/marshmallow/validate.py.",
+      "dod": "pytest -q tests/haao_r102_M07_probe.py",
+      "existing_tests": "pytest -q tests/test_validate.py",
+      "target_files": ["src/marshmallow/validate.py"],
+      "patch_mode_eligible": true
+    }
+  ],
+  "excluded_tasks": [
+    {"id": "C-02", "status": "DISCARDED_BASELINE_GREEN", "reason": "The correct case-insensitive Choice result is the declared canonical value Fast; pinned Click 8.1.8 already returns Fast."},
+    {"id": "C-04", "status": "DISCARDED", "reason": "The prior probe conflated independently routed stdout and stderr; pinned Click already honors nl=False."},
+    {"id": "C-05", "status": "DISCARDED", "reason": "Pinned Click already accepts empty input for confirm(default=True, abort=False); the old probe tested prompt spelling instead."},
+    {"id": "C-06", "status": "DISCARDED", "reason": "Using both aliases of one boolean option is valid and resolves to one destination; rejecting it is not natural Click behavior."},
+    {"id": "C-07", "status": "DISCARDED", "reason": "The old term_len import probe did not test the requested cross-module behavior and its target files exceed the size contract."},
+    {"id": "C-08", "status": "DISCARDED", "reason": "CompletionItem.type is shell metadata (plain, file, dir), not a ParamType label; the proposed string normalization contract was invalid."},
+    {"id": "C-09", "status": "DISCARDED", "reason": "The old probe exercised only one ordinary parser error and did not establish parser/invocation parity."},
+    {"id": "C-10", "status": "DISCARDED", "reason": "Deep-copying a caller-owned ctx.obj across invocations would violate Click context ownership semantics."},
+    {"id": "C-11", "status": "DISCARDED", "reason": "Click has no mutually-exclusive option-group declaration in the proposed task, and nargs=-1 naturally returns a tuple."},
+    {"id": "T-02", "status": "NEEDS_REDESIGN", "reason": "The corrected quoted-comma TSV probe passes on pinned Tablib v3.8.0, so there is no red baseline or capability datapoint."},
+    {"id": "T-04", "status": "DISCARDED", "reason": "The old duplicate-header probe did not establish a valid dimension transition and targeted large core.py."},
+    {"id": "T-05", "status": "NEEDS_REDESIGN", "reason": "The semantically corrected full-datetime ISO probe passes on pinned Tablib v3.8.0, so there is no bug to repair."},
+    {"id": "T-06", "status": "DISCARDED", "reason": "Returning Dataset from slicing contradicts pinned Tablib's public list-returning behavior and targets large core.py."},
+    {"id": "T-08", "status": "DISCARDED_BASELINE_GREEN", "reason": "Dataset.load and detect_format already share the active registry and the probe passes upstream."},
+    {"id": "T-09", "status": "DISCARDED", "reason": "The old probe checked a nonexistent titles() convenience API rather than observable export ordering."},
+    {"id": "T-10", "status": "DISCARDED", "reason": "The old probe checked a private lock attribute instead of discriminating concurrent behavior and targeted large core.py."},
+    {"id": "T-11", "status": "DISCARDED", "reason": "The old probe checked an arbitrary chunk-size constant rather than bounded-memory behavior; csv.reader already streams input."},
+    {"id": "T-12", "status": "DISCARDED_EXISTING_TEST_CONFLICT", "reason": "Preserving YAML header order is natural and baseline-red, but it intentionally invalidates pinned test_yaml_export, so it fails the existing-suite-green contract."}
+  ]
+}

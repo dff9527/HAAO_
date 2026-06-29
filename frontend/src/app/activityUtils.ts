@@ -23,7 +23,14 @@ function payloadString(payload: Record<string, unknown> | null | undefined, key:
 }
 
 export function eventNeedsAttention(event: RunEvent): boolean {
-  if (event.event_type === 'error' || event.event_type === 'egress_attempt' || event.event_type === 'escalation') {
+  if (
+    event.event_type === 'error'
+    || event.event_type === 'egress_attempt'
+    || event.event_type === 'diff_scope_reject'
+    || event.event_type === 'rollback'
+    || event.event_type === 'conflict'
+    || event.event_type === 'escalation'
+  ) {
     return true;
   }
   if (event.event_type === 'report') {
@@ -123,7 +130,7 @@ export const MOCK_RUN_EVENTS: RunEvent[] = [
     event_type: 'run_started',
     ts: new Date(Date.now() - 120_000).toISOString(),
     model_id: 'qwen3-coder-next',
-    payload: { status: 'in_progress' },
+    payload: { status: 'in_progress', reasoner_prompt_version: 'decomposer@v2.3.1' },
   },
   {
     id: 2,
@@ -161,13 +168,72 @@ export const MOCK_RUN_EVENTS: RunEvent[] = [
     requirement_id: 'R-001',
     ticket_id: 'T-001',
     run_id: 'RUN-demo-1',
-    event_type: 'dod_check',
-    ts: new Date(Date.now() - 90_000).toISOString(),
-    model_id: 'qwen3-coder-next',
-    payload: { command: 'pytest calc_test.py', status: 'pass', expected: 'pass', output_tail: '1 passed' },
+    event_type: 'egress_attempt',
+    ts: new Date(Date.now() - 96_000).toISOString(),
+    payload: {
+      stage: 'sandbox',
+      kind: 'egress_attempt',
+      blocked: true,
+      reason: 'network_blocked_by_sandbox',
+      primitive: 'docker',
+      command: 'pytest calc_test.py',
+      detail: 'Network blocked during sandboxed DoD run',
+    },
   },
   {
     id: 5,
+    project_id: 'default',
+    ticket_id: 'T-015',
+    run_id: 'RUN-demo-3',
+    event_type: 'conflict',
+    ts: new Date(Date.now() - 94_000).toISOString(),
+    payload: {
+      detail: 'Ticket held because another leased ticket overlaps target_files',
+      conflicting_ticket_ids: ['T-012'],
+      kind: 'file_overlap',
+    },
+  },
+  {
+    id: 6,
+    project_id: 'default',
+    requirement_id: 'R-001',
+    ticket_id: 'T-001',
+    run_id: 'RUN-demo-1',
+    event_type: 'egress_attempt',
+    ts: new Date(Date.now() - 95_000).toISOString(),
+    payload: {
+      blocked: true,
+      destination: 'https://pypi.org/simple/requests/',
+      command: 'pip install requests',
+      detail: 'Network blocked during DoD test run',
+    },
+  },
+  {
+    id: 7,
+    project_id: 'default',
+    requirement_id: 'R-001',
+    ticket_id: 'T-001',
+    run_id: 'RUN-demo-1',
+    event_type: 'diff_scope_reject',
+    ts: new Date(Date.now() - 92_000).toISOString(),
+    payload: {
+      path: 'README.md',
+      detail: 'Edit outside ticket target_files',
+    },
+  },
+  {
+    id: 8,
+    project_id: 'default',
+    requirement_id: 'R-001',
+    ticket_id: 'T-001',
+    run_id: 'RUN-demo-1',
+    event_type: 'dod_check',
+    ts: new Date(Date.now() - 90_000).toISOString(),
+    model_id: 'qwen3-coder-next',
+    payload: { command: 'pytest calc_test.py', status: 'pass', expected: 'pass', output_tail: '1 passed', sandbox_primitive: 'docker' },
+  },
+  {
+    id: 9,
     project_id: 'default',
     requirement_id: 'R-001',
     ticket_id: 'T-001',
@@ -177,7 +243,7 @@ export const MOCK_RUN_EVENTS: RunEvent[] = [
     payload: { report_kind: 'needs_you', reason: 'diff_review_required', status: 'diff_pending' },
   },
   {
-    id: 6,
+    id: 10,
     project_id: 'default',
     requirement_id: 'R-001',
     ticket_id: 'T-001',
@@ -186,5 +252,49 @@ export const MOCK_RUN_EVENTS: RunEvent[] = [
     ts: new Date(Date.now() - 75_000).toISOString(),
     model_id: 'qwen3-coder-next',
     payload: { passed: true, escalated: false },
+  },
+  {
+    id: 11,
+    project_id: 'default',
+    ticket_id: 'T-013',
+    run_id: 'RUN-demo-2',
+    event_type: 'run_started',
+    ts: new Date(Date.now() - 40_000).toISOString(),
+    model_id: 'gemma-4-26b-a4b',
+    payload: { status: 'in_progress', reasoner_prompt_version: 'coder@v1.8.0' },
+  },
+  {
+    id: 12,
+    project_id: 'default',
+    ticket_id: 'T-013',
+    run_id: 'RUN-demo-2',
+    event_type: 'egress_attempt',
+    ts: new Date(Date.now() - 36_000).toISOString(),
+    payload: {
+      stage: 'sandbox',
+      reason: 'sandbox_unavailable',
+      primitive: 'local',
+      command: 'pytest tests/test_rate_limit.py',
+      detail: 'Network isolation unavailable; running DoD/test command without a sandbox.',
+    },
+  },
+  {
+    id: 13,
+    project_id: 'default',
+    ticket_id: 'T-013',
+    run_id: 'RUN-demo-2',
+    event_type: 'rollback',
+    ts: new Date(Date.now() - 35_000).toISOString(),
+    payload: { detail: 'Restored worktree after diff scope rejection' },
+  },
+  {
+    id: 14,
+    project_id: 'default',
+    ticket_id: 'T-013',
+    run_id: 'RUN-demo-2',
+    event_type: 'run_finished',
+    ts: new Date(Date.now() - 30_000).toISOString(),
+    model_id: 'gemma-4-26b-a4b',
+    payload: { passed: false, escalated: false },
   },
 ];

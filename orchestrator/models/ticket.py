@@ -10,6 +10,8 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import BaseModel, ConfigDict, Field
 
+from orchestrator.execution_safety import derive_diff_stats
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = PROJECT_ROOT / "atomic_ticket.schema.json"
@@ -29,6 +31,8 @@ class TicketStatus(StrEnum):
     AWAITING_ACCEPTANCE = "awaiting_acceptance"
     DONE = "done"
     BLOCKED = "blocked"
+    ABANDONED = "abandoned"
+    SPLIT = "split"
 
 
 class StrictModel(BaseModel):
@@ -85,6 +89,7 @@ class ResultLog(StrictModel):
 class Result(StrictModel):
     outcome: Literal["success", "test_failed", "error", "pending"] = "pending"
     diff: str | None = None
+    diff_stats: dict[str, Any] | None = None
     test_output: str | None = None
     logs: list[ResultLog] = Field(default_factory=list)
 
@@ -111,6 +116,7 @@ class Ticket(StrictModel):
     priority: Literal["low", "medium", "high"] = "medium"
     created_by: str = "claude"
     dependencies: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)
     task: Task
     context: Context
     definition_of_done: DefinitionOfDone
@@ -121,6 +127,7 @@ class Ticket(StrictModel):
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Ticket:
+        data = _normalize_ticket_data(data)
         validate_ticket_schema(data)
         model = cls.model_validate(data)
         as_dict = model.to_dict()
@@ -141,6 +148,39 @@ def validate_ticket_schema(data: dict[str, Any]) -> None:
     errors = sorted(validator.iter_errors(data), key=lambda error: list(error.path))
     if errors:
         raise SchemaValidationError(_format_schema_error(errors[0])) from errors[0]
+
+
+def _normalize_ticket_data(data: dict[str, Any]) -> dict[str, Any]:
+    normalized = json.loads(json.dumps(data))
+    metadata = normalized.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("abandoned") is True:
+        if normalized.get("status") != TicketStatus.ABANDONED.value:
+            metadata.setdefault("legacy_status_before_abandon_migration", normalized.get("status"))
+            normalized["status"] = TicketStatus.ABANDONED.value
+    result = normalized.get("result")
+    dependencies = normalized.get("dependencies")
+    depends_on = normalized.get("depends_on")
+    if isinstance(depends_on, list) and not isinstance(dependencies, list):
+        normalized["dependencies"] = depends_on
+    elif isinstance(dependencies, list) and not isinstance(depends_on, list):
+        normalized["depends_on"] = dependencies
+    elif isinstance(dependencies, list) and isinstance(depends_on, list):
+        merged = []
+        for dependency in [*dependencies, *depends_on]:
+            if dependency not in merged:
+                merged.append(dependency)
+        normalized["dependencies"] = merged
+        normalized["depends_on"] = merged
+    task = normalized.get("task")
+    if isinstance(result, dict) and isinstance(task, dict):
+        diff = result.get("diff")
+        target_files = task.get("target_files")
+        if isinstance(diff, str) and isinstance(target_files, list):
+            result["diff_stats"] = derive_diff_stats(
+                diff,
+                [str(path) for path in target_files],
+            )
+    return normalized
 
 
 def _format_schema_error(error: JsonSchemaValidationError) -> str:

@@ -1,0 +1,18 @@
+diff --git a/src/marshmallow/validate.py b/src/marshmallow/validate.py
+index d56912a3..250e3340 100644
+--- a/src/marshmallow/validate.py
++++ b/src/marshmallow/validate.py
+@@ -603,7 +603,12 @@ class OneOf(Validator):
+         *,
+         error: str | None = None,
+     ):
+-        self.choices = choices
++        if isinstance(choices, (str, bytes)):
++            self.choices = choices
++        elif isinstance(choices, (list, tuple, set, frozenset)):
++            self.choices = choices
++        else:
++            self.choices = tuple(choices)
+         self.choices_text = ", ".join(str(choice) for choice in self.choices)
+         self.labels = labels if labels is not None else []
+         self.labels_text = ", ".join(str(label) for label in self.labels)

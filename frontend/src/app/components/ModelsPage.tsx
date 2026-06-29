@@ -7,12 +7,28 @@ import { DEFAULT_LOCAL_MODELS, formatCloudCost, getModelMeta, isCloudModel } fro
 import { cloudModelDisplayLabel, modelDisplayLabel } from '../modelDisplay';
 import type { ModelConfig, RoleRoute, AssignedModel, CloudModel, RequirementSource } from '../types';
 import type { BackendLocalModelEndpoint } from '../api/types';
+import type { IdentityContext } from '../api/types';
 import type { CloudReasonerConfig, IntegrationCredential, IntegrationProvider } from '../api/client';
 import { apiClient } from '../api/client';
 import { ModelStatusLegend } from './ModelStatusLegend';
 import { EvalRunPanel } from './EvalRunPanel';
 import { HelpTip } from './HelpTip';
 import { HELP_TOOLTIPS } from '../dxUtils';
+import { ACTION_DISCLOSURES } from '../trustUtils';
+import { ActionDisclosure } from './ActionDisclosure';
+import { MembersPanel } from './MembersPanel';
+import { AuditLogPanel } from './AuditLogPanel';
+import { RunnersPanel } from './RunnersPanel';
+import { GitCredentialConnect } from './GitCredentialConnect';
+import {
+  hasTeamPermission,
+  isReadOnlyTeamRole,
+  mockIntegrationsWithApp,
+  mockTeamPlaneEnabled,
+  roleLabel,
+  isForbiddenError,
+  forbiddenMessage,
+} from '../teamPlaneUtils';
 
 type TestStatus = 'idle' | 'running' | 'ok' | 'fail';
 
@@ -45,6 +61,8 @@ interface Props {
   allowCloudExecutionModel: boolean;
   onUpdateAllowCloudExecutionModel: (enabled: boolean) => Promise<void>;
   usingMockData?: boolean;
+  identityContext?: IdentityContext | null;
+  onForbidden?: (message: string) => void;
 }
 
 function SectionHeader({ num, title, subtitle }: { num: string; title: string; subtitle?: string }) {
@@ -208,6 +226,8 @@ export function ModelsPage({
   allowCloudExecutionModel,
   onUpdateAllowCloudExecutionModel,
   usingMockData = false,
+  identityContext = null,
+  onForbidden,
 }: Props) {
   const [expandedModels, setExpandedModels] = useState<Set<AssignedModel>>(new Set());
   const [cloudExecutionPending, setCloudExecutionPending] = useState(false);
@@ -263,12 +283,25 @@ export function ModelsPage({
     () => Array.from(new Set([...devFallbackChain, ...localModelOptions, ...cloudModels.map((model) => model.id)])),
     [cloudModels, devFallbackChain, localModelOptions],
   );
+  const teamActive = identityContext?.identity_configured === true;
+  const canAdminSettings = hasTeamPermission(identityContext, 'admin');
+  const viewerLocked = teamActive && isReadOnlyTeamRole(identityContext);
+  const adminLocked = teamActive && !canAdminSettings;
+
+  function settingsDisabled(adminOnly = false): boolean {
+    if (!teamActive) return false;
+    if (viewerLocked) return true;
+    if (adminOnly) return adminLocked;
+    return false;
+  }
 
   useEffect(() => {
     let active = true;
     setIntegrationsLoading(true);
-    apiClient
-      .listIntegrations()
+    const load = mockTeamPlaneEnabled()
+      ? Promise.resolve(mockIntegrationsWithApp())
+      : apiClient.listIntegrations();
+    load
       .then((items) => {
         if (active) setIntegrations(items);
       })
@@ -342,8 +375,12 @@ export function ModelsPage({
       setRegistryApiKey('');
       setRegistryState('ok');
     } catch (error) {
-      setRegistryState('fail');
-      setRegistryMessage(error instanceof Error ? error.message : 'Could not add cloud model.');
+      if (isForbiddenError(error)) {
+        onForbidden?.(forbiddenMessage(error));
+      } else {
+        setRegistryState('fail');
+        setRegistryMessage(error instanceof Error ? error.message : 'Could not add cloud model.');
+      }
     }
   }
 
@@ -352,8 +389,12 @@ export function ModelsPage({
     try {
       await onDeleteCloudModel(modelId);
     } catch (error) {
-      setRegistryMessage(error instanceof Error ? error.message : 'Could not remove cloud model.');
-      setRegistryState('fail');
+      if (isForbiddenError(error)) {
+        onForbidden?.(forbiddenMessage(error));
+      } else {
+        setRegistryMessage(error instanceof Error ? error.message : 'Could not remove cloud model.');
+        setRegistryState('fail');
+      }
     } finally {
       setDeletingCloudId(null);
     }
@@ -464,8 +505,12 @@ export function ModelsPage({
         setIntegrationMessage('Credential saved but not marked configured.');
       }
     } catch (error) {
-      setIntegrationState('fail');
-      setIntegrationMessage(error instanceof Error ? error.message : 'Could not save integration.');
+      if (isForbiddenError(error)) {
+        onForbidden?.(forbiddenMessage(error));
+      } else {
+        setIntegrationState('fail');
+        setIntegrationMessage(error instanceof Error ? error.message : 'Could not save integration.');
+      }
     }
   }
 
@@ -476,8 +521,12 @@ export function ModelsPage({
       await apiClient.deleteIntegration(provider, credentialId);
       setIntegrations((items) => items.filter((item) => !(item.provider === provider && item.id === credentialId)));
     } catch (error) {
-      setIntegrationMessage(error instanceof Error ? error.message : 'Could not remove integration.');
-      setIntegrationState('fail');
+      if (isForbiddenError(error)) {
+        onForbidden?.(forbiddenMessage(error));
+      } else {
+        setIntegrationMessage(error instanceof Error ? error.message : 'Could not remove integration.');
+        setIntegrationState('fail');
+      }
     } finally {
       setDeletingIntegrationKey(null);
     }
@@ -526,6 +575,20 @@ export function ModelsPage({
         {/* ── Section 1: Connections ── */}
         <section className="space-y-3">
           <SectionHeader num="1" title="Connections" subtitle="Each block saves independently." />
+          {teamActive && identityContext && (
+            <div className="rounded-xl border border-border bg-muted/30 px-4 py-2.5 text-xs text-muted-foreground flex flex-wrap items-center gap-2">
+              <span className="font-medium text-foreground">Workspace</span>
+              <span className="font-mono">{identityContext.workspace_id}</span>
+              <span>·</span>
+              <span>Signed in as {identityContext.actor_id}</span>
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-foreground">
+                {roleLabel(identityContext.role)}
+              </span>
+              {viewerLocked && (
+                <span className="text-amber-700 dark:text-amber-300">Read-only settings</span>
+              )}
+            </div>
+          )}
 
           <CollapsibleConnectionBlock title="Local model servers" hint="LM Studio / OpenAI-compatible URLs.">
             <div className="space-y-2">
@@ -673,7 +736,7 @@ export function ModelsPage({
                           <button
                             type="button"
                             onClick={() => void removeRegistryModel(model.id)}
-                            disabled={deletingCloudId === model.id}
+                            disabled={settingsDisabled(true) || deletingCloudId === model.id}
                             className="ml-auto h-7 w-7 flex items-center justify-center rounded border border-border text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                             aria-label={`Remove ${model.label}`}
                           >
@@ -687,6 +750,7 @@ export function ModelsPage({
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   <select
                     value={registryProvider}
+                    disabled={settingsDisabled(true)}
                     onChange={(e) => { setRegistryProvider(e.target.value); setRegistryState('idle'); setRegistryMessage(''); setDiscoveredModels([]); setDiscoverState('idle'); setDiscoverMessage(''); }}
                     className={FORM_INPUT_CLASS}
                   >
@@ -696,6 +760,7 @@ export function ModelsPage({
                   </select>
                   <input
                     value={registryModelId}
+                    disabled={settingsDisabled(true)}
                     onChange={(e) => { setRegistryModelId(e.target.value); setRegistryState('idle'); setRegistryMessage(''); }}
                     placeholder="Model id — or Discover to pick"
                     list="discovered-cloud-models"
@@ -715,6 +780,7 @@ export function ModelsPage({
                   <input
                     type="password"
                     value={registryApiKey}
+                    disabled={settingsDisabled(true)}
                     onChange={(e) => { setRegistryApiKey(e.target.value); setRegistryState('idle'); setRegistryMessage(''); }}
                     placeholder="API key"
                     className={FORM_INPUT_MONO_CLASS}
@@ -724,7 +790,7 @@ export function ModelsPage({
                   <button
                     type="button"
                     onClick={() => void discoverModels()}
-                    disabled={discoverState === 'running'}
+                    disabled={settingsDisabled(true) || discoverState === 'running'}
                     title="List the models this provider exposes for your key"
                     className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded border border-border hover:bg-muted transition-colors disabled:opacity-50 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
@@ -741,7 +807,7 @@ export function ModelsPage({
                   <button
                     type="button"
                     onClick={() => void addRegistryModel()}
-                    disabled={registryState === 'running' || !registryModelId.trim() || !registryApiKey.trim()}
+                    disabled={settingsDisabled(true) || registryState === 'running' || !registryModelId.trim() || !registryApiKey.trim()}
                     className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded border border-border hover:bg-muted transition-colors disabled:opacity-50 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     {registryState === 'running' ? <Loader2 size={11} className="animate-spin" /> : <Plus size={11} />}
@@ -856,6 +922,11 @@ export function ModelsPage({
                         <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground uppercase">
                           {credential.provider}
                         </span>
+                        {credential.credential_type && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-violet-50 text-violet-700 dark:bg-violet-950 dark:text-violet-300 uppercase">
+                            {credential.credential_type}
+                          </span>
+                        )}
                         <span className="font-mono text-[11px] text-muted-foreground">{credential.id}</span>
                         <span
                           className={`text-[10px] px-1.5 py-0.5 rounded-full ${
@@ -874,7 +945,7 @@ export function ModelsPage({
                         <button
                           type="button"
                           onClick={() => void removeIntegrationCredential(credential.provider, credential.id)}
-                          disabled={deletingIntegrationKey === `${credential.provider}:${credential.id}`}
+                          disabled={settingsDisabled(true) || deletingIntegrationKey === `${credential.provider}:${credential.id}`}
                           className="ml-auto h-7 w-7 flex items-center justify-center rounded border border-border text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                           aria-label={`Remove ${credential.label || credential.provider}`}
                         >
@@ -888,9 +959,26 @@ export function ModelsPage({
                 ) : (
                   <p className="text-[11px] text-muted-foreground mb-3">None configured.</p>
                 )}
+                {teamActive && identityContext && (
+                  <div className="space-y-2 mb-3">
+                    <GitCredentialConnect
+                      provider="github"
+                      identityContext={identityContext}
+                      integrations={integrations}
+                      onForbidden={onForbidden}
+                    />
+                    <GitCredentialConnect
+                      provider="gitlab"
+                      identityContext={identityContext}
+                      integrations={integrations}
+                      onForbidden={onForbidden}
+                    />
+                  </div>
+                )}
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   <select
                     value={integrationProvider}
+                    disabled={settingsDisabled(true)}
                     onChange={(e) => {
                       setIntegrationProvider(e.target.value as IntegrationProvider);
                       setIntegrationState('idle');
@@ -904,6 +992,7 @@ export function ModelsPage({
                   </select>
                   <input
                     value={integrationLabel}
+                    disabled={settingsDisabled(true)}
                     onChange={(e) => setIntegrationLabel(e.target.value)}
                     placeholder="Label (optional)"
                     className={FORM_INPUT_CLASS}
@@ -911,6 +1000,7 @@ export function ModelsPage({
                   <input
                     type="password"
                     value={integrationToken}
+                    disabled={settingsDisabled(true)}
                     onChange={(e) => {
                       setIntegrationToken(e.target.value);
                       setIntegrationState('idle');
@@ -921,6 +1011,7 @@ export function ModelsPage({
                   />
                   <input
                     value={integrationScopes}
+                    disabled={settingsDisabled(true)}
                     onChange={(e) => setIntegrationScopes(e.target.value)}
                     placeholder={selectedIntegrationProvider.scopePlaceholder}
                     className={`${FORM_INPUT_MONO_CLASS} sm:col-span-2`}
@@ -930,7 +1021,7 @@ export function ModelsPage({
                   <button
                     type="button"
                     onClick={() => void addIntegrationCredential()}
-                    disabled={integrationState === 'running' || !integrationToken.trim()}
+                    disabled={settingsDisabled(true) || integrationState === 'running' || !integrationToken.trim()}
                     className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded border border-border hover:bg-muted transition-colors disabled:opacity-50 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     {integrationState === 'running' ? <Loader2 size={11} className="animate-spin" /> : <Plus size={11} />}
@@ -958,7 +1049,7 @@ export function ModelsPage({
               </p>
               <Switch
                 checked={allowCloudExecutionModel}
-                disabled={cloudExecutionPending}
+                disabled={cloudExecutionPending || settingsDisabled(true)}
                 onCheckedChange={(checked) => {
                   setCloudExecutionPending(true);
                   void onUpdateAllowCloudExecutionModel(checked).finally(() => {
@@ -978,7 +1069,8 @@ export function ModelsPage({
           />
 
           <CollapsibleConnectionBlock title="Webhook notifications" hint="Optional attention alerts.">
-            <div className="flex flex-wrap items-center gap-2">
+            <ActionDisclosure text={ACTION_DISCLOSURES.webhook} />
+            <div className="flex flex-wrap items-center gap-2 mt-2">
               <input
                 type="url"
                 value={webhookInput}
@@ -1002,6 +1094,20 @@ export function ModelsPage({
               )}
             </div>
           </CollapsibleConnectionBlock>
+
+          {teamActive && identityContext && (
+            <>
+              <CollapsibleConnectionBlock title="Members" hint="Workspace roles and invites.">
+                <MembersPanel identityContext={identityContext} onForbidden={onForbidden} />
+              </CollapsibleConnectionBlock>
+              <CollapsibleConnectionBlock title="Audit log" hint="Append-only privileged action history.">
+                <AuditLogPanel identityContext={identityContext} />
+              </CollapsibleConnectionBlock>
+              <CollapsibleConnectionBlock title="Runners" hint="Where execution runs — split-plane seam.">
+                <RunnersPanel identityContext={identityContext} onForbidden={onForbidden} />
+              </CollapsibleConnectionBlock>
+            </>
+          )}
         </section>
 
         {/* ── Section 2: Role routing ── */}
@@ -1092,6 +1198,7 @@ export function ModelsPage({
                             )}
                             <select
                               value={route.model}
+                              disabled={viewerLocked}
                               onChange={(e) => onUpdateRoute(route.id, e.target.value as AssignedModel)}
                               className="text-xs bg-background border border-border rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-ring text-foreground w-full"
                             >

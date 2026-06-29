@@ -1,0 +1,20 @@
+diff --git a/src/tablib/formats/_json.py b/src/tablib/formats/_json.py
+--- a/src/tablib/formats/_json.py
++++ b/src/tablib/formats/_json.py
+@@ -1,6 +1,7 @@
+ """ Tablib - JSON Support
+ """
++import datetime
+ import decimal
+ import json
+ from uuid import UUID
+ 
+@@ -10,6 +11,8 @@ import tablib
+ def serialize_objects_handler(obj):
+     if isinstance(obj, (decimal.Decimal, UUID)):
+         return str(obj)
++    elif isinstance(obj, datetime.datetime):
++        return obj.isoformat()
+     elif hasattr(obj, 'isoformat'):
+         return obj.isoformat()
+     else:

@@ -110,6 +110,8 @@ export const STATUS_CLASSES: Record<TicketStatus, string> = {
   'Awaiting acceptance': 'bg-orange-50 text-orange-700 dark:bg-orange-950 dark:text-orange-300',
   Done: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300',
   Blocked: 'bg-red-50 text-red-700 dark:bg-red-950 dark:text-red-300',
+  Abandoned: 'bg-zinc-100 text-zinc-500 dark:bg-zinc-900 dark:text-zinc-500',
+  Split: 'bg-violet-50 text-violet-600 dark:bg-violet-950 dark:text-violet-400',
 };
 
 export const TYPE_CLASSES: Record<TicketType, string> = {
@@ -144,7 +146,15 @@ export const MANUAL_STATUS_TRANSITIONS: Record<TicketStatus, TicketStatus[]> = {
   'Awaiting acceptance': [],
   Done: [],
   Blocked: [],
+  Abandoned: [],
+  Split: [],
 };
+
+export const TERMINAL_TICKET_STATUSES: TicketStatus[] = ['Done', 'Abandoned', 'Split'];
+
+export function isTerminalTicketStatus(status: TicketStatus): boolean {
+  return TERMINAL_TICKET_STATUSES.includes(status);
+}
 
 export function canManuallyMoveTicket(from: TicketStatus, to: TicketStatus): boolean {
   return MANUAL_STATUS_TRANSITIONS[from]?.includes(to) ?? false;

@@ -1,0 +1,17 @@
+diff --git a/src/tablib/formats/_html.py b/src/tablib/formats/_html.py
+--- a/src/tablib/formats/_html.py
++++ b/src/tablib/formats/_html.py
+@@ -1,4 +1,5 @@
+ """ Tablib - HTML export support.
+ """
++from html import escape
+ from html.parser import HTMLParser
+ from xml.etree import ElementTree as ET
+@@ -44,6 +45,6 @@ class HTMLFormat:
+         result = ''
+         for i, dset in enumerate(databook._datasets):
+             title = dset.title if dset.title else f'Set {i}'
+-            result += f'<{cls.BOOK_ENDINGS}>{title}</{cls.BOOK_ENDINGS}>\n'
++            result += f'<{cls.BOOK_ENDINGS}>{escape(str(title))}</{cls.BOOK_ENDINGS}>\n'
+             result += dset.html
+             result += '\n'

@@ -18,9 +18,22 @@ import type {
   RequirementTemplate,
   DemoSeedResult,
   RequirementShareSummary,
+  DecisionCenterPayload,
+  AcceptanceSummary,
+  TicketSignals,
+  SplitTicketResponse,
+  TicketGraphPayload,
+  WorkerSlotStatus,
+  IdentityContext,
+  WorkspaceMembership,
+  AuditEvent,
+  RunnerRecord,
+  GitAppInstallInfo,
+  MembershipRole,
 } from './types';
 import type { ChatAttachment, ChatMessage, ChatSegment, CloudModel } from '../types';
 import { getStoredApiToken, promptForApiToken, setStoredApiToken } from './authToken';
+import { identityHeaders } from './authIdentity';
 
 const API_PREFIX = '/api';
 
@@ -46,18 +59,21 @@ export interface IntegrationCredential {
   configured: boolean;
   created_at: string;
   updated_at: string;
+  credential_type?: 'pat' | 'app';
 }
 
 export interface AutoWorkerStatus {
   running: boolean;
   interval_sec: number;
   max_cycles_per_tick: number;
+  max_workers: number;
   allow_dirty_workspace: boolean;
   last_started_at: string | null;
   last_run_at: string | null;
   last_error: string;
   last_skipped_reason: string;
   project_id: string | null;
+  worker_statuses?: WorkerSlotStatus[];
 }
 
 export class ApiError extends Error {
@@ -92,7 +108,9 @@ async function responseErrorMessage(response: Response): Promise<string> {
 }
 
 function authHeaders(extra?: HeadersInit): HeadersInit {
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = {
+    ...identityHeaders(),
+  };
   const token = getStoredApiToken();
   if (token) {
     headers.Authorization = `Bearer ${token}`;
@@ -171,6 +189,29 @@ async function request<T>(path: string, init?: RequestInit, retried = false): Pr
     throw new ApiError(response.status, await responseErrorMessage(response));
   }
 
+  if (response.status === 204) {
+    return undefined as T;
+  }
+  return (await response.json()) as T;
+}
+
+async function requestOptional<T>(path: string, init?: RequestInit): Promise<T | null> {
+  const response = await fetch(`${API_PREFIX}${path}`, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...authHeaders(init?.headers),
+    },
+  });
+  if (response.status === 404) {
+    return null;
+  }
+  if (response.status === 401) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new ApiError(response.status, await responseErrorMessage(response));
+  }
   if (response.status === 204) {
     return undefined as T;
   }
@@ -348,6 +389,7 @@ export const apiClient = {
       task_target_files?: string[];
       dod_tests?: string[];
       assigned_model?: string;
+      depends_on?: string[];
       rerun?: boolean;
     },
     projectId?: string,
@@ -456,9 +498,12 @@ export const apiClient = {
   getWorkerStatus: async (): Promise<AutoWorkerStatus> =>
     request('/orchestrator/worker/status'),
 
+  getTicketGraph: async (projectId: string): Promise<TicketGraphPayload> =>
+    request(`/tickets/graph?project_id=${encodeURIComponent(projectId)}`),
+
   startWorker: async (
     projectId: string,
-    opts?: { interval_sec?: number; max_cycles_per_tick?: number; allow_dirty_workspace?: boolean },
+    opts?: { interval_sec?: number; max_cycles_per_tick?: number; allow_dirty_workspace?: boolean; max_workers?: number },
   ): Promise<AutoWorkerStatus> =>
     request('/orchestrator/worker/start', {
       method: 'POST',
@@ -725,6 +770,39 @@ export const apiClient = {
     return data.summary;
   },
 
+  getDecisions: async (projectId: string): Promise<DecisionCenterPayload> =>
+    request(`/decisions?project_id=${encodeURIComponent(projectId)}`),
+
+  getRequirementSignals: async (requirementId: string, projectId?: string): Promise<TicketSignals[]> => {
+    const suffix = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
+    const data = await request<{ signals: { tickets: TicketSignals[] } }>(
+      `/requirements/${encodeURIComponent(requirementId)}/signals${suffix}`,
+    );
+    return data.signals.tickets ?? [];
+  },
+
+  getAcceptanceSummary: async (ticketId: string, projectId?: string): Promise<AcceptanceSummary> => {
+    const data = await request<{ summary: AcceptanceSummary }>(
+      `/tickets/${encodeURIComponent(ticketId)}/acceptance-summary${projectQuery(projectId)}`,
+    );
+    return data.summary;
+  },
+
+  splitTicket: async (ticketId: string, feedback: string, projectId?: string): Promise<SplitTicketResponse> => {
+    return request(
+      `/tickets/${encodeURIComponent(ticketId)}/split${projectQuery(projectId)}`,
+      { method: 'POST', body: JSON.stringify({ feedback }) },
+    );
+  },
+
+  abandonTicket: async (ticketId: string, reason: string, projectId?: string): Promise<BackendTicket> => {
+    const data = await request<{ ticket: BackendTicket }>(
+      `/tickets/${encodeURIComponent(ticketId)}/abandon${projectQuery(projectId)}`,
+      { method: 'POST', body: JSON.stringify({ reason }) },
+    );
+    return data.ticket;
+  },
+
   ticketLogsWs: (ticketId: string, projectId?: string): WebSocket => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const params = new URLSearchParams();
@@ -733,5 +811,94 @@ export const apiClient = {
     if (token) params.set('token', token);
     const suffix = params.toString() ? `?${params.toString()}` : '';
     return new WebSocket(`${protocol}//${window.location.host}${API_PREFIX}/tickets/${ticketId}/logs${suffix}`);
+  },
+
+  getIdentityContext: async (): Promise<IdentityContext> => {
+    const data = await requestOptional<{ context: IdentityContext }>('/identity/context');
+    if (data?.context) {
+      return data.context;
+    }
+    return {
+      identity_configured: false,
+      actor_id: 'implicit-owner',
+      workspace_id: 'default',
+      role: 'owner',
+      implicit_owner: true,
+      permissions: ['read', 'mutate', 'admin'],
+    };
+  },
+
+  listMemberships: async (workspaceId: string): Promise<WorkspaceMembership[]> => {
+    const params = new URLSearchParams({ workspace: workspaceId });
+    const data = await requestOptional<{ memberships: WorkspaceMembership[] }>(`/memberships?${params.toString()}`);
+    return data?.memberships ?? [];
+  },
+
+  upsertMembership: async (payload: {
+    user_id: string;
+    workspace_id: string;
+    role: MembershipRole;
+    email?: string;
+    display_name?: string;
+  }): Promise<WorkspaceMembership> => {
+    const data = await request<{ membership: WorkspaceMembership }>('/memberships', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    return data.membership;
+  },
+
+  removeMembership: async (workspaceId: string, userId: string): Promise<void> => {
+    const params = new URLSearchParams({ workspace: workspaceId, user_id: userId });
+    await request(`/memberships?${params.toString()}`, { method: 'DELETE' });
+  },
+
+  getAuditEvents: async (opts: {
+    workspace: string;
+    cursor?: number;
+    limit?: number;
+  }): Promise<{ events: AuditEvent[]; next_cursor: number | null }> => {
+    const params = new URLSearchParams({ workspace: opts.workspace });
+    if (opts.cursor != null) params.set('cursor', String(opts.cursor));
+    if (opts.limit != null) params.set('limit', String(opts.limit));
+    const data = await request<{ events: AuditEvent[]; next_cursor: number | null }>(
+      `/audit?${params.toString()}`,
+    );
+    return {
+      events: data.events ?? [],
+      next_cursor: data.next_cursor ?? null,
+    };
+  },
+
+  listRunners: async (workspaceId: string): Promise<RunnerRecord[]> => {
+    const params = new URLSearchParams({ workspace: workspaceId });
+    const data = await requestOptional<{ runners: RunnerRecord[] }>(`/runners?${params.toString()}`);
+    return data?.runners ?? [];
+  },
+
+  registerRunner: async (payload: {
+    workspace_id: string;
+    label: string;
+  }): Promise<{ runner: RunnerRecord; token: string }> => {
+    const data = await request<{ runner: RunnerRecord; token: string }>('/runner/register', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    return data;
+  },
+
+  revokeRunner: async (runnerId: string): Promise<RunnerRecord> => {
+    const data = await request<{ runner: RunnerRecord }>(`/runner/revoke/${encodeURIComponent(runnerId)}`, {
+      method: 'POST',
+    });
+    return data.runner;
+  },
+
+  getGitAppInstallInfo: async (
+    provider: 'github' | 'gitlab',
+    workspaceId: string,
+  ): Promise<GitAppInstallInfo | null> => {
+    const params = new URLSearchParams({ provider, workspace: workspaceId });
+    return requestOptional<GitAppInstallInfo>(`/config/integrations/app-install?${params.toString()}`);
   },
 };

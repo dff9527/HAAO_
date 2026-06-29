@@ -15,11 +15,21 @@ import {
   statusDisplayLabel,
 } from '../copy';
 import { DiffViewer } from './DiffViewer';
+import { DiffScopeBadge } from './DiffScopeBadge';
+import { RunProvenanceChip } from './RunProvenanceChip';
+import { SplitLineageMarker } from './SplitLineageMarker';
 import { InterventionNotice, interventionNoticeForTicket } from './InterventionNotice';
 import { PrLinkBadge } from './PrLinkBadge';
+import { AcceptanceChecklist } from './AcceptanceChecklist';
+import { BlockedRecoveryMenu } from './BlockedRecoveryMenu';
+import { ActionDisclosure } from './ActionDisclosure';
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip';
 import { prEligibility, showConnectGithubHint } from '../prEligibility';
-import type { Ticket, TicketStatus, AssignedModel, RequirementSource } from '../types';
+import { apiClient } from '../api/client';
+import type { AcceptanceSummary } from '../api/types';
+import { MOCK_ACCEPTANCE_SUMMARY } from '../trustUtils';
+import { ACTION_DISCLOSURES } from '../trustUtils';
+import { workerDisplayNumber } from '../throughputUtils';
 
 type PrActionStatus = 'idle' | 'running' | 'ok' | 'fail';
 
@@ -59,6 +69,13 @@ interface Props {
   onDelete: (force?: boolean) => void;
   onEscalate: () => void;
   onOpenPr?: () => Promise<void>;
+  onSplit?: (feedback: string) => void;
+  onAbandon?: (reason: string) => void;
+  onAssignModelAndRetry?: (model: string) => void;
+  onOpenTicket?: (ticketId: string) => void;
+  onUpdateDependsOn?: (dependsOn: string[]) => void | Promise<void>;
+  allTickets?: Ticket[];
+  usingMockData?: boolean;
   prIntegrationConfigured?: boolean;
   requirementSource?: RequirementSource;
   onViewRequirement?: () => void;
@@ -68,7 +85,13 @@ interface Props {
 
 type ConfirmAction = 'escalate' | 'backlog' | 'delete' | 'merge' | 'revert' | null;
 
-export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApprove, onAccept, onReject, onRun, onCancel, onApproveDiff, onRejectDiff, onMerge, onRevert, onUpdateAndRerun, onDelete, onEscalate, onOpenPr, prIntegrationConfigured = false, requirementSource, onViewRequirement, localModelIds = DEFAULT_LOCAL_MODELS, projectPathReady = true }: Props) {
+export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApprove, onAccept, onReject, onRun, onCancel, onApproveDiff, onRejectDiff, onMerge, onRevert, onUpdateAndRerun, onDelete, onEscalate, onOpenPr, onSplit, onAbandon, onAssignModelAndRetry, onOpenTicket, onUpdateDependsOn, allTickets = [], prIntegrationConfigured = false, usingMockData = false, requirementSource, onViewRequirement, localModelIds = DEFAULT_LOCAL_MODELS, projectPathReady = true }: Props) {
+  const [acceptanceSummary, setAcceptanceSummary] = useState<AcceptanceSummary | null>(null);
+  const [acceptanceLoading, setAcceptanceLoading] = useState(false);
+  const [recoveryPending, setRecoveryPending] = useState(false);
+  const [dependsDraft, setDependsDraft] = useState<string[]>(ticket.dependsOn ?? []);
+  const [newDependencyId, setNewDependencyId] = useState('');
+  const [dependsSaving, setDependsSaving] = useState(false);
   const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null);
   const [rejectFeedback, setRejectFeedback] = useState('');
   const [showRejectInput, setShowRejectInput] = useState(false);
@@ -99,6 +122,38 @@ export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApp
     setPrActionState('idle');
     setPrActionMessage('');
   }, [ticket.id]);
+
+  useEffect(() => {
+    setDependsDraft(ticket.dependsOn ?? []);
+    setNewDependencyId('');
+  }, [ticket.id, ticket.dependsOn]);
+
+  useEffect(() => {
+    if (ticket.status !== 'Awaiting acceptance') {
+      setAcceptanceSummary(null);
+      return;
+    }
+    if (usingMockData) {
+      setAcceptanceSummary({ ...MOCK_ACCEPTANCE_SUMMARY, ticket_id: ticket.id });
+      return;
+    }
+    let active = true;
+    setAcceptanceLoading(true);
+    apiClient
+      .getAcceptanceSummary(ticket.id)
+      .then((summary) => {
+        if (active) setAcceptanceSummary(summary);
+      })
+      .catch(() => {
+        if (active) setAcceptanceSummary(null);
+      })
+      .finally(() => {
+        if (active) setAcceptanceLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [ticket.id, ticket.status, usingMockData]);
 
   // Keep the edit draft in sync with incoming ticket data, but never clobber
   // the user's edits while they are actively editing.
@@ -144,6 +199,8 @@ export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApp
   }
 
   const isBlocked = ticket.status === 'Blocked';
+  const isAbandoned = ticket.status === 'Abandoned';
+  const isSplit = ticket.status === 'Split';
   const isDiffReview = ticket.status === 'Diff review';
   const intervention = interventionNoticeForTicket(ticket);
   const model = getModelMeta(ticket.assignedModel);
@@ -347,6 +404,66 @@ export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApp
 
           {intervention && <InterventionNotice notification={intervention} />}
 
+          {isAbandoned && (
+            <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/50 px-3 py-3 space-y-1">
+              <p className="text-xs font-semibold text-muted-foreground">Abandoned</p>
+              {ticket.abandonReason && (
+                <p className="text-xs text-muted-foreground whitespace-pre-wrap">{ticket.abandonReason}</p>
+              )}
+              {ticket.abandonedAt && (
+                <p className="text-[11px] text-muted-foreground/80">
+                  {new Date(ticket.abandonedAt).toLocaleString()}
+                </p>
+              )}
+            </div>
+          )}
+
+          {isSplit && (
+            <div className="rounded-lg border border-violet-200 dark:border-violet-800 bg-violet-50/60 dark:bg-violet-950/30 px-3 py-3 space-y-2">
+              <p className="text-xs font-semibold text-violet-800 dark:text-violet-200">Superseded — split into smaller tickets</p>
+              {ticket.splitFeedback && (
+                <p className="text-xs text-violet-700 dark:text-violet-300 whitespace-pre-wrap">{ticket.splitFeedback}</p>
+              )}
+              {ticket.childTicketIds && ticket.childTicketIds.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {ticket.childTicketIds.map((childId) => (
+                    <button
+                      key={childId}
+                      type="button"
+                      onClick={() => onOpenTicket?.(childId)}
+                      className="text-xs font-mono px-2 py-1 rounded border border-violet-300 dark:border-violet-700 text-violet-800 dark:text-violet-200 hover:bg-violet-100 dark:hover:bg-violet-900 transition-colors"
+                    >
+                      Open {childId}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {ticket.splitFrom && (
+            <div className="flex items-center gap-2">
+              <SplitLineageMarker
+                parentId={ticket.splitFrom}
+                onClick={onOpenTicket ? () => onOpenTicket(ticket.splitFrom!) : undefined}
+              />
+            </div>
+          )}
+
+          {ticket.conflictNote && (
+            <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/60 dark:bg-amber-950/30 px-3 py-2 text-xs text-amber-800 dark:text-amber-200 flex items-start gap-2">
+              <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+              <span>{ticket.conflictNote}</span>
+            </div>
+          )}
+
+          {ticket.lease && (
+            <div className="text-[11px] text-blue-700 dark:text-blue-300 font-mono">
+              Leased to worker {workerDisplayNumber(ticket.lease.workerId)}
+              {ticket.lease.expiresAt ? ` · until ${new Date(ticket.lease.expiresAt).toLocaleTimeString()}` : ''}
+            </div>
+          )}
+
           {!projectPathReady && (
             <div className="flex items-start gap-2 p-3 rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800">
               <AlertTriangle size={14} className="text-amber-500 mt-0.5 shrink-0" />
@@ -356,13 +473,52 @@ export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApp
             </div>
           )}
 
-          {/* Blocked banner */}
-          {isBlocked && (
+          {/* Blocked recovery */}
+          {isBlocked && onSplit && onAbandon && onAssignModelAndRetry && (
+            <BlockedRecoveryMenu
+              localModelIds={localModelIds}
+              assignedModel={ticket.assignedModel}
+              pending={recoveryPending}
+              onSplit={async (feedback) => {
+                setRecoveryPending(true);
+                try {
+                  onSplit(feedback);
+                } finally {
+                  setRecoveryPending(false);
+                }
+              }}
+              onClarify={() => setShowRejectInput(true)}
+              onChangeModelRetry={async (model) => {
+                setRecoveryPending(true);
+                try {
+                  await onAssignModelAndRetry(model);
+                } finally {
+                  setRecoveryPending(false);
+                }
+              }}
+              onEscalate={async () => {
+                setRecoveryPending(true);
+                try {
+                  onEscalate();
+                } finally {
+                  setRecoveryPending(false);
+                }
+              }}
+              onAbandon={async (reason) => {
+                setRecoveryPending(true);
+                try {
+                  onAbandon(reason);
+                } finally {
+                  setRecoveryPending(false);
+                }
+              }}
+            />
+          )}
+          {isBlocked && !(onSplit && onAbandon && onAssignModelAndRetry) && (
             <div className="flex items-start gap-2 p-3 rounded-lg bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800">
               <AlertTriangle size={14} className="text-red-500 mt-0.5 shrink-0" />
               <p className="text-xs text-red-700 dark:text-red-300">
                 <span className="font-semibold">Blocked — retry budget exhausted.</span>
-                {' '}HAAO will auto-escalate to the Tech Lead, or you can move back to Backlog for re-scoping.
               </p>
             </div>
           )}
@@ -438,16 +594,99 @@ export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApp
               )}
             </div>
 
+            {/* Dependencies */}
+            <div className="rounded-lg border border-border p-3">
+              <div className="flex items-center gap-1.5 mb-2">
+                <GitBranch size={12} className="text-muted-foreground" />
+                <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Depends on</span>
+              </div>
+              {dependsDraft.length === 0 && (
+                <p className="text-xs text-muted-foreground mb-2">No upstream tickets — can run when ready.</p>
+              )}
+              <ul className="space-y-1 mb-2">
+                {dependsDraft.map((depId) => (
+                  <li key={depId} className="flex items-center gap-2 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => onOpenTicket?.(depId)}
+                      className="font-mono text-primary hover:underline"
+                    >
+                      {depId}
+                    </button>
+                    <span className="text-muted-foreground truncate">
+                      {allTickets.find((item) => item.id === depId)?.title ?? ''}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setDependsDraft((prev) => prev.filter((id) => id !== depId))}
+                      className="ml-auto text-muted-foreground hover:text-red-600"
+                      aria-label={`Remove dependency ${depId}`}
+                    >
+                      <X size={12} />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              <div className="flex gap-2">
+                <select
+                  value={newDependencyId}
+                  onChange={(event) => setNewDependencyId(event.target.value)}
+                  className="flex-1 text-xs border border-border rounded px-2 py-1 bg-background"
+                  aria-label="Add dependency ticket"
+                >
+                  <option value="">Add dependency…</option>
+                  {allTickets
+                    .filter((item) => item.id !== ticket.id && !dependsDraft.includes(item.id))
+                    .map((item) => (
+                      <option key={item.id} value={item.id}>{item.id} — {item.title}</option>
+                    ))}
+                </select>
+                <button
+                  type="button"
+                  disabled={!newDependencyId}
+                  onClick={() => {
+                    if (!newDependencyId) return;
+                    setDependsDraft((prev) => [...prev, newDependencyId]);
+                    setNewDependencyId('');
+                  }}
+                  className="text-xs px-2.5 py-1 rounded border border-border hover:bg-muted disabled:opacity-40"
+                >
+                  Add
+                </button>
+              </div>
+              {onUpdateDependsOn && (
+                <button
+                  type="button"
+                  disabled={dependsSaving}
+                  onClick={async () => {
+                    setDependsSaving(true);
+                    try {
+                      await onUpdateDependsOn(dependsDraft);
+                    } finally {
+                      setDependsSaving(false);
+                    }
+                  }}
+                  className="mt-2 text-xs px-2.5 py-1 rounded bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50"
+                >
+                  {dependsSaving ? 'Saving…' : 'Save dependencies'}
+                </button>
+              )}
+            </div>
+
             {/* Assigned model */}
             <div className="rounded-lg border border-border p-3">
               <div className="flex items-center gap-1.5 mb-2">
                 <Bot size={12} className="text-muted-foreground" />
                 <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Assigned model</span>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${model.pillClass}`}>
                   {model.label}
                 </span>
+                <RunProvenanceChip
+                  modelId={ticket.lastRunModelId ?? ticket.assignedModel}
+                  promptVersion={ticket.reasonerPromptVersion}
+                />
                 {ticket.autoEscalated && (
                   <span className="text-[10px] text-amber-600 dark:text-amber-400 font-mono">↑ auto-escalated by HAAO</span>
                 )}
@@ -476,11 +715,12 @@ export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApp
           {/* Diff review gate */}
           {isDiffReview && ticket.pendingDiff && (
             <div className="rounded-lg border border-cyan-200 dark:border-cyan-800 bg-cyan-50/60 dark:bg-cyan-950/30 p-3 space-y-3">
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-1.5 mb-2">
                 <FileCode size={13} className="text-cyan-600 dark:text-cyan-400" />
                 <span className="text-xs font-semibold text-cyan-700 dark:text-cyan-300 uppercase tracking-wide">
                   {STATE_COPY.diff.heading}
                 </span>
+                {ticket.diffStats && <DiffScopeBadge stats={ticket.diffStats} />}
               </div>
               <DiffViewer diff={ticket.pendingDiff} />
               {!showDiffRejectInput ? (
@@ -567,6 +807,9 @@ export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApp
                 </p>
               ) : null}
               {renderPrActionButton()}
+              {showPrAction && onOpenPr && (
+                <ActionDisclosure text={ACTION_DISCLOSURES.open_pr} />
+              )}
               {prActionState === 'fail' && prActionMessage && (
                 <p className="text-[11px] text-red-600 dark:text-red-400">{prActionMessage}</p>
               )}
@@ -744,6 +987,14 @@ export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApp
               <p className="text-xs text-indigo-700 dark:text-indigo-300 mb-3">
                 {STATE_COPY.gate2.body}
               </p>
+              {ticket.diffStats && (
+                <div className="mb-3">
+                  <DiffScopeBadge stats={ticket.diffStats} />
+                </div>
+              )}
+              <div className="mb-3">
+                <AcceptanceChecklist summary={acceptanceSummary} loading={acceptanceLoading} />
+              </div>
               {!showRejectInput ? (
                 <div className="flex gap-2">
                   <button

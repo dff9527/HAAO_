@@ -1,5 +1,6 @@
 import { formatCloudCost } from './constants';
 import type { InsightsCostStatus, InsightsPayload } from './api/types';
+import { extendMockInsights } from './trustUtils';
 
 export function formatCostStatusNote(
   totalUsd: number,
@@ -56,7 +57,7 @@ export function scorecardNeedsCaveat(row: InsightsPayload['model_scorecard'][num
   return row.sample_size < 5 || row.human_override_count > 0;
 }
 
-export const MOCK_INSIGHTS: InsightsPayload = {
+export const MOCK_INSIGHTS: InsightsPayload = extendMockInsights({
   project_id: 'default',
   range: '30d',
   generated_at: new Date().toISOString(),
@@ -122,4 +123,4 @@ export const MOCK_INSIGHTS: InsightsPayload = {
       human_override_count: 0,
     },
   ],
-};
+});

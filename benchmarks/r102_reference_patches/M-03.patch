@@ -1,0 +1,13 @@
+diff --git a/src/marshmallow/utils.py b/src/marshmallow/utils.py
+index df3cd294..291d7561 100644
+--- a/src/marshmallow/utils.py
++++ b/src/marshmallow/utils.py
+@@ -214,6 +214,8 @@ def from_timestamp(value: typing.Any) -> dt.datetime:
+ 
+ 
+ def from_timestamp_ms(value: typing.Any) -> dt.datetime:
++    if value is True or value is False:
++        raise ValueError("Not a valid POSIX timestamp")
+     value = float(value)
+     return from_timestamp(value / 1000)
+ 

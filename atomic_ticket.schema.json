@@ -23,7 +23,7 @@
     },
     "status": {
       "type": "string",
-      "enum": ["backlog", "ready", "in_progress", "testing", "diff_pending", "review", "awaiting_acceptance", "done", "blocked"],
+      "enum": ["backlog", "ready", "in_progress", "testing", "diff_pending", "review", "awaiting_acceptance", "done", "blocked", "abandoned", "split"],
       "description": "Current state-machine state"
     },
     "priority": {
@@ -39,6 +39,12 @@
     "dependencies": {
       "type": "array",
       "description": "Ticket ids that must reach 'done' before this one can start. Dependencies with a Git branch must also be merged into their base branch so their code is available to dependent worktrees.",
+      "items": { "type": "string", "pattern": "^T-[0-9]{3,}$" },
+      "default": []
+    },
+    "depends_on": {
+      "type": "array",
+      "description": "Alias for dependencies, frozen for dependency-graph APIs.",
       "items": { "type": "string", "pattern": "^T-[0-9]{3,}$" },
       "default": []
     },
@@ -184,6 +190,20 @@
       "properties": {
         "outcome": { "type": "string", "enum": ["success", "test_failed", "error", "pending"], "default": "pending" },
         "diff": { "type": "string", "description": "Unified diff of changes" },
+        "diff_stats": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "files_touched": { "type": "integer", "minimum": 0 },
+            "lines_added": { "type": "integer", "minimum": 0 },
+            "lines_removed": { "type": "integer", "minimum": 0 },
+            "out_of_scope_files": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": []
+            }
+          }
+        },
         "test_output": { "type": "string" },
         "logs": {
           "type": "array",

@@ -1,0 +1,15 @@
+diff --git a/src/tablib/core.py b/src/tablib/core.py
+index 4e3bb7e..2e02ffb 100644
+--- a/src/tablib/core.py
++++ b/src/tablib/core.py
+@@ -651,7 +651,10 @@ class Dataset:
+         Returns a new :class:`Dataset` instance where columns have been
+         sorted.
+         """
+ 
++        if not self:
++            return Dataset(headers=self.headers, title=self.title)
++
+         if isinstance(col, str):
+ 
+             if not self.headers:

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import sqlite3
 import uuid
 import hashlib
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -39,6 +40,9 @@ RunEventType = Literal[
     "retry",
     "escalation",
     "egress_attempt",
+    "diff_scope_reject",
+    "rollback",
+    "conflict",
     "report",
     "run_finished",
     "error",
@@ -47,6 +51,8 @@ CostStatus = Literal["actual", "estimated", "unknown"]
 IntegrationProvider = Literal["github", "gitlab", "slack"]
 NotificationKind = Literal["needs_you", "done", "blocked"]
 EvalRunStatus = Literal["running", "completed", "failed"]
+MembershipRole = Literal["owner", "admin", "member", "viewer"]
+RunnerJobStatus = Literal["queued", "leased", "running", "terminal"]
 
 
 class DuplicateTicketError(ValueError):
@@ -59,6 +65,17 @@ class TicketDeletionError(ValueError):
 
 class AmbiguousTicketError(ValueError):
     """Raised when an unscoped ticket id exists in multiple projects."""
+
+
+@dataclass(frozen=True)
+class TicketLeaseClaim:
+    ticket: Ticket | None
+    skipped_reason: str = ""
+    conflict_ticket_ids: list[str] | None = None
+
+    @property
+    def claimed(self) -> bool:
+        return self.ticket is not None
 
 
 @dataclass(frozen=True)
@@ -92,6 +109,140 @@ class RunEvent:
             "cost_usd": self.cost_usd,
             "cost_status": self.cost_status,
             "payload": self.payload,
+        }
+
+
+@dataclass(frozen=True)
+class PromptVersionRecord:
+    id: str
+    template_hash: str
+    first_seen_at: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "template_hash": self.template_hash,
+            "first_seen_at": self.first_seen_at,
+        }
+
+
+@dataclass(frozen=True)
+class UserRecord:
+    id: str
+    email: str
+    display_name: str
+    created_at: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "email": self.email,
+            "display_name": self.display_name,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass(frozen=True)
+class WorkspaceRecord:
+    id: str
+    name: str
+    created_at: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {"id": self.id, "name": self.name, "created_at": self.created_at}
+
+
+@dataclass(frozen=True)
+class MembershipRecord:
+    user_id: str
+    workspace_id: str
+    role: MembershipRole
+    created_at: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "user_id": self.user_id,
+            "workspace_id": self.workspace_id,
+            "role": self.role,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass(frozen=True)
+class AuditEventRecord:
+    id: int
+    actor_id: str
+    workspace_id: str
+    action: str
+    target: str
+    ts: str
+    ip: str | None = None
+    payload: dict | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "actor_id": self.actor_id,
+            "workspace_id": self.workspace_id,
+            "action": self.action,
+            "target": self.target,
+            "ts": self.ts,
+            "ip": self.ip,
+            "payload": self.payload or {},
+        }
+
+
+@dataclass(frozen=True)
+class RunnerTokenRecord:
+    id: str
+    workspace_id: str
+    label: str
+    created_at: str
+    revoked_at: str | None = None
+    last_heartbeat_at: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "workspace_id": self.workspace_id,
+            "label": self.label,
+            "created_at": self.created_at,
+            "revoked_at": self.revoked_at,
+            "last_heartbeat_at": self.last_heartbeat_at,
+        }
+
+
+@dataclass(frozen=True)
+class IssuedRunnerToken:
+    runner: RunnerTokenRecord
+    token: str
+
+
+@dataclass(frozen=True)
+class RunnerJobRecord:
+    id: str
+    workspace_id: str
+    status: RunnerJobStatus
+    created_at: str
+    updated_at: str
+    ticket_id: str | None = None
+    lease_runner_id: str | None = None
+    lease_expires_at: str | None = None
+    payload: dict | None = None
+    result: dict | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "workspace_id": self.workspace_id,
+            "ticket_id": self.ticket_id,
+            "status": self.status,
+            "lease_runner_id": self.lease_runner_id,
+            "lease_expires_at": self.lease_expires_at,
+            "payload": self.payload or {},
+            "result": self.result or {},
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
         }
 
 
@@ -631,6 +782,169 @@ class TicketRepository:
         ticket_json["status"] = TicketStatus(status).value
         return self.save(Ticket.from_dict(ticket_json))
 
+    def lease(
+        self,
+        ticket_id: str,
+        *,
+        worker_id: str,
+        ttl_sec: int = 300,
+        project_id: str | None = None,
+    ) -> Ticket | None:
+        effective_project_id = self._effective_project_id(project_id)
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(seconds=max(1, int(ttl_sec)))
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT ticket_json FROM tickets
+                WHERE id = ? AND project_id = ?
+                """,
+                (ticket_id, effective_project_id),
+            ).fetchone()
+            if row is None:
+                self.connection.rollback()
+                return None
+            ticket = Ticket.from_dict(json.loads(row["ticket_json"]))
+            if TicketStatus(ticket.status) != TicketStatus.READY:
+                self.connection.rollback()
+                return None
+            metadata = ticket.metadata.model_dump(mode="json") if ticket.metadata else {}
+            if _lease_active(metadata, now) and metadata.get("lease_worker_id") != worker_id:
+                self.connection.rollback()
+                return None
+            updated = _ticket_with_lease(ticket, worker_id=worker_id, now=now, expires_at=expires_at)
+            self._save_in_transaction(updated, effective_project_id)
+            self.connection.commit()
+            return updated
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def claim_next_ready_ticket(
+        self,
+        *,
+        worker_id: str,
+        ttl_sec: int = 300,
+        project_id: str | None = None,
+    ) -> TicketLeaseClaim:
+        effective_project_id = self._effective_project_id(project_id)
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(seconds=max(1, int(ttl_sec)))
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.connection.execute(
+                """
+                SELECT ticket_json FROM tickets
+                WHERE project_id = ? AND status = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (effective_project_id, TicketStatus.READY.value),
+            ).fetchall()
+            tickets = [Ticket.from_dict(json.loads(row["ticket_json"])) for row in rows]
+            active_tickets = self._active_leased_tickets_in_transaction(effective_project_id, now)
+            waiting_dependencies: list[str] = []
+            conflict_ids: list[str] = []
+            for ticket in tickets:
+                metadata = ticket.metadata.model_dump(mode="json") if ticket.metadata else {}
+                if _lease_active(metadata, now) and metadata.get("lease_worker_id") != worker_id:
+                    continue
+                if not self._dependencies_satisfied_in_transaction(ticket, effective_project_id):
+                    waiting_dependencies.append(ticket.id)
+                    continue
+                conflicts = _overlapping_ticket_ids(ticket, active_tickets)
+                if conflicts:
+                    conflict_ids.append(ticket.id)
+                    continue
+                updated = _ticket_with_lease(
+                    ticket,
+                    worker_id=worker_id,
+                    now=now,
+                    expires_at=expires_at,
+                )
+                self._save_in_transaction(updated, effective_project_id)
+                self.connection.commit()
+                return TicketLeaseClaim(ticket=updated)
+            self.connection.rollback()
+            if conflict_ids:
+                return TicketLeaseClaim(
+                    ticket=None,
+                    skipped_reason="target_file_conflict",
+                    conflict_ticket_ids=conflict_ids,
+                )
+            if waiting_dependencies:
+                return TicketLeaseClaim(
+                    ticket=None,
+                    skipped_reason="dependencies_pending",
+                    conflict_ticket_ids=[],
+                )
+            return TicketLeaseClaim(ticket=None, skipped_reason="", conflict_ticket_ids=[])
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def renew_lease(
+        self,
+        ticket_id: str,
+        *,
+        worker_id: str,
+        ttl_sec: int = 300,
+        project_id: str | None = None,
+    ) -> Ticket | None:
+        ticket = self.get(ticket_id, project_id=project_id)
+        if ticket is None:
+            return None
+        metadata = ticket.metadata.model_dump(mode="json") if ticket.metadata else {}
+        if metadata.get("lease_worker_id") != worker_id:
+            return None
+        now = datetime.now(UTC)
+        return self.save(
+            _ticket_with_lease(
+                ticket,
+                worker_id=worker_id,
+                now=now,
+                expires_at=now + timedelta(seconds=max(1, int(ttl_sec))),
+            ),
+            project_id=project_id,
+        )
+
+    def release_lease(
+        self,
+        ticket_id: str,
+        *,
+        worker_id: str | None = None,
+        project_id: str | None = None,
+    ) -> Ticket | None:
+        ticket = self.get(ticket_id, project_id=project_id)
+        if ticket is None:
+            return None
+        metadata = ticket.metadata.model_dump(mode="json") if ticket.metadata else {}
+        if worker_id is not None and metadata.get("lease_worker_id") != worker_id:
+            return None
+        ticket_json = ticket.to_dict()
+        metadata = ticket_json.setdefault("metadata", {})
+        for key in ("lease_worker_id", "lease_expires_at", "lease_heartbeat_at", "lease_ttl_sec"):
+            metadata.pop(key, None)
+        return self.save(Ticket.from_dict(ticket_json), project_id=project_id)
+
+    def active_leases(self, project_id: str | None = None) -> list[Ticket]:
+        effective_project_id = self._effective_project_id(project_id)
+        now = datetime.now(UTC)
+        rows = self.connection.execute(
+            """
+            SELECT ticket_json FROM tickets
+            WHERE project_id IN (?)
+            ORDER BY created_at ASC, id ASC
+            """,
+            (effective_project_id,),
+        ).fetchall()
+        tickets = [Ticket.from_dict(json.loads(row["ticket_json"])) for row in rows]
+        return [
+            ticket
+            for ticket in tickets
+            if _lease_active(ticket.metadata.model_dump(mode="json") if ticket.metadata else {}, now)
+        ]
+
     def append_log(
         self,
         ticket_id: str,
@@ -684,6 +998,65 @@ class TicketRepository:
         )
         self.connection.commit()
         return updated_ticket
+
+    def _save_in_transaction(self, ticket: Ticket, project_id: str) -> Ticket:
+        ticket_json = ticket.to_dict()
+        metadata = ticket_json.setdefault("metadata", {})
+        metadata["project_id"] = project_id
+        metadata["updated_at"] = _now()
+        updated_ticket = Ticket.from_dict(ticket_json)
+        cursor = self.connection.execute(
+            """
+            UPDATE tickets
+            SET status = ?, ticket_json = ?, updated_at = ?
+            WHERE id = ? AND project_id = ?
+            """,
+            (
+                updated_ticket.status,
+                _dumps(updated_ticket),
+                metadata["updated_at"],
+                updated_ticket.id,
+                project_id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise KeyError(f"Ticket not found: {updated_ticket.id}")
+        return updated_ticket
+
+    def _active_leased_tickets_in_transaction(self, project_id: str, now: datetime) -> list[Ticket]:
+        rows = self.connection.execute(
+            """
+            SELECT ticket_json FROM tickets
+            WHERE project_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (project_id,),
+        ).fetchall()
+        tickets = [Ticket.from_dict(json.loads(row["ticket_json"])) for row in rows]
+        return [
+            ticket
+            for ticket in tickets
+            if _lease_active(ticket.metadata.model_dump(mode="json") if ticket.metadata else {}, now)
+        ]
+
+    def _dependencies_satisfied_in_transaction(self, ticket: Ticket, project_id: str) -> bool:
+        for dependency_id in _ticket_dependencies(ticket):
+            row = self.connection.execute(
+                """
+                SELECT ticket_json FROM tickets
+                WHERE id = ? AND project_id = ?
+                """,
+                (dependency_id, project_id),
+            ).fetchone()
+            if row is None:
+                return False
+            dependency = Ticket.from_dict(json.loads(row["ticket_json"]))
+            if TicketStatus(dependency.status) != TicketStatus.DONE:
+                return False
+            metadata = dependency.metadata.model_dump(mode="json") if dependency.metadata else {}
+            if metadata.get("git_branch") and not metadata.get("git_merge_commit"):
+                return False
+        return True
 
     def delete(self, ticket_id: str, *, force: bool = False) -> None:
         ticket = self._require_ticket(ticket_id)
@@ -1100,8 +1473,15 @@ class RunEventRepository:
         ts: datetime | str | None = None,
     ) -> RunEvent:
         timestamp = ts.isoformat() if isinstance(ts, datetime) else (ts or _now())
+        event_payload = _event_payload_with_contract_fields(
+            event_type=event_type,
+            payload=payload or {},
+            ticket_id=ticket_id,
+            run_id=run_id,
+            ts=timestamp,
+        )
         redacted_payload = redact_json(
-            payload or {},
+            event_payload,
             extra_secrets=_configured_secret_values(self.connection),
         )
         payload_json = json.dumps(redacted_payload, ensure_ascii=False, sort_keys=True)
@@ -1179,6 +1559,398 @@ class RunEventRepository:
             params,
         ).fetchall()
         return [_run_event_from_row(row) for row in rows]
+
+
+class PromptVersionRepository:
+    def __init__(self, connection: sqlite3.Connection):
+        self.connection = connection
+        initialize_database(connection)
+
+    def record(self, *, prompt_id: str, template_hash: str) -> PromptVersionRecord:
+        now = _now()
+        self.connection.execute(
+            """
+            INSERT INTO prompt_versions (id, template_hash, first_seen_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(id) DO NOTHING
+            """,
+            (prompt_id, template_hash, now),
+        )
+        self.connection.commit()
+        record = self.get(prompt_id)
+        if record is None:
+            raise KeyError(f"Prompt version not found after insert: {prompt_id}")
+        return record
+
+    def get(self, prompt_id: str) -> PromptVersionRecord | None:
+        row = self.connection.execute(
+            """
+            SELECT id, template_hash, first_seen_at
+            FROM prompt_versions
+            WHERE id = ?
+            """,
+            (prompt_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _prompt_version_from_row(row)
+
+    def list(self) -> list[PromptVersionRecord]:
+        rows = self.connection.execute(
+            """
+            SELECT id, template_hash, first_seen_at
+            FROM prompt_versions
+            ORDER BY first_seen_at ASC, id ASC
+            """
+        ).fetchall()
+        return [_prompt_version_from_row(row) for row in rows]
+
+
+class IdentityRepository:
+    def __init__(self, connection: sqlite3.Connection):
+        self.connection = connection
+        initialize_database(connection)
+
+    def identity_configured(self) -> bool:
+        row = self.connection.execute("SELECT 1 FROM memberships LIMIT 1").fetchone()
+        return row is not None
+
+    def create_workspace(self, *, workspace_id: str, name: str) -> WorkspaceRecord:
+        now = _now()
+        self.connection.execute(
+            """
+            INSERT INTO workspaces (id, name, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET name = excluded.name
+            """,
+            (workspace_id, name, now),
+        )
+        self.connection.commit()
+        record = self.get_workspace(workspace_id)
+        if record is None:
+            raise KeyError(f"Workspace not found after create: {workspace_id}")
+        return record
+
+    def get_workspace(self, workspace_id: str) -> WorkspaceRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM workspaces WHERE id = ?",
+            (workspace_id,),
+        ).fetchone()
+        return _workspace_from_row(row) if row is not None else None
+
+    def create_user(
+        self,
+        *,
+        user_id: str,
+        email: str = "",
+        display_name: str = "",
+    ) -> UserRecord:
+        now = _now()
+        self.connection.execute(
+            """
+            INSERT INTO users (id, email, display_name, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                email = excluded.email,
+                display_name = excluded.display_name
+            """,
+            (user_id, email, display_name, now),
+        )
+        self.connection.commit()
+        record = self.get_user(user_id)
+        if record is None:
+            raise KeyError(f"User not found after create: {user_id}")
+        return record
+
+    def get_user(self, user_id: str) -> UserRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        return _user_from_row(row) if row is not None else None
+
+    def set_membership(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str,
+        role: MembershipRole,
+    ) -> MembershipRecord:
+        self.create_user(user_id=user_id)
+        self.create_workspace(workspace_id=workspace_id, name=workspace_id)
+        now = _now()
+        self.connection.execute(
+            """
+            INSERT INTO memberships (user_id, workspace_id, role, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, workspace_id) DO UPDATE SET role = excluded.role
+            """,
+            (user_id, workspace_id, role, now),
+        )
+        self.connection.commit()
+        membership = self.get_membership(user_id=user_id, workspace_id=workspace_id)
+        if membership is None:
+            raise KeyError("Membership not found after upsert")
+        return membership
+
+    def get_membership(self, *, user_id: str, workspace_id: str) -> MembershipRecord | None:
+        row = self.connection.execute(
+            """
+            SELECT * FROM memberships
+            WHERE user_id = ? AND workspace_id = ?
+            """,
+            (user_id, workspace_id),
+        ).fetchone()
+        return _membership_from_row(row) if row is not None else None
+
+
+class AuditRepository:
+    def __init__(self, connection: sqlite3.Connection):
+        self.connection = connection
+        initialize_database(connection)
+
+    def append(
+        self,
+        *,
+        actor_id: str,
+        workspace_id: str,
+        action: str,
+        target: str,
+        payload: dict | None = None,
+        ip: str | None = None,
+        ts: datetime | str | None = None,
+    ) -> AuditEventRecord:
+        timestamp = ts.isoformat() if isinstance(ts, datetime) else (ts or _now())
+        redacted_payload = redact_json(
+            payload or {},
+            extra_secrets=_configured_secret_values(self.connection),
+        )
+        cursor = self.connection.execute(
+            """
+            INSERT INTO audit_events (actor_id, workspace_id, action, target, ts, ip, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                actor_id,
+                workspace_id,
+                action,
+                target,
+                timestamp,
+                ip,
+                json.dumps(redacted_payload, ensure_ascii=False, sort_keys=True),
+            ),
+        )
+        self.connection.commit()
+        row = self.connection.execute(
+            "SELECT * FROM audit_events WHERE id = ?",
+            (int(cursor.lastrowid),),
+        ).fetchone()
+        return _audit_event_from_row(row)
+
+    def list(
+        self,
+        *,
+        workspace_id: str,
+        cursor: int | None = None,
+        limit: int = 100,
+    ) -> list[AuditEventRecord]:
+        bounded_limit = max(0, min(int(limit), 500))
+        clauses = ["workspace_id = ?"]
+        params: list[object] = [workspace_id]
+        if cursor is not None:
+            clauses.append("id > ?")
+            params.append(cursor)
+        params.append(bounded_limit)
+        rows = self.connection.execute(
+            f"""
+            SELECT * FROM audit_events
+            WHERE {' AND '.join(clauses)}
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [_audit_event_from_row(row) for row in rows]
+
+
+class RunnerRepository:
+    def __init__(self, connection: sqlite3.Connection):
+        self.connection = connection
+        initialize_database(connection)
+
+    def issue_token(self, *, workspace_id: str, label: str) -> IssuedRunnerToken:
+        raw_token = "hrun_" + secrets.token_urlsafe(32)
+        runner_id = f"runner-{uuid.uuid4().hex[:12]}"
+        now = _now()
+        self.connection.execute(
+            """
+            INSERT INTO runner_tokens (id, workspace_id, label, token_hash, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (runner_id, workspace_id, label, _hash_token(raw_token), now),
+        )
+        self.connection.commit()
+        runner = self.get_runner(runner_id)
+        if runner is None:
+            raise KeyError(f"Runner not found after issue: {runner_id}")
+        return IssuedRunnerToken(runner=runner, token=raw_token)
+
+    def get_runner(self, runner_id: str) -> RunnerTokenRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM runner_tokens WHERE id = ?",
+            (runner_id,),
+        ).fetchone()
+        return _runner_token_from_row(row) if row is not None else None
+
+    def authenticate(self, token: str) -> RunnerTokenRecord | None:
+        row = self.connection.execute(
+            """
+            SELECT * FROM runner_tokens
+            WHERE token_hash = ? AND revoked_at IS NULL
+            """,
+            (_hash_token(token),),
+        ).fetchone()
+        return _runner_token_from_row(row) if row is not None else None
+
+    def revoke(self, runner_id: str) -> RunnerTokenRecord:
+        now = _now()
+        cursor = self.connection.execute(
+            """
+            UPDATE runner_tokens
+            SET revoked_at = COALESCE(revoked_at, ?)
+            WHERE id = ?
+            """,
+            (now, runner_id),
+        )
+        if cursor.rowcount == 0:
+            raise KeyError(f"Runner not found: {runner_id}")
+        self.connection.commit()
+        record = self.get_runner(runner_id)
+        if record is None:
+            raise KeyError(f"Runner not found after revoke: {runner_id}")
+        return record
+
+    def heartbeat(self, token: str) -> RunnerTokenRecord | None:
+        runner = self.authenticate(token)
+        if runner is None:
+            return None
+        self.connection.execute(
+            """
+            UPDATE runner_tokens
+            SET last_heartbeat_at = ?
+            WHERE id = ?
+            """,
+            (_now(), runner.id),
+        )
+        self.connection.commit()
+        return self.get_runner(runner.id)
+
+    def enqueue_job(
+        self,
+        *,
+        workspace_id: str,
+        payload: dict,
+        ticket_id: str | None = None,
+        job_id: str | None = None,
+    ) -> RunnerJobRecord:
+        now = _now()
+        job_id = job_id or f"job-{uuid.uuid4().hex[:12]}"
+        self.connection.execute(
+            """
+            INSERT INTO runner_jobs (
+                id, workspace_id, ticket_id, status, payload_json, result_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, 'queued', ?, '{}', ?, ?)
+            """,
+            (
+                job_id,
+                workspace_id,
+                ticket_id,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+        self.connection.commit()
+        record = self.get_job(job_id)
+        if record is None:
+            raise KeyError(f"Runner job not found after enqueue: {job_id}")
+        return record
+
+    def lease_next_job(self, *, runner: RunnerTokenRecord, ttl_sec: int = 300) -> RunnerJobRecord | None:
+        now_dt = datetime.now(UTC)
+        expires = now_dt + timedelta(seconds=max(1, int(ttl_sec)))
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.connection.execute(
+                """
+                SELECT * FROM runner_jobs
+                WHERE workspace_id = ? AND status IN ('queued', 'leased')
+                ORDER BY created_at ASC, id ASC
+                """,
+                (runner.workspace_id,),
+            ).fetchall()
+            for row in rows:
+                job = _runner_job_from_row(row)
+                if job.status == "leased":
+                    lease_expires = _parse_datetime(job.lease_expires_at)
+                    if lease_expires is not None and lease_expires > now_dt:
+                        continue
+                timestamp = now_dt.isoformat()
+                self.connection.execute(
+                    """
+                    UPDATE runner_jobs
+                    SET status = 'leased', lease_runner_id = ?, lease_expires_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (runner.id, expires.isoformat(), timestamp, job.id),
+                )
+                self.connection.commit()
+                return self.get_job(job.id)
+            self.connection.rollback()
+            return None
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def complete_job(
+        self,
+        *,
+        job_id: str,
+        runner: RunnerTokenRecord,
+        result: dict,
+        status: str = "terminal",
+    ) -> RunnerJobRecord:
+        now = _now()
+        cursor = self.connection.execute(
+            """
+            UPDATE runner_jobs
+            SET status = ?, result_json = ?, updated_at = ?
+            WHERE id = ? AND workspace_id = ? AND lease_runner_id = ?
+            """,
+            (
+                status,
+                json.dumps(result, ensure_ascii=False, sort_keys=True),
+                now,
+                job_id,
+                runner.workspace_id,
+                runner.id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise KeyError(f"Runner job not leased by runner: {job_id}")
+        self.connection.commit()
+        job = self.get_job(job_id)
+        if job is None:
+            raise KeyError(f"Runner job not found after complete: {job_id}")
+        return job
+
+    def get_job(self, job_id: str) -> RunnerJobRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM runner_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        return _runner_job_from_row(row) if row is not None else None
 
 
 class NotificationRepository:
@@ -1979,6 +2751,89 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _event_payload_with_contract_fields(
+    *,
+    event_type: str,
+    payload: dict,
+    ticket_id: str | None,
+    run_id: str | None,
+    ts: str,
+) -> dict:
+    enriched = dict(payload)
+    if event_type not in {"egress_attempt", "diff_scope_reject", "rollback"}:
+        return enriched
+    enriched.setdefault("kind", event_type)
+    enriched.setdefault("ticket_id", ticket_id)
+    enriched.setdefault("run_id", run_id)
+    detail = enriched.get("detail")
+    if not isinstance(detail, str) or not detail:
+        for key in ("message", "error", "reason", "command"):
+            value = enriched.get(key)
+            if isinstance(value, str) and value:
+                enriched["detail"] = value
+                break
+        else:
+            enriched["detail"] = event_type
+    enriched.setdefault("ts", ts)
+    return enriched
+
+
+def _lease_active(metadata: dict, now: datetime) -> bool:
+    expires_at = _parse_datetime(metadata.get("lease_expires_at"))
+    return expires_at is not None and expires_at > now
+
+
+def _ticket_with_lease(
+    ticket: Ticket,
+    *,
+    worker_id: str,
+    now: datetime,
+    expires_at: datetime,
+) -> Ticket:
+    ticket_json = ticket.to_dict()
+    metadata = ticket_json.setdefault("metadata", {})
+    metadata["lease_worker_id"] = worker_id
+    metadata["lease_heartbeat_at"] = now.isoformat()
+    metadata["lease_expires_at"] = expires_at.isoformat()
+    metadata["lease_ttl_sec"] = int((expires_at - now).total_seconds())
+    return Ticket.from_dict(ticket_json)
+
+
+def _ticket_dependencies(ticket: Ticket) -> list[str]:
+    dependencies: list[str] = []
+    for dependency in [*ticket.dependencies, *ticket.depends_on]:
+        if dependency not in dependencies:
+            dependencies.append(dependency)
+    return dependencies
+
+
+def _overlapping_ticket_ids(ticket: Ticket, active_tickets: list[Ticket]) -> list[str]:
+    target_files = set(ticket.task.target_files)
+    overlaps: list[str] = []
+    for active in active_tickets:
+        if active.id == ticket.id:
+            continue
+        if target_files.intersection(active.task.target_files):
+            overlaps.append(active.id)
+    return overlaps
+
+
+def _parse_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 def _next_chat_id(prefix: str) -> str:
     stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
     return f"{prefix}-{stamp}-{uuid.uuid4().hex[:8]}"
@@ -2063,6 +2918,90 @@ def _run_event_from_row(row: sqlite3.Row) -> RunEvent:
         cost_usd=row["cost_usd"],
         cost_status=row["cost_status"],
         payload=payload,
+    )
+
+
+def _prompt_version_from_row(row: sqlite3.Row) -> PromptVersionRecord:
+    return PromptVersionRecord(
+        id=row["id"],
+        template_hash=row["template_hash"],
+        first_seen_at=row["first_seen_at"],
+    )
+
+
+def _user_from_row(row: sqlite3.Row) -> UserRecord:
+    return UserRecord(
+        id=row["id"],
+        email=row["email"],
+        display_name=row["display_name"],
+        created_at=row["created_at"],
+    )
+
+
+def _workspace_from_row(row: sqlite3.Row) -> WorkspaceRecord:
+    return WorkspaceRecord(id=row["id"], name=row["name"], created_at=row["created_at"])
+
+
+def _membership_from_row(row: sqlite3.Row) -> MembershipRecord:
+    return MembershipRecord(
+        user_id=row["user_id"],
+        workspace_id=row["workspace_id"],
+        role=row["role"],
+        created_at=row["created_at"],
+    )
+
+
+def _audit_event_from_row(row: sqlite3.Row) -> AuditEventRecord:
+    payload = {}
+    try:
+        decoded = json.loads(row["payload_json"] or "{}")
+        if isinstance(decoded, dict):
+            payload = decoded
+    except json.JSONDecodeError:
+        payload = {}
+    return AuditEventRecord(
+        id=int(row["id"]),
+        actor_id=row["actor_id"],
+        workspace_id=row["workspace_id"],
+        action=row["action"],
+        target=row["target"],
+        ts=row["ts"],
+        ip=row["ip"],
+        payload=payload,
+    )
+
+
+def _runner_token_from_row(row: sqlite3.Row) -> RunnerTokenRecord:
+    return RunnerTokenRecord(
+        id=row["id"],
+        workspace_id=row["workspace_id"],
+        label=row["label"],
+        created_at=row["created_at"],
+        revoked_at=row["revoked_at"],
+        last_heartbeat_at=row["last_heartbeat_at"],
+    )
+
+
+def _runner_job_from_row(row: sqlite3.Row) -> RunnerJobRecord:
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    try:
+        result = json.loads(row["result_json"] or "{}")
+    except json.JSONDecodeError:
+        result = {}
+    return RunnerJobRecord(
+        id=row["id"],
+        workspace_id=row["workspace_id"],
+        ticket_id=row["ticket_id"],
+        status=row["status"],
+        lease_runner_id=row["lease_runner_id"],
+        lease_expires_at=row["lease_expires_at"],
+        payload=payload if isinstance(payload, dict) else {},
+        result=result if isinstance(result, dict) else {},
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from orchestrator.db.sqlite import TicketRepository
+from orchestrator.db.sqlite import RunEventRepository, TicketRepository
 from orchestrator.execution_safety import DiffScopeError, GitWorkspaceGuard
 from orchestrator.git_flow import GitTicketFlow, now_iso
 from orchestrator.models.ticket import Result, Ticket, TicketStatus
@@ -34,6 +34,7 @@ class DiffReviewService:
             self.repo_root,
             workspace_guard=self.workspace_guard,
         )
+        self.run_events = RunEventRepository(repository.connection)
 
     def approve_diff(self, ticket_id: str) -> DiffReviewResult:
         ticket = self._require_ticket(ticket_id)
@@ -46,7 +47,23 @@ class DiffReviewService:
         if not diff.strip():
             raise DiffScopeError("Ticket has no pending diff to approve")
 
-        commit = self.git_flow.approve_diff_to_branch(ticket, diff)
+        try:
+            commit = self.git_flow.approve_diff_to_branch(ticket, diff)
+        except DiffScopeError as exc:
+            self.run_events.append_run_event(
+                project_id=_ticket_project_id(ticket),
+                requirement_id=_ticket_requirement_id(ticket),
+                ticket_id=ticket.id,
+                run_id=_ticket_run_id(ticket),
+                event_type="diff_scope_reject",
+                model_id=ticket.execution.assigned_model,
+                payload={
+                    "detail": str(exc),
+                    "target_files": ticket.task.target_files,
+                    "reason": "unrelated-change attempt",
+                },
+            )
+            raise
         ticket_json = ticket.to_dict()
         metadata = ticket_json.setdefault("metadata", {})
         metadata["git_branch"] = commit.branch
@@ -88,3 +105,21 @@ class DiffReviewService:
         if ticket is None:
             raise KeyError(f"Ticket not found: {ticket_id}")
         return ticket
+
+
+def _ticket_project_id(ticket: Ticket) -> str:
+    metadata = ticket.metadata.model_dump(mode="json") if ticket.metadata else {}
+    project_id = metadata.get("project_id")
+    return project_id if isinstance(project_id, str) and project_id else "default"
+
+
+def _ticket_requirement_id(ticket: Ticket) -> str | None:
+    metadata = ticket.metadata.model_dump(mode="json") if ticket.metadata else {}
+    requirement_id = metadata.get("requirement_id")
+    return requirement_id if isinstance(requirement_id, str) and requirement_id else None
+
+
+def _ticket_run_id(ticket: Ticket) -> str | None:
+    metadata = ticket.metadata.model_dump(mode="json") if ticket.metadata else {}
+    run_id = metadata.get("last_run_id")
+    return run_id if isinstance(run_id, str) and run_id else None

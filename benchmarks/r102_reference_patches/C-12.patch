@@ -1,0 +1,54 @@
+diff --git a/src/click/_textwrap.py b/src/click/_textwrap.py
+--- a/src/click/_textwrap.py
++++ b/src/click/_textwrap.py
+@@ -2,6 +2,35 @@ import textwrap
+ import typing as t
+ from contextlib import contextmanager
+ 
++from ._compat import _ansi_re
++from ._compat import term_len
++
++
++def _truncate_visible(text: str, width: int) -> str:
++    visible = 0
++    index = 0
++    cut = 0
++    while index < len(text):
++        match = _ansi_re.match(text, index)
++        if match is not None:
++            index = match.end()
++            continue
++        visible += 1
++        index += 1
++        cut = index
++        if visible >= width:
++            break
++    return text[:cut]
++
++
++def _split_visible(text: str, width: int) -> t.Tuple[str, str]:
++    head = _truncate_visible(text, width)
++    tail = text[len(head):]
++    if tail and term_len(tail) == 0:
++        head += tail
++        tail = ""
++    return head, tail
++
+ 
+ class TextWrapper(textwrap.TextWrapper):
+     def _handle_long_word(
+@@ -15,9 +44,11 @@ class TextWrapper(textwrap.TextWrapper):
+ 
+         if self.break_long_words:
+             last = reversed_chunks[-1]
+-            cut = last[:space_left]
+-            res = last[space_left:]
++            cut, res = _split_visible(last, space_left)
+             cur_line.append(cut)
+-            reversed_chunks[-1] = res
++            if res:
++                reversed_chunks[-1] = res
++            else:
++                reversed_chunks.pop()
+         elif not cur_line:
+             cur_line.append(reversed_chunks.pop())

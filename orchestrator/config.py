@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     database_url: str = Field(default="sqlite:///./haao.sqlite3", alias="DATABASE_URL")
     claude_model: str = Field(default="claude-sonnet-4-6", alias="CLAUDE_MODEL")
     haao_api_token: str = Field(default="", alias="HAAO_API_TOKEN")
+    haao_sandbox_mode: str = Field(default="", alias="HAAO_SANDBOX_MODE")
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

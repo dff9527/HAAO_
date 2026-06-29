@@ -1,0 +1,15 @@
+diff --git a/src/marshmallow/exceptions.py b/src/marshmallow/exceptions.py
+index 0000000..0000000 100644
+--- a/src/marshmallow/exceptions.py
++++ b/src/marshmallow/exceptions.py
+@@ -35,7 +35,9 @@ class ValidationError(MarshmallowError):
+         valid_data: list[dict[str, typing.Any]] | dict[str, typing.Any] | None = None,
+         **kwargs,
+     ):
+-        self.messages = [message] if isinstance(message, (str, bytes)) else message
++        if isinstance(message, bytes):
++            message = message.decode("utf-8")
++        self.messages = [message] if isinstance(message, str) else message
+         self.field_name = field_name
+         self.data = data
+         self.valid_data = valid_data

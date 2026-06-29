@@ -25,6 +25,8 @@ LEGAL_TRANSITIONS: dict[TicketStatus, frozenset[TicketStatus]] = {
     ),
     TicketStatus.DONE: frozenset(),
     TicketStatus.BLOCKED: frozenset(),
+    TicketStatus.ABANDONED: frozenset(),
+    TicketStatus.SPLIT: frozenset(),
 }
 
 

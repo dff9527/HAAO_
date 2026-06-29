@@ -1,0 +1,57 @@
+diff --git a/src/tablib/core.py b/src/tablib/core.py
+index 4e3bb7e..99ca2a8 100644
+--- a/src/tablib/core.py
++++ b/src/tablib/core.py
+@@ -29,6 +29,12 @@ __docformat__ = 'restructuredtext'
+ 
+ 
++def normalize_header(value):
++    if isinstance(value, str):
++        return value.strip()
++    return value
++
++
+ class Row:
+     """Internal Row object. Mainly used for filtering."""
+ 
+     __slots__ = ['_row', 'tags']
+@@ -148,5 +154,7 @@ class Dataset:
+     """
+ 
++    normalize_header = staticmethod(normalize_header)
++
+     def __init__(self, *args, **kwargs):
+         self._data = list(Row(arg) for arg in args)
+         self.__headers = None
+@@ -305,8 +313,8 @@ class Dataset:
+     def _set_headers(self, collection):
+         """Validating headers setter."""
+         self._validate(collection)
+         if collection:
+-            self.__headers = list(collection)
++            self.__headers = [normalize_header(value) for value in collection]
+         else:
+             self.__headers = None
+ 
+@@ -553,7 +561,7 @@ class Dataset:
+             elif header and self.height == 0 and len(col):
+                 raise InvalidDimensions
+ 
+-            self.headers.insert(index, header)
++            self.headers.insert(index, normalize_header(header))
+ 
+         if self.height and self.width:
+ 
+diff --git a/src/tablib/formats/_csv.py b/src/tablib/formats/_csv.py
+index f67406f..bc43f23 100644
+--- a/src/tablib/formats/_csv.py
++++ b/src/tablib/formats/_csv.py
+@@ -45,7 +45,7 @@ class CSVFormat:
+             if i < skip_lines:
+                 continue
+             if i == skip_lines and headers:
+-                dset.headers = row
++                dset.headers = [dset.normalize_header(value) for value in row]
+             elif row:
+                 if i > 0 and len(row) < dset.width:
+                     row += [''] * (dset.width - len(row))

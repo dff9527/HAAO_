@@ -12,9 +12,15 @@ from typing import Protocol
 from clients.lmstudio import ChatMessage
 from orchestrator.cloud_usage import CloudUsage, apply_usage_to_requirement
 from orchestrator.config import get_settings
-from orchestrator.db.sqlite import RequirementRepository, RunEventRepository, SettingsRepository, TicketRepository
+from orchestrator.db.sqlite import (
+    PromptVersionRepository,
+    RequirementRepository,
+    RunEventRepository,
+    SettingsRepository,
+    TicketRepository,
+)
 from orchestrator.execution_resolver import resolve_execution_client
-from orchestrator.execution_safety import GitWorkspaceGuard, normalize_repo_path
+from orchestrator.execution_safety import GitWorkspaceGuard, derive_diff_stats, normalize_repo_path
 from orchestrator.model_policy import next_local_fallback_model
 from orchestrator.models.ticket import Result, Ticket, TicketStatus
 from orchestrator.runner.dod_runner import TestRunResult, TestRunner
@@ -31,6 +37,7 @@ from orchestrator.state_machine import InvalidTransitionError, TicketStateServic
 from orchestrator.notifications import NotificationService
 from orchestrator.context.injector import estimate_tokens
 from orchestrator.context.untrusted import UNTRUSTED_CONTEXT_INSTRUCTION
+from orchestrator.prompt_registry import record_prompt_version
 from orchestrator.redaction import current_known_secrets, redact_text
 
 
@@ -165,6 +172,7 @@ class ExecutionLoop:
         self.settings_repository = settings_repository
         self.requirement_repository = requirement_repository
         self.run_events = RunEventRepository(repository.connection)
+        self.prompt_versions = PromptVersionRepository(repository.connection)
         self._active_run_context: ActiveRunContext | None = None
         if max_output_tokens < 1:
             raise ValueError("max_output_tokens must be positive")
@@ -188,7 +196,12 @@ class ExecutionLoop:
                 run_id=run_id,
             )
             self._active_run_context = run_context
-            ticket = self._mark_run_context(ticket, run_context)
+            reasoner_prompt_version = self._record_execution_prompt_version()
+            ticket = self._mark_run_context(
+                ticket,
+                run_context,
+                reasoner_prompt_version=reasoner_prompt_version,
+            )
             self.run_events.append_run_event(
                 project_id=project_id,
                 requirement_id=requirement_id,
@@ -196,7 +209,11 @@ class ExecutionLoop:
                 run_id=run_id,
                 event_type="run_started",
                 model_id=ticket.execution.assigned_model,
-                payload={"status": ticket.status},
+                payload={
+                    "status": ticket.status,
+                    "model_id": ticket.execution.assigned_model,
+                    "reasoner_prompt_version": reasoner_prompt_version,
+                },
             )
             with self.workspace_guard.worktree_for_ticket(ticket.id) as worktree_root:
                 execution_registry.set_worktree(registry_key, worktree_root)
@@ -260,7 +277,7 @@ class ExecutionLoop:
         while True:
             self._check_cancelled(registry_key)
             if ticket.execution.attempts > 0:
-                self.workspace_guard.reset_worktree(worktree_root)
+                self._reset_worktree_with_event(worktree_root, ticket, reason="retry")
                 self.repository.append_log(ticket.id, "Reset ticket worktree before retry")
 
             # The persisted ticket contains the dispatch-time snapshot. Refresh
@@ -400,7 +417,7 @@ class ExecutionLoop:
                 if fallback_ticket is not None:
                     ticket = fallback_ticket
                     self.repository.append_log(ticket.id, str(write_error), level="error")
-                    self.workspace_guard.reset_worktree(worktree_root)
+                    self._reset_worktree_with_event(worktree_root, ticket, reason="write_error")
                     continue
                 failed = self.state_service.record_test_failure(ticket.id)
                 ticket = failed.ticket
@@ -410,7 +427,7 @@ class ExecutionLoop:
                     self._notify_intervention(ticket, "ticket_blocked")
                     return ExecutionResult(ticket=ticket, passed=False, escalated=True)
                 self._record_retry(ticket, "write_error")
-                self.workspace_guard.reset_worktree(worktree_root)
+                self._reset_worktree_with_event(worktree_root, ticket, reason="write_error_retry")
                 continue
 
             if is_unverified_ticket(ticket):
@@ -453,7 +470,7 @@ class ExecutionLoop:
             fallback_ticket = self._fallback_after_budget_exhausted(ticket)
             if fallback_ticket is not None:
                 ticket = fallback_ticket
-                self.workspace_guard.reset_worktree(worktree_root)
+                self._reset_worktree_with_event(worktree_root, ticket, reason="dod_failed_fallback")
                 continue
             failed = self.state_service.record_test_failure(ticket.id)
             ticket = failed.ticket
@@ -463,7 +480,7 @@ class ExecutionLoop:
                 self._notify_intervention(ticket, "ticket_blocked")
                 return ExecutionResult(ticket=ticket, passed=False, escalated=True)
             self._record_retry(ticket, "dod_failed")
-            self.workspace_guard.reset_worktree(worktree_root)
+            self._reset_worktree_with_event(worktree_root, ticket, reason="dod_failed_retry")
             continue
 
     def _fallback_after_budget_exhausted(self, ticket: Ticket) -> Ticket | None:
@@ -508,12 +525,33 @@ class ExecutionLoop:
         )
         return updated
 
-    def _mark_run_context(self, ticket: Ticket, context: ActiveRunContext) -> Ticket:
+    def _mark_run_context(
+        self,
+        ticket: Ticket,
+        context: ActiveRunContext,
+        *,
+        reasoner_prompt_version: str,
+    ) -> Ticket:
         ticket_json = ticket.to_dict()
         metadata = ticket_json.setdefault("metadata", {})
         metadata["last_run_id"] = context.run_id
         metadata["last_run_started_at"] = now_iso()
+        metadata["last_run_model_id"] = ticket.execution.assigned_model
+        metadata["reasoner_prompt_version"] = reasoner_prompt_version
         return self.repository.save(Ticket.from_dict(ticket_json))
+
+    def _record_execution_prompt_version(self) -> str:
+        template_source = "\n\n".join(
+            [
+                inspect.getsource(build_file_rewrite_prompt),
+                inspect.getsource(build_file_patch_prompt),
+            ]
+        )
+        return record_prompt_version(
+            self.prompt_versions,
+            name="coder-execution-prompt",
+            template=template_source,
+        )
 
     def _append_activity_event(
         self,
@@ -577,6 +615,7 @@ class ExecutionLoop:
                 "edit_mode": edit_mode,
                 "max_tokens": max_tokens,
                 "used_cloud_usage": usage.total_tokens > 0,
+                "reasoner_prompt_version": self._current_prompt_version(ticket),
             },
         )
 
@@ -685,10 +724,31 @@ class ExecutionLoop:
         ticket_json["result"] = Result(
             outcome=outcome,
             diff=redact_text(diff, extra_secrets=extra_secrets),
+            diff_stats=derive_diff_stats(diff, ticket.task.target_files),
             test_output=redact_text(test_output, extra_secrets=extra_secrets),
             logs=existing_logs,
         ).model_dump(mode="json", exclude_none=True)
         return self.repository.save(Ticket.from_dict(ticket_json))
+
+    def _reset_worktree_with_event(self, worktree_root: Path, ticket: Ticket, *, reason: str) -> None:
+        was_dirty = _is_git_dirty(worktree_root)
+        self.workspace_guard.reset_worktree(worktree_root)
+        if not was_dirty:
+            return
+        self._append_activity_event(
+            ticket,
+            "rollback",
+            payload={
+                "reason": reason,
+                "detail": f"Rolled back dirty ticket worktree before {reason}",
+            },
+            model_id=ticket.execution.assigned_model,
+        )
+
+    def _current_prompt_version(self, ticket: Ticket) -> str | None:
+        metadata = ticket.metadata.model_dump(mode="json") if ticket.metadata else {}
+        value = metadata.get("reasoner_prompt_version")
+        return value if isinstance(value, str) else None
 
     def _require_ticket(self, ticket_id: str) -> Ticket:
         ticket = self.repository.get(ticket_id)
@@ -720,11 +780,13 @@ class ExecutionLoop:
         run_id = context.run_id if context else None
         payload = {
             "stage": "sandbox",
+            "kind": audit.event_type,
             "reason": audit.reason,
             "command": audit.command,
             "primitive": audit.primitive,
             "blocked": audit.blocked,
             "message": audit.message,
+            "detail": audit.message or audit.reason or audit.command,
         }
         if audit.event_type == "egress_attempt":
             payload["destination"] = "network"
@@ -1082,6 +1144,19 @@ def git_diff(repo_root: Path, target_files: list[str]) -> str:
     if completed.returncode != 0:
         return completed.stderr.strip()
     return completed.stdout
+
+
+def _is_git_dirty(repo_root: Path) -> bool:
+    completed = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    if completed.returncode != 0:
+        return False
+    return bool(completed.stdout.strip())
 
 
 def format_test_results(results: list[TestRunResult]) -> str:

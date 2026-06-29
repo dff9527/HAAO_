@@ -6,8 +6,11 @@ import {
 } from 'lucide-react';
 import { getModelMeta, MANUAL_STATUS_TRANSITIONS, TYPE_CLASSES } from '../constants';
 import { STATE_COPY } from '../copy';
+import { workerDisplayNumber } from '../throughputUtils';
 import { InterventionNotice, interventionNoticeForTicket } from './InterventionNotice';
 import { PrLinkBadge } from './PrLinkBadge';
+import { DiffScopeBadge } from './DiffScopeBadge';
+import { SplitLineageMarker } from './SplitLineageMarker';
 import type { Ticket } from '../types';
 
 const PRIORITY_DOT: Record<string, string> = {
@@ -22,9 +25,10 @@ interface Props {
   onClick: () => void;
   onApprove: (id: string) => void;
   onAccept: (id: string) => void;
+  onOpenTicket?: (id: string) => void;
 }
 
-export function TicketCard({ ticket, isSelected, onClick, onApprove, onAccept }: Props) {
+export function TicketCard({ ticket, isSelected, onClick, onApprove, onAccept, onOpenTicket }: Props) {
   const ref = useRef<HTMLDivElement>(null);
 
   // Only cards whose status has an allowed manual transition can be dragged.
@@ -42,6 +46,9 @@ export function TicketCard({ ticket, isSelected, onClick, onApprove, onAccept }:
 
   const model = getModelMeta(ticket.assignedModel);
   const isDone = ticket.status === 'Done';
+  const isAbandoned = ticket.status === 'Abandoned';
+  const isSplit = ticket.status === 'Split';
+  const isTerminal = isDone || isAbandoned || isSplit;
   const isBlocked = ticket.status === 'Blocked';
   const isInProgress = ticket.status === 'In Progress';
   const isReady = ticket.status === 'Ready';
@@ -70,7 +77,7 @@ export function TicketCard({ ticket, isSelected, onClick, onApprove, onAccept }:
       className={`
         group relative bg-card border border-border rounded-lg px-3 py-2.5 select-none
         transition-shadow hover:shadow-sm
-        ${isDone ? 'opacity-60' : ''}
+        ${isTerminal ? 'opacity-60' : ''}
         ${isBlocked ? 'border-red-200 dark:border-red-900' : ''}
         ${isSelected ? 'ring-1 ring-primary' : ''}
       `}
@@ -101,7 +108,7 @@ export function TicketCard({ ticket, isSelected, onClick, onApprove, onAccept }:
       </div>
 
       {/* Title */}
-      <p className={`text-sm leading-snug mb-2 ${isDone ? 'line-through text-muted-foreground' : 'text-foreground'}`}>
+      <p className={`text-sm leading-snug mb-2 ${isTerminal ? 'line-through text-muted-foreground' : 'text-foreground'}`}>
         {ticket.title}
         {ticket.isNew && (
           <span className="ml-1.5 text-[10px] px-1 py-0 rounded bg-emerald-50 text-emerald-600 dark:bg-emerald-950 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800 font-medium normal-case no-underline">
@@ -109,6 +116,55 @@ export function TicketCard({ ticket, isSelected, onClick, onApprove, onAccept }:
           </span>
         )}
       </p>
+
+      {ticket.splitFrom && (
+        <div className="mb-2" onClick={(e) => e.stopPropagation()}>
+          <SplitLineageMarker
+            parentId={ticket.splitFrom}
+            onClick={onOpenTicket ? () => onOpenTicket(ticket.splitFrom!) : undefined}
+          />
+        </div>
+      )}
+
+      {isAbandoned && ticket.abandonReason && (
+        <div className="mb-2 text-[11px] text-muted-foreground">
+          Abandoned{ticket.abandonedAt ? ` · ${new Date(ticket.abandonedAt).toLocaleString()}` : ''}: {ticket.abandonReason}
+        </div>
+      )}
+
+      {isSplit && ticket.childTicketIds && ticket.childTicketIds.length > 0 && (
+        <div className="mb-2 flex flex-wrap gap-1" onClick={(e) => e.stopPropagation()}>
+          {ticket.childTicketIds.map((childId) => (
+            <button
+              key={childId}
+              type="button"
+              onClick={() => onOpenTicket?.(childId)}
+              className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-violet-200 dark:border-violet-800 text-violet-700 dark:text-violet-300 hover:bg-violet-50 dark:hover:bg-violet-950"
+            >
+              → {childId}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {ticket.diffStats && (
+        <div className="mb-2">
+          <DiffScopeBadge stats={ticket.diffStats} compact />
+        </div>
+      )}
+
+      {ticket.lease && (isInProgress || ticket.testStatus === 'testing') && (
+        <div className="mb-2 text-[11px] text-blue-700 dark:text-blue-300 font-mono">
+          Running on worker {workerDisplayNumber(ticket.lease.workerId)}
+        </div>
+      )}
+
+      {ticket.conflictNote && (
+        <div className="mb-2 flex items-start gap-1 text-[11px] text-amber-700 dark:text-amber-300">
+          <AlertTriangle size={11} className="shrink-0 mt-0.5" />
+          <span>{ticket.conflictNote}</span>
+        </div>
+      )}
 
       {/* Rejection feedback lives in the detail panel — keep the card compact
           with just a one-line hint that feedback exists. */}
@@ -237,6 +293,16 @@ export function TicketCard({ ticket, isSelected, onClick, onApprove, onAccept }:
           {ticket.testStatus === 'fail' && (
             <span className="flex items-center gap-0.5 text-[11px] text-red-600 dark:text-red-400">
               <XCircle size={11} /> failed
+            </span>
+          )}
+          {isAbandoned && (
+            <span className="text-[10px] px-1 py-0 rounded font-medium bg-zinc-100 text-zinc-600 dark:bg-zinc-900 dark:text-zinc-400">
+              abandoned
+            </span>
+          )}
+          {isSplit && (
+            <span className="text-[10px] px-1 py-0 rounded font-medium bg-violet-50 text-violet-700 dark:bg-violet-950 dark:text-violet-300">
+              superseded
             </span>
           )}
           {isBlocked && (

@@ -1,0 +1,23 @@
+diff --git a/src/tablib/formats/_html.py b/src/tablib/formats/_html.py
+--- a/src/tablib/formats/_html.py
++++ b/src/tablib/formats/_html.py
+@@ -98,6 +98,12 @@ class TablibHTMLParser(HTMLParser):
+         elif tag == 'thead':
+             self.thead_open = False
+             self.dset.headers = self.headers
++        elif (
++            tag == 'tr' and self.headers and self.dset.headers is None
++            and not self.thead_open
++        ):
++            self.dset.headers = self.headers
++            self.headers = []
+         elif tag == 'tr' and self.current_row:
+             self.dset.append(self.current_row)
+             self.current_row = []
+@@ -104,5 +110,5 @@ class TablibHTMLParser(HTMLParser):
+         elif tag in ['td', 'th']:
+-            if self.thead_open:
++            if self.thead_open or tag == 'th':
+                 self.headers.append(self.current_data)
+             else:
+                 self.current_row.append(self.current_data)

@@ -1,0 +1,12 @@
+diff --git a/src/click/types.py b/src/click/types.py
+index 195d0d2..24ca113 100644
+--- a/src/click/types.py
++++ b/src/click/types.py
+@@ -865,6 +865,7 @@ class Path(ParamType):
+         is_dash = self.file_okay and self.allow_dash and rv in (b"-", "-")
+ 
+         if not is_dash:
++            rv = os.path.normpath(os.path.expanduser(rv))
+             if self.resolve_path:
+                 # os.path.realpath doesn't resolve symlinks on Windows
+                 # until Python 3.8. Use pathlib for now.

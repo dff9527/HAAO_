@@ -7,7 +7,16 @@ export type TicketStatus =
   | 'Review'
   | 'Awaiting acceptance'
   | 'Done'
-  | 'Blocked';
+  | 'Blocked'
+  | 'Abandoned'
+  | 'Split';
+
+export interface DiffStats {
+  files_touched: number;
+  lines_added: number;
+  lines_removed: number;
+  out_of_scope_files: string[];
+}
 export type TestStatus = 'none' | 'testing' | 'pass' | 'fail';
 export type LogLevel = 'info' | 'warn' | 'error' | 'success';
 export type AssignedModel = string;
@@ -142,7 +151,37 @@ export interface Ticket {
   prUrl?: string;                  // Open PR link (never includes token)
   prStatus?: string;               // opened | updated | …
   lastInterventionNotification?: InterventionNotification;
+  // Wave 5 — recovery lineage + patch safety + provenance
+  childTicketIds?: string[];
+  splitFrom?: string;
+  splitFeedback?: string;
+  splitAt?: string;
+  abandonReason?: string;
+  abandonedAt?: string;
+  diffStats?: DiffStats;
+  reasonerPromptVersion?: string;
+  lastRunModelId?: string;
+  // Wave 7 — throughput: deps, lease, scheduling
+  dependsOn?: string[];
+  lease?: TicketLease;
+  readyState?: TicketReadyState;
+  conflictNote?: string;
+  graphReady?: boolean;
+  graphBlocked?: boolean;
 }
+
+export interface TicketLease {
+  workerId: string;
+  expiresAt?: string;
+  heartbeatAt?: string;
+}
+
+export type TicketReadyState =
+  | 'ready'
+  | 'waiting_dependencies'
+  | 'conflict'
+  | 'not_ready'
+  | 'terminal';
 
 export interface InterventionNotification {
   ticketId: string;

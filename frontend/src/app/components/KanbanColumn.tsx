@@ -75,6 +75,12 @@ function columnSublabel(columnStatus: TicketStatus, tickets: Ticket[]): string |
     if (hasDiff) return STATE_COPY.diff.columnSublabel;
     return 'Automated review in progress';
   }
+  if (columnStatus === 'Done') {
+    const hasAbandoned = tickets.some((t) => t.status === 'Abandoned');
+    const hasSplit = tickets.some((t) => t.status === 'Split');
+    if (hasAbandoned || hasSplit) return 'Done, abandoned, and superseded';
+    return 'Completed work';
+  }
   return undefined;
 }
 
@@ -91,7 +97,7 @@ function emptyHint(columnStatus: TicketStatus): string {
     case 'Awaiting acceptance':
       return 'You decide when work is complete.';
     case 'Done':
-      return 'Completed tickets appear here.';
+      return 'Completed, abandoned, and superseded tickets.';
     default:
       return 'Empty';
   }
@@ -202,6 +208,7 @@ export function KanbanColumn({
             onClick={() => onSelectTicket(ticket.id)}
             onApprove={onApproveTicket}
             onAccept={onAcceptTicket}
+            onOpenTicket={onSelectTicket}
           />
         ))}
         {!loading && tickets.length === 0 && (

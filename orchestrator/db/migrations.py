@@ -28,6 +28,8 @@ def run_migrations(connection: sqlite3.Connection) -> None:
 def ensure_schema_compatibility(connection: sqlite3.Connection) -> None:
     _ensure_projects_table(connection)
     _ensure_foundational_contract_tables(connection)
+    _ensure_prompt_versions_table(connection)
+    _ensure_team_plane_tables(connection)
     _ensure_notifications_table(connection)
     _ensure_eval_runs_table(connection)
     _ensure_requirement_templates_table(connection)
@@ -94,6 +96,15 @@ def migrate_eval_runs_table(connection: sqlite3.Connection) -> None:
 
 def migrate_requirement_templates_table(connection: sqlite3.Connection) -> None:
     _ensure_requirement_templates_table(connection)
+
+
+def migrate_wave5_trust_tables(connection: sqlite3.Connection) -> None:
+    _ensure_foundational_contract_tables(connection)
+    _ensure_prompt_versions_table(connection)
+
+
+def migrate_wave6_team_plane_tables(connection: sqlite3.Connection) -> None:
+    _ensure_team_plane_tables(connection)
 
 
 def _ensure_chat_tables(connection: sqlite3.Connection) -> None:
@@ -171,6 +182,9 @@ def _ensure_foundational_contract_tables(connection: sqlite3.Connection) -> None
                     'retry',
                     'escalation',
                     'egress_attempt',
+                    'diff_scope_reject',
+                    'rollback',
+                    'conflict',
                     'report',
                     'run_finished',
                     'error'
@@ -202,6 +216,7 @@ def _ensure_foundational_contract_tables(connection: sqlite3.Connection) -> None
         );
         """
     )
+    _rebuild_run_events_for_wave5_event_types(connection)
 
 
 def _ensure_notifications_table(connection: sqlite3.Connection) -> None:
@@ -224,6 +239,163 @@ def _ensure_notifications_table(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_notifications_unread
         ON notifications(project_id, read_at);
+        """
+    )
+
+
+def _ensure_prompt_versions_table(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS prompt_versions (
+            id TEXT PRIMARY KEY,
+            template_hash TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_prompt_versions_hash
+        ON prompt_versions(template_hash);
+        """
+    )
+
+
+def _ensure_team_plane_tables(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL DEFAULT '',
+            display_name TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS workspaces (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS memberships (
+            user_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member', 'viewer')),
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, workspace_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memberships_workspace
+        ON memberships(workspace_id, user_id);
+
+        CREATE TABLE IF NOT EXISTS audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            ip TEXT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_audit_events_workspace_id
+        ON audit_events(workspace_id, id);
+
+        CREATE TABLE IF NOT EXISTS runner_tokens (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            label TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            revoked_at TEXT NULL,
+            last_heartbeat_at TEXT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_runner_tokens_workspace
+        ON runner_tokens(workspace_id, id);
+
+        CREATE TABLE IF NOT EXISTS runner_jobs (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            ticket_id TEXT NULL,
+            status TEXT NOT NULL CHECK (status IN ('queued', 'leased', 'running', 'terminal')),
+            lease_runner_id TEXT NULL,
+            lease_expires_at TEXT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            result_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_runner_jobs_workspace_status
+        ON runner_jobs(workspace_id, status, created_at, id);
+        """
+    )
+
+
+def _rebuild_run_events_for_wave5_event_types(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'run_events'"
+    ).fetchone()
+    if row is None:
+        return
+    sql = row["sql"] or ""
+    if "diff_scope_reject" in sql and "rollback" in sql and "conflict" in sql:
+        return
+
+    connection.execute("ALTER TABLE run_events RENAME TO run_events_old")
+    connection.execute(
+        """
+        CREATE TABLE run_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT NOT NULL,
+            requirement_id TEXT NULL,
+            ticket_id TEXT NULL,
+            run_id TEXT NULL,
+            event_type TEXT NOT NULL CHECK (
+                event_type IN (
+                    'run_started',
+                    'model_call',
+                    'diff_produced',
+                    'dod_check',
+                    'retry',
+                    'escalation',
+                    'egress_attempt',
+                    'diff_scope_reject',
+                    'rollback',
+                    'conflict',
+                    'report',
+                    'run_finished',
+                    'error'
+                )
+            ),
+            ts TEXT NOT NULL,
+            model_id TEXT NULL,
+            input_tokens INTEGER NULL,
+            output_tokens INTEGER NULL,
+            cost_usd REAL NULL,
+            cost_status TEXT NULL CHECK (
+                cost_status IS NULL OR cost_status IN ('actual', 'estimated', 'unknown')
+            ),
+            payload_json TEXT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO run_events (
+            id, project_id, requirement_id, ticket_id, run_id, event_type, ts,
+            model_id, input_tokens, output_tokens, cost_usd, cost_status, payload_json
+        )
+        SELECT
+            id, project_id, requirement_id, ticket_id, run_id, event_type, ts,
+            model_id, input_tokens, output_tokens, cost_usd, cost_status, payload_json
+        FROM run_events_old
+        """
+    )
+    connection.execute("DROP TABLE run_events_old")
+    connection.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_run_events_project_id
+        ON run_events(project_id, id);
         """
     )
 
@@ -474,6 +646,8 @@ MIGRATIONS: list[Migration] = [
     migrate_project_execution_policy,
     migrate_eval_runs_table,
     migrate_requirement_templates_table,
+    migrate_wave5_trust_tables,
+    migrate_wave6_team_plane_tables,
 ]
 
 

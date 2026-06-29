@@ -17,6 +17,8 @@ import { apiClient } from '../api/client';
 import type { ChatAttachment, ChatMessage, RequirementSource, Ticket } from '../types';
 import { HelpTip } from './HelpTip';
 import { HELP_TOOLTIPS } from '../dxUtils';
+import { ACTION_DISCLOSURES } from '../trustUtils';
+import { ActionDisclosure } from './ActionDisclosure';
 
 export type ChatLayoutMode = 'balanced' | 'rail' | 'hidden';
 
@@ -420,6 +422,9 @@ export function ChatPanel({
           {chatReasonerMode === 'cloud' ? <Cloud size={10} /> : <HardDrive size={10} />}
           {chatReasonerMode === 'cloud' ? 'Cloud' : 'Local'}
         </button>
+        {chatReasonerMode === 'cloud' && !isRail && (
+          <ActionDisclosure text={ACTION_DISCLOSURES.cloud_reasoner} />
+        )}
         <button
           type="button"
           onClick={isRail ? onCollapse : onCollapse}
@@ -477,9 +482,9 @@ export function ChatPanel({
           </div>
         )}
         {!isRail && showImageNotice && (
-          <p className="text-[11px] rounded-md border border-amber-200 bg-amber-50/80 px-2 py-1.5 text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
-            Images are analysed by the cloud Tech Lead.
-          </p>
+          <div className="px-1">
+            <ActionDisclosure text={ACTION_DISCLOSURES.image_local} />
+          </div>
         )}
         <div className="flex items-end gap-1.5">
           {!isRail && (

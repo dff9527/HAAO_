@@ -12,11 +12,18 @@ from orchestrator.attachments import build_attachment_context
 from orchestrator.cloud_usage import CloudUsage, apply_usage_to_requirement
 from orchestrator.context.repo_context import build_enriched_repo_context
 from orchestrator.context.scope import validate_scope_paths
-from orchestrator.db.sqlite import RequirementRepository, SettingsRepository, TicketRepository
+from clients.cloud_reasoner import load_prompt
+from orchestrator.db.sqlite import (
+    PromptVersionRepository,
+    RequirementRepository,
+    SettingsRepository,
+    TicketRepository,
+)
 from orchestrator.model_instructions import tech_lead_additional_instructions
 from orchestrator.model_policy import enforce_local_execution_model
 from orchestrator.models.requirement import Requirement, RequirementStatus
 from orchestrator.models.ticket import Ticket
+from orchestrator.prompt_registry import record_prompt_version
 
 
 class Decomposer(Protocol):
@@ -76,6 +83,7 @@ class RequirementService:
         self.project_id = project_id or getattr(ticket_repository, "project_id", None) or "default"
         self.context_injector = context_injector or ContextInjector(self.repo_root)
         self.settings_repository = settings_repository
+        self.prompt_versions = PromptVersionRepository(ticket_repository.connection)
 
     def decompose_preview(self, requirement: Requirement) -> RequirementPreviewResult:
         if not requirement.prompt.strip():
@@ -99,6 +107,11 @@ class RequirementService:
         repo_conventions = detect_conventions(self.repo_root)
         if test_command and f"Preferred test command override: {test_command}" not in repo_conventions:
             repo_conventions = f"{repo_conventions}\n- Preferred test command override: {test_command}"
+        reasoner_prompt_version = record_prompt_version(
+            self.prompt_versions,
+            name="tech-lead-decompose",
+            template=load_prompt("decompose.txt"),
+        )
         ticket_dicts = _call_decomposer(
             self.decomposer,
             stored.prompt,
@@ -125,6 +138,7 @@ class RequirementService:
             ticket_dict["status"] = "backlog"
             enforce_local_execution_model(ticket_dict, repository=self.settings_repository)
             _merge_requirement_guidance(ticket_dict, stored, persisted=False)
+            ticket_dict.setdefault("metadata", {})["reasoner_prompt_version"] = reasoner_prompt_version
             ticket = self.context_injector.inject(Ticket.from_dict(ticket_dict))
             proposed_tickets.append(ticket)
 
@@ -242,11 +256,18 @@ class RequirementService:
 
         for payload in renumbered:
             dependencies = payload.get("dependencies")
-            if isinstance(dependencies, list):
-                payload["dependencies"] = [
-                    id_map.get(dependency, dependency)
-                    for dependency in dependencies
-                ]
+            depends_on = payload.get("depends_on")
+            merged = []
+            for dependency in [
+                *(dependencies if isinstance(dependencies, list) else []),
+                *(depends_on if isinstance(depends_on, list) else []),
+            ]:
+                mapped = id_map.get(dependency, dependency)
+                if mapped not in merged:
+                    merged.append(mapped)
+            if merged:
+                payload["dependencies"] = merged
+                payload["depends_on"] = merged
 
         return renumbered
 

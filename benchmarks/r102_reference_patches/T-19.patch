@@ -1,0 +1,11 @@
+diff --git a/src/tablib/formats/_yaml.py b/src/tablib/formats/_yaml.py
+--- a/src/tablib/formats/_yaml.py
++++ b/src/tablib/formats/_yaml.py
+@@ -52,6 +52,5 @@ class YAMLFormat:
+                 return True
+             else:
+                 return False
+-        except (yaml.parser.ParserError, yaml.reader.ReaderError,
+-                yaml.scanner.ScannerError):
++        except yaml.YAMLError:
+             return False

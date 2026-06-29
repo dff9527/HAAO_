@@ -1,0 +1,14 @@
+diff --git a/src/click/types.py b/src/click/types.py
+index 195d0d2..65d48ce 100644
+--- a/src/click/types.py
++++ b/src/click/types.py
+@@ -429,6 +429,9 @@ class _NumberRangeBase(_NumberParamTypeBase):
+         max_open: bool = False,
+         clamp: bool = False,
+     ) -> None:
++        if min is not None and max is not None and min > max:
++            raise ValueError("minimum cannot be greater than maximum")
++
+         self.min = min
+         self.max = max
+         self.min_open = min_open

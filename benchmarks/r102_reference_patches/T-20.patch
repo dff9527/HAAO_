@@ -1,0 +1,13 @@
+diff --git a/src/tablib/formats/_json.py b/src/tablib/formats/_json.py
+--- a/src/tablib/formats/_json.py
++++ b/src/tablib/formats/_json.py
+@@ -56,7 +56,7 @@ class JSONFormat:
+     def detect(cls, stream):
+         """Returns True if given stream is valid JSON."""
+         try:
+-            json.load(stream)
+-            return True
++            payload = json.load(stream)
++            return isinstance(payload, list)
+         except (TypeError, ValueError):
+             return False

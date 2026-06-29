@@ -1,0 +1,17 @@
+diff --git a/src/marshmallow/fields.py b/src/marshmallow/fields.py
+index dc3d8120..bf057a65 100644
+--- a/src/marshmallow/fields.py
++++ b/src/marshmallow/fields.py
+@@ -1059,6 +1059,12 @@ class Float(Number[float]):
+         self.allow_nan = allow_nan
+         super().__init__(as_string=as_string, **kwargs)
+ 
++    def _to_string(self, value: float) -> str:
++        text = format(value, ".15g")
++        if "e" not in text and "." in text:
++            text = text.rstrip("0").rstrip(".")
++        return text
++
+     def _validated(self, value: typing.Any) -> float:
+         num = super()._validated(value)
+         if self.allow_nan is False:

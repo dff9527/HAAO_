@@ -1,0 +1,14 @@
+diff --git a/src/marshmallow/validate.py b/src/marshmallow/validate.py
+index 0000000..0000000 100644
+--- a/src/marshmallow/validate.py
++++ b/src/marshmallow/validate.py
+@@ -336,6 +336,9 @@ class Range(Validator):
+         max_inclusive: bool = True,
+         error: str | None = None,
+     ):
++        if min is not None and max is not None and min > max:
++            raise ValueError("minimum cannot be greater than maximum")
++
+         self.min = min
+         self.max = max
+         self.error = error

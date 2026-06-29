@@ -1,0 +1,14 @@
+diff --git a/src/tablib/formats/_latex.py b/src/tablib/formats/_latex.py
+--- a/src/tablib/formats/_latex.py
++++ b/src/tablib/formats/_latex.py
+@@ -117,6 +117,8 @@ class LATEXFormat:
+         :param row: single dataset row
+         """
+ 
+-        new_row = [cls._escape_tex_reserved_symbols(str(item)) if item else ''
+-                   for item in row]
++        new_row = [
++            cls._escape_tex_reserved_symbols(str(item)) if item is not None else ''
++            for item in row
++        ]
+         return 6 * ' ' + ' & '.join(new_row) + ' \\\\'

@@ -1,0 +1,42 @@
+diff --git a/src/tablib/formats/_xls.py b/src/tablib/formats/_xls.py
+--- a/src/tablib/formats/_xls.py
++++ b/src/tablib/formats/_xls.py
+@@ -1,6 +1,7 @@
+ """ Tablib - XLS Support.
+ """
+ import datetime
++import re
+ from io import BytesIO
+ 
+ import xlrd
+@@ -16,6 +17,12 @@ datetime_style = xlwt.easyxf(num_format_str='M/D/YY h:mm')
+ date_style = xlwt.easyxf(num_format_str='M/D/YY')
+ time_style = xlwt.easyxf(num_format_str='h:mm:ss')
+ 
++INVALID_TITLE_REGEX = re.compile(r'[\\*?:/\[\]]')
++
++
++def safe_xls_sheet_title(title, replace='-'):
++    return re.sub(INVALID_TITLE_REGEX, replace, title)[:31]
++
+ 
+ class XLSFormat:
+     title = 'xls'
+@@ -47,4 +54,7 @@ class XLSFormat:
+         wb = xlwt.Workbook(encoding='utf8')
+-        ws = wb.add_sheet(dataset.title if dataset.title else 'Tablib Dataset')
++        ws = wb.add_sheet(
++            safe_xls_sheet_title(dataset.title)
++            if dataset.title else 'Tablib Dataset'
++        )
+ 
+         cls.dset_sheet(dataset, ws)
+@@ -61,5 +71,7 @@ class XLSFormat:
+ 
+         for i, dset in enumerate(databook._datasets):
+-            ws = wb.add_sheet(dset.title if dset.title else f"Sheet{i}")
++            ws = wb.add_sheet(
++                safe_xls_sheet_title(dset.title) if dset.title else f"Sheet{i}"
++            )
+ 
+             cls.dset_sheet(dset, ws)

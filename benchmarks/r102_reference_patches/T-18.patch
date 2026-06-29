@@ -1,0 +1,15 @@
+diff --git a/src/tablib/formats/_json.py b/src/tablib/formats/_json.py
+--- a/src/tablib/formats/_json.py
++++ b/src/tablib/formats/_json.py
+@@ -11,8 +11,10 @@ def serialize_objects_handler(obj):
+     if isinstance(obj, (decimal.Decimal, UUID)):
+         return str(obj)
+     elif hasattr(obj, 'isoformat'):
+         return obj.isoformat()
+     else:
+-        return obj
++        raise TypeError(
++            f'Object of type {type(obj).__name__} is not JSON serializable'
++        )
+ 
+ 

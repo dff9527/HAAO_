@@ -7,6 +7,7 @@ import { NavSidebar } from './components/NavSidebar';
 import { KanbanBoard } from './components/KanbanBoard';
 import { ChatPanel, type ChatLayoutMode } from './components/ChatPanel';
 import { BoardToolbar } from './components/BoardToolbar';
+import { DependencyGraphPanel } from './components/DependencyGraphPanel';
 import { TicketDetail } from './components/TicketDetail';
 import { RequirementComposer } from './components/RequirementComposer';
 import { RequirementSummaryModal } from './components/RequirementSummaryModal';
@@ -17,6 +18,7 @@ import { ModelsPage } from './components/ModelsPage';
 import { ActivityPage } from './components/ActivityPage';
 import { InsightsPage } from './components/InsightsPage';
 import { InboxPage } from './components/InboxPage';
+import { DecisionCenterPage } from './components/DecisionCenterPage';
 import { OnboardingWizard } from './components/OnboardingWizard';
 import { RequirementsPage } from './components/RequirementsPage';
 import { INITIAL_MODEL_CONFIGS, INITIAL_ROLE_ROUTES } from './data/modelsData';
@@ -25,9 +27,13 @@ import type { AssignedModel, ChatMessage, CloudModel, ModelConfig, Project, Requ
 import type { Page } from './components/NavSidebar';
 import { apiClient, type AutoWorkerStatus, type CloudReasonerConfig, type IntegrationCredential } from './api/client';
 import { roleRoutingToRoutes, routesToRoleRouting, devTeamChainFromRouting, toBackendStatus, toUiProject, toUiTicket, toUiRequirement } from './api/adapter';
-import type { BackendLocalModelEndpoint, BackendManualTicketCreateRequest, BackendTicket, InboxUnreadCount } from './api/types';
+import type { BackendLocalModelEndpoint, BackendManualTicketCreateRequest, BackendTicket, InboxUnreadCount, TicketGraphPayload, IdentityContext } from './api/types';
+import { buildMockGraph, mergeGraphIntoTickets, MOCK_WORKER_STATUS } from './throughputUtils';
 import { MOCK_INBOX_UNREAD_COUNT } from './inboxUtils';
 import { ONBOARDING_DISMISSED_KEY } from './dxUtils';
+import { MOCK_DECISIONS, decisionTotalCount } from './trustUtils';
+import { MOCK_IDENTITY_CONTEXT, mockTeamPlaneEnabled } from './teamPlaneUtils';
+import { setStoredIdentity } from './api/authIdentity';
 import { DEFAULT_LOCAL_MODELS } from './constants';
 import { boardHasActiveWork, countNeedsAttention } from './ticketAttention';
 import { EMPTY_BOARD_FILTERS, matchesBoardFilters, type BoardFilters } from './boardFilters';
@@ -59,6 +65,9 @@ export default function App() {
   const [boardLive, setBoardLive] = useState(false);
   const [workerStatus, setWorkerStatus] = useState<AutoWorkerStatus | null>(null);
   const [workerPending, setWorkerPending] = useState(false);
+  const [showDependencies, setShowDependencies] = useState(false);
+  const [ticketGraph, setTicketGraph] = useState<TicketGraphPayload | null>(null);
+  const [graphLoading, setGraphLoading] = useState(false);
   const boardSearchRef = useRef<HTMLInputElement>(null);
   const [projects, setProjects] = useState<Project[]>([
     { id: 'default', name: 'HAAO', path: '', defaultBranch: 'main', env: {}, setupCmd: '', cleanupCmd: '' },
@@ -69,7 +78,9 @@ export default function App() {
   const [chatLayoutMode, setChatLayoutMode] = useState<ChatLayoutMode>('balanced');
   const [allowCloudExecutionModel, setAllowCloudExecutionModel] = useState(false);
   const [integrations, setIntegrations] = useState<IntegrationCredential[]>([]);
+  const [identityContext, setIdentityContext] = useState<IdentityContext | null>(null);
   const [inboxUnreadCount, setInboxUnreadCount] = useState<InboxUnreadCount>({ total: 0, by_project: {} });
+  const [decisionCount, setDecisionCount] = useState(0);
   const [chatReasonerMode, setChatReasonerMode] = useState<'cloud' | 'local'>('cloud');
   const [onboardingOpen, setOnboardingOpen] = useState(false);
   const [onboardingDismissed, setOnboardingDismissed] = useState(
@@ -144,56 +155,81 @@ export default function App() {
     return error instanceof Error && error.message ? error.message : fallback;
   }
 
-  const replaceTicketFromBackend = useCallback((backendTicket: BackendTicket) => {
-    const projectId = typeof backendTicket.metadata?.project_id === 'string'
-      ? backendTicket.metadata.project_id
-      : selectedProjectId;
-    const ui = toUiTicket(backendTicket, projectNameById[projectId]);
+  const replaceTicketsFromBackend = useCallback((backendTickets: BackendTicket[]) => {
     setTickets((prev) => {
-      const index = prev.findIndex((ticket) => ticket.id === ui.id);
-      if (index === -1) return [...prev, ui];
       const next = [...prev];
-      next[index] = ui;
+      for (const backendTicket of backendTickets) {
+        const projectId = typeof backendTicket.metadata?.project_id === 'string'
+          ? backendTicket.metadata.project_id
+          : selectedProjectId;
+        const ui = toUiTicket(backendTicket, projectNameById[projectId]);
+        const index = next.findIndex((ticket) => ticket.id === ui.id);
+        if (index === -1) next.push(ui);
+        else next[index] = ui;
+      }
       return next;
     });
   }, [projectNameById, selectedProjectId]);
+
+  const replaceTicketFromBackend = useCallback((backendTicket: BackendTicket) => {
+    replaceTicketsFromBackend([backendTicket]);
+  }, [replaceTicketsFromBackend]);
+
+  const loadTicketGraph = useCallback(async (baseTickets: Ticket[]) => {
+    if (usingMockData) {
+      setTicketGraph(buildMockGraph(baseTickets));
+      return baseTickets;
+    }
+    setGraphLoading(true);
+    try {
+      const graph = await apiClient.getTicketGraph(selectedProjectId);
+      setTicketGraph(graph);
+      return mergeGraphIntoTickets(baseTickets, graph);
+    } catch {
+      setTicketGraph(null);
+      return baseTickets;
+    } finally {
+      setGraphLoading(false);
+    }
+  }, [selectedProjectId, usingMockData]);
 
   const loadTickets = useCallback(async () => {
     setTicketsLoading(true);
     try {
       const backendTickets = await apiClient.listTickets(selectedProjectId);
-      setTickets(
-        backendTickets.map((ticket) => {
-          const projectId = typeof ticket.metadata?.project_id === 'string'
-            ? ticket.metadata.project_id
-            : selectedProjectId;
-          return toUiTicket(ticket, projectNameById[projectId]);
-        }),
-      );
+      const uiTickets = backendTickets.map((ticket) => {
+        const projectId = typeof ticket.metadata?.project_id === 'string'
+          ? ticket.metadata.project_id
+          : selectedProjectId;
+        return toUiTicket(ticket, projectNameById[projectId]);
+      });
+      setTickets(await loadTicketGraph(uiTickets));
       setUsingMockData(false);
     } catch {
+      const mockTickets = INITIAL_TICKETS;
+      setTickets(await loadTicketGraph(mockTickets));
       setUsingMockData(true);
+      setWorkerStatus(MOCK_WORKER_STATUS);
     } finally {
       setTicketsLoading(false);
     }
-  }, [projectNameById, selectedProjectId]);
+  }, [loadTicketGraph, projectNameById, selectedProjectId]);
 
   const refreshTickets = useCallback(async () => {
     if (usingMockData) return;
     try {
       const backendTickets = await apiClient.listTickets(selectedProjectId);
-      setTickets(
-        backendTickets.map((ticket) => {
-          const projectId = typeof ticket.metadata?.project_id === 'string'
-            ? ticket.metadata.project_id
-            : selectedProjectId;
-          return toUiTicket(ticket, projectNameById[projectId]);
-        }),
-      );
+      const uiTickets = backendTickets.map((ticket) => {
+        const projectId = typeof ticket.metadata?.project_id === 'string'
+          ? ticket.metadata.project_id
+          : selectedProjectId;
+        return toUiTicket(ticket, projectNameById[projectId]);
+      });
+      setTickets(await loadTicketGraph(uiTickets));
     } catch {
       // Keep the last known board state during transient refresh failures.
     }
-  }, [projectNameById, selectedProjectId, usingMockData]);
+  }, [loadTicketGraph, projectNameById, selectedProjectId, usingMockData]);
 
   const loadChatMessages = useCallback(async () => {
     if (usingMockData) {
@@ -224,6 +260,50 @@ export default function App() {
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
   }, [darkMode]);
+
+  useEffect(() => {
+    if (mockTeamPlaneEnabled()) {
+      setIdentityContext(MOCK_IDENTITY_CONTEXT);
+      setStoredIdentity(MOCK_IDENTITY_CONTEXT.actor_id, MOCK_IDENTITY_CONTEXT.workspace_id);
+      return;
+    }
+    if (usingMockData) {
+      setIdentityContext({
+        identity_configured: false,
+        actor_id: 'implicit-owner',
+        workspace_id: 'default',
+        role: 'owner',
+        implicit_owner: true,
+        permissions: ['read', 'mutate', 'admin'],
+      });
+      return;
+    }
+    let active = true;
+    apiClient
+      .getIdentityContext()
+      .then((context) => {
+        if (!active) return;
+        setIdentityContext(context);
+        if (context.identity_configured && !context.implicit_owner) {
+          setStoredIdentity(context.actor_id, context.workspace_id);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setIdentityContext({
+            identity_configured: false,
+            actor_id: 'implicit-owner',
+            workspace_id: 'default',
+            role: 'owner',
+            implicit_owner: true,
+            permissions: ['read', 'mutate', 'admin'],
+          });
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [usingMockData]);
 
   useEffect(() => {
     if (currentPage !== 'home') setSelectedTicketId(null);
@@ -282,13 +362,22 @@ export default function App() {
   }, [attentionCount, attentionFilter]);
 
   useEffect(() => {
-    if (currentPage !== 'home' || usingMockData) return;
+    if (usingMockData) {
+      setWorkerStatus(MOCK_WORKER_STATUS);
+      return;
+    }
+    if (currentPage !== 'home') return;
     let active = true;
     const poll = () => {
       apiClient
         .getWorkerStatus()
         .then((status) => {
-          if (active) setWorkerStatus(status);
+          if (active) {
+            setWorkerStatus({
+              ...status,
+              max_workers: status.max_workers ?? status.worker_statuses?.length ?? 1,
+            });
+          }
         })
         .catch(() => {});
     };
@@ -311,6 +400,28 @@ export default function App() {
         .listNotifications({ projectId: selectedProjectId, limit: 1 })
         .then((data) => {
           if (active) setInboxUnreadCount(data.unread_count);
+        })
+        .catch(() => {});
+    };
+    poll();
+    const intervalId = window.setInterval(poll, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, [selectedProjectId, usingMockData]);
+
+  useEffect(() => {
+    if (usingMockData) {
+      setDecisionCount(decisionTotalCount(MOCK_DECISIONS.counts));
+      return;
+    }
+    let active = true;
+    const poll = () => {
+      apiClient
+        .getDecisions(selectedProjectId)
+        .then((data) => {
+          if (active) setDecisionCount(decisionTotalCount(data.counts));
         })
         .catch(() => {});
     };
@@ -754,6 +865,64 @@ export default function App() {
     }
   }, [pushToast, selectedProjectId]);
 
+  const handleSplitTicket = useCallback(
+    async (ticketId: string, feedback: string) => {
+      try {
+        const result = await apiClient.splitTicket(ticketId, feedback, selectedProjectId);
+        const ticketsToMerge = [result.ticket, ...(result.children ?? [])];
+        replaceTicketsFromBackend(ticketsToMerge);
+        pushToast(
+          `Split into ${result.child_ticket_ids.length} ticket${result.child_ticket_ids.length === 1 ? '' : 's'}: ${result.child_ticket_ids.join(', ')}.`,
+          'success',
+        );
+      } catch (error) {
+        pushToast(messageFromError(error, 'Split failed.'));
+      }
+    },
+    [pushToast, replaceTicketsFromBackend, selectedProjectId],
+  );
+
+  const handleAbandonTicket = useCallback(
+    (ticketId: string, reason: string) => runAndReplace(
+      ticketId,
+      (id, projectId) => apiClient.abandonTicket(id, reason, projectId),
+      'Ticket abandoned.',
+    ),
+    [runAndReplace],
+  );
+
+  const handleAssignModelAndRetry = useCallback(async (ticketId: string, model: string) => {
+    try {
+      await apiClient.assignModel(ticketId, model, selectedProjectId);
+      const updated = await apiClient.retryTicket(ticketId, selectedProjectId);
+      replaceTicketFromBackend(updated);
+      pushToast('Model changed and ticket retried.', 'success');
+    } catch (error) {
+      pushToast(messageFromError(error, 'Could not change model and retry.'));
+    }
+  }, [pushToast, replaceTicketFromBackend, selectedProjectId]);
+
+  const handleUpdateDependsOn = useCallback(async (ticketId: string, dependsOn: string[]) => {
+    if (usingMockData) {
+      setTickets((prev) => {
+        const next = prev.map((ticket) => (ticket.id === ticketId ? { ...ticket, dependsOn } : ticket));
+        setTicketGraph(buildMockGraph(next));
+        return next;
+      });
+      pushToast('Dependencies updated.', 'success');
+      return;
+    }
+    try {
+      const updated = await apiClient.updateTicket(ticketId, { depends_on: dependsOn }, selectedProjectId);
+      const ui = toUiTicket(updated, projectNameById[selectedProjectId]);
+      const mergedBase = tickets.map((ticket) => (ticket.id === ticketId ? { ...ui, dependsOn } : ticket));
+      setTickets(await loadTicketGraph(mergedBase));
+      pushToast('Dependencies updated.', 'success');
+    } catch (error) {
+      pushToast(messageFromError(error, 'Could not update dependencies.'));
+    }
+  }, [loadTicketGraph, projectNameById, pushToast, selectedProjectId, tickets, usingMockData]);
+
   const handleCreateProject = useCallback(async (payload: { name: string; path: string }) => {
     const project = toUiProject(await apiClient.createProject(payload));
     setProjects((prev) => [...prev.filter((item) => item.id !== project.id), project]);
@@ -987,6 +1156,7 @@ export default function App() {
             <NavSidebar
               currentPage={currentPage}
               inboxUnreadCount={inboxUnreadCount.by_project[selectedProjectId] ?? 0}
+              decisionCount={decisionCount}
               onNavigate={setCurrentPage}
             />
             {currentPage === 'home' ? (
@@ -1028,9 +1198,8 @@ export default function App() {
                     onToggleAttentionFilter={handleToggleAttentionFilter}
                     onNewRequirement={() => setShowNewReq(true)}
                     onNewTicket={() => setShowNewTicket(true)}
-                    autoRunRunning={Boolean(workerStatus?.running)}
-                    autoRunPending={workerPending}
-                    autoRunError={workerStatus?.last_error ?? ''}
+                    workerStatus={workerStatus}
+                    workerPending={workerPending}
                     autoRunNotice={workerStatus?.last_skipped_reason ?? ''}
                     onToggleAutoRun={handleToggleAutoRun}
                     projectPathReady={projectPathReady}
@@ -1042,7 +1211,18 @@ export default function App() {
                     onFiltersChange={setBoardFilters}
                     onClearFilters={() => setBoardFilters(EMPTY_BOARD_FILTERS)}
                     onOpenSetup={() => setCurrentPage('models')}
+                    tickets={tickets}
+                    showDependencies={showDependencies}
+                    onToggleDependencies={() => setShowDependencies((value) => !value)}
                   />
+                  {showDependencies && (
+                    <DependencyGraphPanel
+                      graph={ticketGraph}
+                      tickets={tickets}
+                      loading={graphLoading}
+                      onSelectTicket={setSelectedTicketId}
+                    />
+                  )}
                   <KanbanBoard
                     tickets={tickets}
                     loading={ticketsLoading}
@@ -1082,6 +1262,26 @@ export default function App() {
                 onOpenTicket={handleInboxOpenTicket}
                 onOpenRequirement={handleInboxOpenRequirement}
               />
+            ) : currentPage === 'decisions' ? (
+              <DecisionCenterPage
+                projectId={selectedProjectId}
+                usingMockData={usingMockData}
+                onOpenTicket={(ticketId) => {
+                  setCurrentPage('home');
+                  setSelectedTicketId(ticketId);
+                }}
+                onOpenRequirement={(requirementId) => setViewingRequirementId(requirementId)}
+                onApproveTicket={(ticketId) => {
+                  setCurrentPage('home');
+                  setSelectedTicketId(ticketId);
+                  void handleApprove(ticketId);
+                }}
+                onAcceptTicket={(ticketId) => {
+                  setCurrentPage('home');
+                  setSelectedTicketId(ticketId);
+                  void handleAccept(ticketId);
+                }}
+              />
             ) : currentPage === 'requirements' ? (
               <RequirementsPage
                 requirements={requirements}
@@ -1114,6 +1314,8 @@ export default function App() {
               allowCloudExecutionModel={allowCloudExecutionModel}
               onUpdateAllowCloudExecutionModel={handleUpdateAllowCloudExecutionModel}
               usingMockData={usingMockData}
+              identityContext={identityContext}
+              onForbidden={(message) => pushToast(message)}
             />
           )}
           </div>
@@ -1148,6 +1350,13 @@ export default function App() {
             onDelete={(force) => handleDelete(selectedTicket.id, force)}
             onEscalate={() => handleEscalate(selectedTicket.id)}
             onOpenPr={() => handleOpenPr(selectedTicket.id)}
+            onSplit={(feedback) => handleSplitTicket(selectedTicket.id, feedback)}
+            onAbandon={(reason) => handleAbandonTicket(selectedTicket.id, reason)}
+            onAssignModelAndRetry={(model) => void handleAssignModelAndRetry(selectedTicket.id, model)}
+            onOpenTicket={(id) => setSelectedTicketId(id)}
+            onUpdateDependsOn={(dependsOn) => handleUpdateDependsOn(selectedTicket.id, dependsOn)}
+            allTickets={tickets}
+            usingMockData={usingMockData}
             prIntegrationConfigured={prIntegrationConfigured}
             requirementSource={
               selectedTicket.requirementId

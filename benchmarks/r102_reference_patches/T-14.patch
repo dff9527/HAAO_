@@ -1,0 +1,13 @@
+diff --git a/src/tablib/formats/_jira.py b/src/tablib/formats/_jira.py
+--- a/src/tablib/formats/_jira.py
++++ b/src/tablib/formats/_jira.py
+@@ -35,6 +35,8 @@ class JIRAFormat:
+     def _serialize_row(cls, row, delimiter='|'):
+         return '{}{}{}'.format(
+             delimiter,
+-            delimiter.join([str(item) if item else ' ' for item in row]),
++            delimiter.join(
++                [str(item) if item is not None and item != '' else ' ' for item in row]
++            ),
+             delimiter
+         )

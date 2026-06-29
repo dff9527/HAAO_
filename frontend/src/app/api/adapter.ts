@@ -1,5 +1,8 @@
 import type { AssignedModel, LogLevel, Project, RequirementSource, RoleRoute, Ticket, TicketStatus } from '../types';
 import type { BackendProject, BackendRequirement, BackendRoleRouting, BackendTicket, BackendTicketStatus } from './types';
+import { parseDiffStats } from '../diffStatsUtils';
+import { parseTicketLease } from '../throughputUtils';
+import type { TicketReadyState } from '../types';
 
 const STATUS_TO_UI: Record<BackendTicketStatus, TicketStatus> = {
   backlog: 'Backlog',
@@ -11,6 +14,8 @@ const STATUS_TO_UI: Record<BackendTicketStatus, TicketStatus> = {
   awaiting_acceptance: 'Awaiting acceptance',
   done: 'Done',
   blocked: 'Blocked',
+  abandoned: 'Abandoned',
+  split: 'Split',
 };
 
 const STATUS_TO_BACKEND: Record<TicketStatus, BackendTicketStatus> = {
@@ -22,6 +27,8 @@ const STATUS_TO_BACKEND: Record<TicketStatus, BackendTicketStatus> = {
   'Awaiting acceptance': 'awaiting_acceptance',
   Done: 'done',
   Blocked: 'blocked',
+  Abandoned: 'abandoned',
+  Split: 'split',
 };
 
 function toAssignedModel(model: string | string[]): AssignedModel {
@@ -121,7 +128,49 @@ export function toUiTicket(ticket: BackendTicket, projectName?: string): Ticket 
     prUrl: typeof ticket.metadata?.pr_url === 'string' ? ticket.metadata.pr_url : undefined,
     prStatus: typeof ticket.metadata?.pr_status === 'string' ? ticket.metadata.pr_status : undefined,
     lastInterventionNotification: toInterventionNotification(ticket.metadata),
+    childTicketIds: Array.isArray(ticket.metadata?.child_ticket_ids)
+      ? ticket.metadata.child_ticket_ids.filter((item): item is string => typeof item === 'string')
+      : undefined,
+    splitFrom: typeof ticket.metadata?.split_from === 'string' ? ticket.metadata.split_from : undefined,
+    splitFeedback: typeof ticket.metadata?.split_feedback === 'string' ? ticket.metadata.split_feedback : undefined,
+    splitAt: typeof ticket.metadata?.split_requested_at === 'string' ? ticket.metadata.split_requested_at : undefined,
+    abandonReason: typeof ticket.metadata?.abandon_reason === 'string' ? ticket.metadata.abandon_reason : undefined,
+    abandonedAt: typeof ticket.metadata?.abandoned_at === 'string' ? ticket.metadata.abandoned_at : undefined,
+    diffStats: parseDiffStats(ticket.result?.diff_stats),
+    reasonerPromptVersion:
+      typeof ticket.metadata?.reasoner_prompt_version === 'string'
+        ? ticket.metadata.reasoner_prompt_version
+        : undefined,
+    lastRunModelId:
+      typeof ticket.metadata?.last_run_model_id === 'string' ? ticket.metadata.last_run_model_id : undefined,
+    dependsOn: normalizeDependsOn(ticket),
+    lease: parseTicketLease({
+      worker_id: ticket.metadata?.lease_worker_id,
+      expires_at: ticket.metadata?.lease_expires_at,
+      heartbeat_at: ticket.metadata?.lease_heartbeat_at,
+    }),
+    conflictNote:
+      typeof ticket.metadata?.conflict_note === 'string' ? ticket.metadata.conflict_note : undefined,
+    readyState: normalizeReadyState(ticket.metadata?.ready_state),
   };
+}
+
+function normalizeDependsOn(ticket: BackendTicket): string[] | undefined {
+  const fromField = Array.isArray(ticket.depends_on)
+    ? ticket.depends_on.filter((item): item is string => typeof item === 'string')
+    : [];
+  const fromMeta = Array.isArray(ticket.metadata?.depends_on)
+    ? ticket.metadata.depends_on.filter((item): item is string => typeof item === 'string')
+    : [];
+  const merged = [...new Set([...fromField, ...fromMeta])];
+  return merged.length ? merged : undefined;
+}
+
+function normalizeReadyState(value: unknown): TicketReadyState | undefined {
+  if (value === 'ready' || value === 'waiting_dependencies' || value === 'conflict' || value === 'not_ready' || value === 'terminal') {
+    return value;
+  }
+  return undefined;
 }
 
 function toInterventionNotification(metadata: BackendTicket['metadata']): Ticket['lastInterventionNotification'] {

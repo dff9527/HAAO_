@@ -7,7 +7,16 @@ export type BackendTicketStatus =
   | 'review'
   | 'awaiting_acceptance'
   | 'done'
-  | 'blocked';
+  | 'blocked'
+  | 'abandoned'
+  | 'split';
+
+export interface DiffStats {
+  files_touched: number;
+  lines_added: number;
+  lines_removed: number;
+  out_of_scope_files: string[];
+}
 
 export interface BackendTicket {
   id: string;
@@ -44,6 +53,7 @@ export interface BackendTicket {
   result?: {
     outcome?: 'success' | 'test_failed' | 'error' | 'pending';
     diff?: string;
+    diff_stats?: DiffStats;
     test_output?: string;
     logs?: Array<{
       ts: string;
@@ -57,6 +67,45 @@ export interface BackendTicket {
     feedback?: string;
   };
   metadata?: Record<string, unknown>;
+  depends_on?: string[];
+}
+
+export interface TicketGraphEdge {
+  source: string;
+  target: string;
+  kind: string;
+}
+
+export interface TicketGraphNode {
+  id: string;
+  status: string;
+  depends_on: string[];
+  target_files: string[];
+  ready_state: string;
+  leased: boolean;
+  lease: {
+    worker_id: string;
+    expires_at?: string;
+    heartbeat_at?: string;
+    ttl_sec?: number;
+  } | null;
+}
+
+export interface TicketGraphPayload {
+  project_id: string;
+  nodes: TicketGraphNode[];
+  edges: TicketGraphEdge[];
+  ready?: string[];
+  blocked?: string[];
+}
+
+export interface WorkerSlotStatus {
+  worker_id: string;
+  running: boolean;
+  last_run_at?: string | null;
+  last_error?: string;
+  last_skipped_reason?: string;
+  ticket_id?: string | null;
 }
 
 export interface BackendProject {
@@ -154,9 +203,19 @@ export type RunEventType =
   | 'retry'
   | 'escalation'
   | 'egress_attempt'
+  | 'diff_scope_reject'
+  | 'rollback'
+  | 'conflict'
   | 'report'
   | 'run_finished'
   | 'error';
+
+export interface SplitTicketResponse {
+  parent_id: string;
+  child_ticket_ids: string[];
+  ticket: BackendTicket;
+  children: BackendTicket[];
+}
 
 export type RunEventCostStatus = 'actual' | 'estimated' | 'unknown';
 
@@ -221,6 +280,96 @@ export interface InsightsPayload {
     series: InsightsCostSeriesPoint[];
   };
   model_scorecard: InsightsModelScorecardRow[];
+  time_to_first_pr?: {
+    sample_size: number;
+    avg_hours: number;
+    median_hours: number;
+    samples: Array<{ ticket_id: string; hours: number; pr_url?: string | null; opened_at: string }>;
+  };
+  roi?: {
+    done_tickets: number;
+    accepted_tickets: number;
+    estimated_hours_saved: number;
+    assumed_hours_saved_per_done_ticket: number;
+    assumed_hourly_rate_usd: number;
+    estimated_value_usd: number;
+    cloud_cost_usd: number;
+    estimated_net_value_usd: number;
+    intervention_count?: number;
+    local_share?: number;
+    cloud_share?: number;
+    method: string;
+  };
+}
+
+export interface TicketSignals {
+  ticket_id?: string;
+  affected_files: string[];
+  risk: { level: string; reasons?: string[] };
+  dod_strength: {
+    level: string;
+    score?: number;
+    tests_count?: number;
+    static_checks_count?: number;
+    acceptance_criteria_count?: number;
+    machine_verifiable?: boolean;
+    reasons?: string[];
+  };
+  cloud_privacy_flags: Array<{ id: string; severity: string; message: string }>;
+  derived_only?: boolean;
+}
+
+export interface DecisionCenterItem {
+  type: 'ticket' | 'requirement';
+  id: string;
+  project_id: string;
+  title: string;
+  status: string;
+  priority?: string;
+  requirement_id?: string;
+  signals?: TicketSignals;
+  actions?: string[];
+  acceptance_summary?: AcceptanceSummary;
+  split_from?: string;
+  child_ticket_ids?: string[];
+}
+
+export interface DecisionCenterGroup {
+  id: string;
+  title: string;
+  items: DecisionCenterItem[];
+}
+
+export interface DecisionCenterPayload {
+  project_id: string;
+  generated_at: string;
+  groups: DecisionCenterGroup[];
+  counts: Record<string, number>;
+  derived_only?: boolean;
+}
+
+export interface AcceptanceCheck {
+  id: string;
+  label: string;
+  passed: boolean;
+  severity: string;
+  detail: string;
+}
+
+export interface AcceptanceSummary {
+  ticket_id: string;
+  status: string;
+  recommendation: string;
+  checks: AcceptanceCheck[];
+  signals?: TicketSignals;
+  pr?: {
+    url?: string | null;
+    status?: string | null;
+    branch?: string | null;
+    provider?: string | null;
+    ready?: boolean;
+  };
+  derived_only?: boolean;
 }
 
 export type InboxNotificationKind = 'needs_you' | 'done' | 'blocked';
@@ -334,3 +483,61 @@ export interface RequirementShareSummary {
     run_events_usd?: number;
   };
 }
+
+export type MembershipRole = 'owner' | 'admin' | 'member' | 'viewer';
+
+export type TeamPlaneAction = 'read' | 'mutate' | 'admin';
+
+export interface IdentityContext {
+  identity_configured: boolean;
+  actor_id: string;
+  workspace_id: string;
+  role: MembershipRole;
+  implicit_owner: boolean;
+  permissions: TeamPlaneAction[];
+}
+
+export interface WorkspaceMembership {
+  user_id: string;
+  workspace_id: string;
+  role: MembershipRole;
+  created_at: string;
+  email?: string;
+  display_name?: string;
+}
+
+export interface AuditEvent {
+  id: number;
+  actor_id: string;
+  workspace_id: string;
+  action: string;
+  target: string;
+  ts: string;
+  ip?: string | null;
+}
+
+export interface RunnerActiveLease {
+  ticket_id?: string;
+  job_id?: string;
+}
+
+export interface RunnerRecord {
+  id: string;
+  workspace_id: string;
+  label: string;
+  created_at: string;
+  revoked_at?: string | null;
+  last_heartbeat_at?: string | null;
+  status: 'online' | 'offline' | 'revoked';
+  active_lease?: RunnerActiveLease | null;
+}
+
+export interface GitAppInstallInfo {
+  provider: 'github' | 'gitlab';
+  install_url: string;
+  installed: boolean;
+  credential_id?: string;
+  label?: string;
+}
+
+export type GitCredentialKind = 'pat' | 'app';

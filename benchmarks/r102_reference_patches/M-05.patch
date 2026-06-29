@@ -1,0 +1,18 @@
+diff --git a/src/marshmallow/schema.py b/src/marshmallow/schema.py
+index 0000000..0000000 100644
+--- a/src/marshmallow/schema.py
++++ b/src/marshmallow/schema.py
+@@ -705,7 +705,10 @@ class Schema(base.SchemaABC):
+                 raw_value = data.get(field_name, missing)
+                 if raw_value is missing:
+                     # Ignore missing field if we're allowed to.
+-                    if partial is True or (
+-                        partial_is_collection and attr_name in partial
++                    if partial is True or (
++                        partial_is_collection
++                        and (
++                            attr_name in partial or field_name in partial
++                        )
+                     ):
+                         continue
+                 d_kwargs = {}

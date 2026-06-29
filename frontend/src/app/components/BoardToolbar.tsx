@@ -1,8 +1,11 @@
 import { forwardRef } from 'react';
-import { AlertTriangle, Circle, Filter, Loader2, Play, Search, Settings, Square, X } from 'lucide-react';
-import type { BoardFilters, BoardPriorityFilter, BoardTypeFilter } from '../boardFilters';
+import { AlertTriangle, Circle, Filter, GitBranch, Search, Settings, X } from 'lucide-react';
+import type { AutoWorkerStatus } from '../api/client';
+import type { BoardFilters, BoardPriorityFilter, BoardTerminalFilter, BoardTypeFilter } from '../boardFilters';
 import { hasActiveBoardFilters } from '../boardFilters';
 import { AddWorkMenu } from './AddWorkMenu';
+import { WorkerPoolControl } from './WorkerPoolControl';
+import type { Ticket } from '../types';
 
 interface Props {
   boardLive: boolean;
@@ -11,9 +14,8 @@ interface Props {
   onToggleAttentionFilter: () => void;
   onNewRequirement: () => void;
   onNewTicket: () => void;
-  autoRunRunning: boolean;
-  autoRunPending: boolean;
-  autoRunError: string;
+  workerStatus: AutoWorkerStatus | null;
+  workerPending: boolean;
   autoRunNotice: string;
   onToggleAutoRun: () => void;
   projectPathReady: boolean;
@@ -25,6 +27,9 @@ interface Props {
   onFiltersChange: (filters: BoardFilters) => void;
   onClearFilters: () => void;
   onOpenSetup: () => void;
+  tickets: Ticket[];
+  showDependencies: boolean;
+  onToggleDependencies: () => void;
 }
 
 export const BoardToolbar = forwardRef<HTMLInputElement, Props>(function BoardToolbar({
@@ -34,9 +39,8 @@ export const BoardToolbar = forwardRef<HTMLInputElement, Props>(function BoardTo
   onToggleAttentionFilter,
   onNewRequirement,
   onNewTicket,
-  autoRunRunning,
-  autoRunPending,
-  autoRunError,
+  workerStatus,
+  workerPending,
   autoRunNotice,
   onToggleAutoRun,
   projectPathReady,
@@ -48,9 +52,14 @@ export const BoardToolbar = forwardRef<HTMLInputElement, Props>(function BoardTo
   onFiltersChange,
   onClearFilters,
   onOpenSetup,
+  tickets,
+  showDependencies,
+  onToggleDependencies,
 }, searchInputRef) {
   const showSetupGuide = !loading && (!projectPathReady || !modelsConfigured);
   const filtersActive = hasActiveBoardFilters(filters);
+  const autoRunRunning = Boolean(workerStatus?.running);
+  const autoRunError = workerStatus?.last_error ?? '';
 
   return (
     <div className="shrink-0 border-b border-border bg-card/80 px-4 py-2 space-y-2">
@@ -104,6 +113,19 @@ export const BoardToolbar = forwardRef<HTMLInputElement, Props>(function BoardTo
           <option value="low">Low</option>
         </select>
 
+        <select
+          value={filters.terminal}
+          onChange={(event) => onFiltersChange({ ...filters, terminal: event.target.value as BoardTerminalFilter })}
+          aria-label="Filter by terminal status"
+          className="h-8 rounded-lg border border-border bg-background px-2 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+        >
+          <option value="all">All tickets</option>
+          <option value="active">Active only</option>
+          <option value="done">Done</option>
+          <option value="abandoned">Abandoned</option>
+          <option value="split">Superseded (split)</option>
+        </select>
+
         {filtersActive && (
           <button
             type="button"
@@ -143,38 +165,24 @@ export const BoardToolbar = forwardRef<HTMLInputElement, Props>(function BoardTo
 
         <button
           type="button"
-          onClick={onToggleAutoRun}
-          disabled={autoRunPending || !projectPathReady}
-          title={
-            !projectPathReady
-              ? 'Set a repository path before enabling auto-run'
-              : autoRunError
-                ? `Auto-run last error: ${autoRunError}`
-                : autoRunRunning
-                  ? 'Auto-run is on — the orchestrator picks up Ready tickets and runs them. Click to stop.'
-                  : 'Start auto-run — the orchestrator dispatches and runs Ready tickets for this project.'
-          }
-          className={`ml-auto inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 ${
-            autoRunRunning
-              ? 'border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+          onClick={onToggleDependencies}
+          className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+            showDependencies
+              ? 'border-indigo-300 bg-indigo-50 text-indigo-800 dark:border-indigo-800 dark:bg-indigo-950 dark:text-indigo-200'
               : 'border-border text-muted-foreground hover:bg-muted hover:text-foreground'
           }`}
         >
-          {autoRunPending ? (
-            <Loader2 size={12} className="animate-spin" />
-          ) : autoRunRunning ? (
-            <Square size={10} className="fill-current" />
-          ) : (
-            <Play size={12} />
-          )}
-          Auto-run
-          {autoRunRunning && !autoRunPending && (
-            <Circle size={7} className="fill-emerald-500 text-emerald-500 animate-pulse" />
-          )}
-          {!autoRunRunning && autoRunError && (
-            <Circle size={7} className="fill-red-500 text-red-500" />
-          )}
+          <GitBranch size={12} />
+          <span className="hidden sm:inline">Dependencies</span>
         </button>
+
+        <WorkerPoolControl
+          workerStatus={workerStatus}
+          tickets={tickets}
+          pending={workerPending}
+          projectPathReady={projectPathReady}
+          onToggle={onToggleAutoRun}
+        />
 
         <AddWorkMenu onNewRequirement={onNewRequirement} onNewTicket={onNewTicket} />
 

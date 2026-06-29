@@ -1,5 +1,5 @@
 import { KanbanColumn } from './KanbanColumn';
-import { COLUMNS } from '../constants';
+import { COLUMNS, isTerminalTicketStatus } from '../constants';
 import { matchesBoardFilters, type BoardFilters } from '../boardFilters';
 import { sortReviewColumnTickets } from '../ticketAttention';
 import type { Ticket, TicketStatus } from '../types';
@@ -27,7 +27,7 @@ export function KanbanBoard({
   onApproveTicket,
   onAcceptTicket,
 }: Props) {
-  const filters = boardFilters ?? { query: '', type: 'all', priority: 'all' };
+  const filters = boardFilters ?? { query: '', type: 'all', priority: 'all', terminal: 'all' };
   const visibleTickets = tickets.filter((ticket) => matchesBoardFilters(ticket, filters, attentionFilter));
 
   function getColumnTickets(columnStatus: TicketStatus): Ticket[] {
@@ -38,6 +38,9 @@ export function KanbanBoard({
     }
     if (columnStatus === 'In Progress') {
       return visibleTickets.filter((ticket) => ticket.status === 'In Progress' || ticket.status === 'Blocked');
+    }
+    if (columnStatus === 'Done') {
+      return visibleTickets.filter((ticket) => isTerminalTicketStatus(ticket.status));
     }
     return visibleTickets.filter((ticket) => ticket.status === columnStatus);
   }

@@ -23,6 +23,10 @@ export function statusDisplayLabel(status: TicketStatus): string {
       return 'Needs your acceptance';
     case 'In Progress':
       return 'In progress';
+    case 'Abandoned':
+      return 'Abandoned';
+    case 'Split':
+      return 'Superseded (split)';
     default:
       return status;
   }

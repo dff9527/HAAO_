@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import subprocess
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from urllib.parse import quote
 import httpx
 
 from orchestrator.db.sqlite import (
+    AuditRepository,
     IntegrationCredential,
     IntegrationRepository,
     RunEventRepository,
@@ -85,6 +87,95 @@ class PullRequestProvider(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class ResolvedGitCredential:
+    provider: ProviderName
+    token: str
+    credential_type: Literal["pat", "app"]
+    credential_id: str
+
+
+class GitCredential(Protocol):
+    provider: ProviderName
+    credential_id: str
+    credential_type: Literal["pat", "app"]
+
+    def resolve_token(self) -> ResolvedGitCredential:
+        ...
+
+
+class AppTokenMinter(Protocol):
+    def mint_installation_token(self, provider: ProviderName, app_payload: dict[str, Any]) -> str:
+        ...
+
+
+class MissingAppTokenMinter(PullRequestFlowError):
+    """Raised when an App credential is selected but no minter is configured."""
+
+
+class PatGitCredential:
+    provider: ProviderName
+    credential_type: Literal["pat"] = "pat"
+
+    def __init__(self, credential: IntegrationCredential, integrations: IntegrationRepository) -> None:
+        self.credential = credential
+        self.integrations = integrations
+        self.provider = credential.provider  # type: ignore[assignment]
+        self.credential_id = credential.id
+
+    def resolve_token(self) -> ResolvedGitCredential:
+        return ResolvedGitCredential(
+            provider=self.provider,
+            token=self.integrations.decrypted_token(self.credential.provider, self.credential.id),
+            credential_type="pat",
+            credential_id=self.credential.id,
+        )
+
+
+class AppGitCredential:
+    provider: ProviderName
+    credential_type: Literal["app"] = "app"
+
+    def __init__(
+        self,
+        credential: IntegrationCredential,
+        integrations: IntegrationRepository,
+        minter: AppTokenMinter | None,
+        audit: AuditRepository,
+    ) -> None:
+        self.credential = credential
+        self.integrations = integrations
+        self.minter = minter
+        self.audit = audit
+        self.provider = credential.provider  # type: ignore[assignment]
+        self.credential_id = credential.id
+
+    def resolve_token(self) -> ResolvedGitCredential:
+        if self.minter is None:
+            raise MissingAppTokenMinter("Git App credential selected but no token minter is configured")
+        raw = self.integrations.decrypted_token(self.credential.provider, self.credential.id)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = {"installation_id": raw}
+        if not isinstance(payload, dict):
+            payload = {"installation_id": str(payload)}
+        token = self.minter.mint_installation_token(self.provider, payload)
+        self.audit.append(
+            actor_id="control-plane",
+            workspace_id=str(payload.get("workspace_id") or "default"),
+            action="git.app_token.mint",
+            target=self.credential.id,
+            payload={"provider": self.provider, "installation_id": payload.get("installation_id")},
+        )
+        return ResolvedGitCredential(
+            provider=self.provider,
+            token=token,
+            credential_type="app",
+            credential_id=self.credential.id,
+        )
+
+
 class PullRequestService:
     def __init__(
         self,
@@ -96,6 +187,8 @@ class PullRequestService:
         base_branch: str = "main",
         workspace_guard: GitWorkspaceGuard | None = None,
         provider_factory: Any | None = None,
+        git_credential_factory: Any | None = None,
+        app_token_minter: AppTokenMinter | None = None,
     ) -> None:
         self.repository = repository
         self.integrations = integrations
@@ -104,6 +197,9 @@ class PullRequestService:
         self.base_branch = base_branch
         self.workspace_guard = workspace_guard or GitWorkspaceGuard(self.repo_root)
         self.provider_factory = provider_factory or create_pull_request_provider
+        self.audit = AuditRepository(repository.connection)
+        self.app_token_minter = app_token_minter
+        self.git_credential_factory = git_credential_factory or self._create_git_credential
 
     def has_pr_integration(self) -> bool:
         return self._select_credential() is not None
@@ -118,13 +214,14 @@ class PullRequestService:
                 raise DirtyWorkspaceError(
                     "Cannot open PR: repository has uncommitted changes"
                 )
-            credential = self._select_credential()
-            if credential is None:
+            git_credential = self._select_credential()
+            if git_credential is None:
                 raise MissingIntegrationError("No github or gitlab integration is configured")
 
-            token = self.integrations.decrypted_token(credential.provider, credential.id)
+            resolved = git_credential.resolve_token()
+            token = resolved.token
             provider = self.provider_factory(
-                credential.provider,
+                resolved.provider,
                 token,
                 self.repo_root,
             )
@@ -142,7 +239,7 @@ class PullRequestService:
             result = PullRequestResult(
                 pr_url=provider_result.pr_url,
                 status=provider_result.status,
-                provider=credential.provider,
+                provider=resolved.provider,
                 branch=branch,
             )
             updated = self._store_result(ticket_id, result)
@@ -157,6 +254,19 @@ class PullRequestService:
                     "provider": result.provider,
                     "branch": result.branch,
                     "status": result.status,
+                    "pr_url": result.pr_url,
+                    "credential_type": resolved.credential_type,
+                },
+            )
+            self.audit.append(
+                actor_id="control-plane",
+                workspace_id=project_id,
+                action="git.pr.open",
+                target=ticket_id,
+                payload={
+                    "provider": result.provider,
+                    "credential_type": resolved.credential_type,
+                    "credential_id": resolved.credential_id,
                     "pr_url": result.pr_url,
                 },
             )
@@ -183,12 +293,22 @@ class PullRequestService:
             self._record_error(project_id, ticket_id, wrapped, token)
             raise wrapped from exc
 
-    def _select_credential(self) -> IntegrationCredential | None:
+    def _select_credential(self) -> GitCredential | None:
         for provider in ("github", "gitlab"):
             credentials = self.integrations.list(provider)
             if credentials:
-                return credentials[0]
+                return self.git_credential_factory(credentials[0])
         return None
+
+    def _create_git_credential(self, credential: IntegrationCredential) -> GitCredential:
+        if _is_app_credential(credential):
+            return AppGitCredential(
+                credential,
+                self.integrations,
+                self.app_token_minter,
+                self.audit,
+            )
+        return PatGitCredential(credential, self.integrations)
 
     def _require_ticket(self, ticket_id: str) -> Ticket:
         ticket = self.repository.get(ticket_id)
@@ -403,6 +523,13 @@ def create_pull_request_provider(
     if provider == "gitlab":
         return GitLabPullRequestProvider(token=token, repo_root=repo_root)
     raise ValueError(f"Unsupported PR provider: {provider}")
+
+
+def _is_app_credential(credential: IntegrationCredential) -> bool:
+    scope_markers = {scope.lower() for scope in credential.scopes}
+    if {"app", "github_app", "gitlab_app", "credential:app"}.intersection(scope_markers):
+        return True
+    return False
 
 
 def pr_branch_name(ticket: Ticket) -> str:

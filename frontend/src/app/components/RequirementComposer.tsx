@@ -14,6 +14,9 @@ import type { BackendProjectConventions, BackendRequirementDecomposeRequest, Bac
 import { toUiTicket } from '../api/adapter';
 import { apiClient } from '../api/client';
 import { MOCK_REQUIREMENT_TEMPLATES } from '../dxUtils';
+import { deriveTicketSignals } from '../trustUtils';
+import { TicketSignalsBadges } from './TicketSignalsBadges';
+import type { TicketSignals } from '../api/types';
 
 // ── Local types ────────────────────────────────────────────────────────────
 
@@ -293,12 +296,13 @@ function ChipInput({
 const ALL_TYPES: TicketType[] = ['feature', 'bugfix', 'refactor', 'test', 'chore'];
 
 function ProposedTicketCard({
-  ticket, index, onChange, localModelIds,
+  ticket, index, onChange, localModelIds, signals,
 }: {
   ticket: ProposedTicket;
   index: number;
   onChange: (updates: Partial<ProposedTicket>) => void;
   localModelIds: string[];
+  signals?: TicketSignals;
 }) {
   const [newFile, setNewFile] = useState('');
   const model = getModelMeta(ticket.assignedModel);
@@ -362,6 +366,17 @@ function ProposedTicketCard({
               ))}
             </select>
           </div>
+
+          <TicketSignalsBadges
+            signals={
+              signals ?? deriveTicketSignals({
+                targetFiles: ticket.contextFiles.map((file) => file.path),
+                assignedModel: ticket.assignedModel,
+                testsCount: ticket.definitionOfDone.tests.length,
+                acceptanceCount: ticket.definitionOfDone.acceptanceCriteria.length,
+              })
+            }
+          />
 
           {/* Context files */}
           <div>
@@ -551,6 +566,7 @@ export function RequirementComposer({
   const [saveTemplateTitle, setSaveTemplateTitle] = useState('');
   const [showSaveTemplate, setShowSaveTemplate] = useState(false);
   const [templateMessage, setTemplateMessage] = useState('');
+  const [ticketSignals, setTicketSignals] = useState<Record<string, TicketSignals>>({});
   const promptRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => { promptRef.current?.focus(); }, []);
@@ -722,6 +738,17 @@ export function RequirementComposer({
         cloudOutputTokens: response.requirement.cloud_output_tokens,
         cloudCostUsd: response.requirement.cloud_cost_usd,
       });
+      try {
+        const signals = await apiClient.getRequirementSignals(response.requirement_id, form.projectId);
+        const byId = Object.fromEntries(
+          signals
+            .filter((item) => item.ticket_id)
+            .map((item) => [String(item.ticket_id), item]),
+        );
+        setTicketSignals(byId);
+      } catch {
+        setTicketSignals({});
+      }
       setStep(2);
     } catch (error) {
       const message = errorMessage(error);
@@ -1256,6 +1283,7 @@ export function RequirementComposer({
                       index={i}
                       onChange={(updates) => updateProposed(t.tempId, updates)}
                       localModelIds={localModelIds}
+                      signals={t.backendTicket?.id ? ticketSignals[t.backendTicket.id] : undefined}
                     />
                   ))}
                 </div>

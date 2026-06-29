@@ -1,0 +1,87 @@
+{
+  "tasks": [
+    {
+      "id": "golden-calc-add-one",
+      "requirement": {
+        "id": "R-001",
+        "project_id": "default",
+        "prompt": "Fix add_one so it increments the input.",
+        "scope_paths": ["calc.py"],
+        "constraints": ["Keep the function name stable."],
+        "priority": "medium",
+        "intent": "bugfix",
+        "test_command": "pytest tests/test_calc.py -q"
+      },
+      "repo_files": {
+        "calc.py": "def add_one(value):\n    return value\n",
+        "tests/test_calc.py": "from calc import add_one\n\n\ndef test_add_one():\n    assert add_one(1) == 2\n"
+      },
+      "recorded_tickets": [
+        {
+          "id": "T-001",
+          "title": "Fix add_one increment",
+          "type": "bugfix",
+          "status": "backlog",
+          "priority": "medium",
+          "created_by": "claude",
+          "dependencies": [],
+          "task": {
+            "description": "Change calc.add_one to return the input plus one.",
+            "target_files": ["calc.py"],
+            "constraints": ["Keep the function name stable."]
+          },
+          "context": {
+            "files": [
+              {
+                "path": "calc.py",
+                "content": "def add_one(value):\n    return value\n"
+              }
+            ],
+            "related_symbols": [],
+            "notes": ""
+          },
+          "definition_of_done": {
+            "tests": [
+              {
+                "command": "pytest tests/test_calc.py -q",
+                "expect": "pass",
+                "timeout_sec": 120
+              }
+            ],
+            "static_checks": [],
+            "acceptance_criteria": ["add_one(1) returns 2"]
+          },
+          "execution": {
+            "assigned_model": "qwen3-coder-next",
+            "retry_budget": 3,
+            "attempts": 0,
+            "escalate_to": "tech_lead"
+          },
+          "result": {
+            "outcome": "pending"
+          },
+          "audit": {
+            "reviewed_by": "",
+            "verdict": "pending",
+            "feedback": ""
+          },
+          "metadata": {
+            "project_id": "default",
+            "requirement_id": "R-001"
+          }
+        }
+      ],
+      "expect": {
+        "tickets": [
+          {
+            "title": "Fix add_one increment",
+            "type": "bugfix",
+            "target_files": ["calc.py"],
+            "has_dod_tests": true,
+            "dod_commands": ["pytest tests/test_calc.py -q"]
+          }
+        ]
+      }
+    }
+  ]
+}

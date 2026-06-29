@@ -8,6 +8,8 @@ from datetime import UTC, date, datetime, timedelta
 from statistics import median
 from typing import Literal
 
+from orchestrator.trust import roi_summary, time_to_first_pr
+
 
 InsightRange = Literal["7d", "30d", "all"]
 COST_STATUSES = ("actual", "estimated", "unknown")
@@ -73,6 +75,12 @@ class InsightsService:
             },
             "local_vs_cloud": local_vs_cloud,
             "cost": cost,
+            "time_to_first_pr": time_to_first_pr(tickets, since=since),
+            "roi": roi_summary(
+                tickets=tickets,
+                cost_total_usd=float(cost["total_usd"]),
+                since=since,
+            ),
             "model_scorecard": _model_scorecard(
                 events,
                 finished_by_run=finished_by_run,
