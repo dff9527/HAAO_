@@ -35,3 +35,8 @@ pnpm-debug.log*
 # Local marketing/launch material
 LAUNCH_KIT.md
 ADS_ENGINE.md
+
+# Playwright run artifacts (baselines under *-snapshots ARE versioned)
+frontend/playwright-report/
+frontend/test-results/
+frontend/blob-report/
