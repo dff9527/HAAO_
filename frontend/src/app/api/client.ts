@@ -38,7 +38,15 @@ import type {
   WorkspaceUsage,
 } from './types';
 import type { ChatAttachment, ChatMessage, ChatSegment, CloudModel } from '../types';
-import { getStoredApiToken, promptForApiToken, setStoredApiToken } from './authToken';
+import {
+  clearAuthRequiredFlag,
+  getStoredApiToken,
+  markAuthRequired,
+  promptForAuth,
+  setStoredApiToken,
+  type AuthChallenge,
+  type AuthReason,
+} from './authToken';
 import { identityHeaders } from './authIdentity';
 
 const API_PREFIX = '/api';
@@ -91,26 +99,63 @@ export class ApiError extends Error {
   }
 }
 
-async function responseErrorMessage(response: Response): Promise<string> {
-  const body = await response.text();
-  if (!body) return `Request failed: ${response.status}`;
-  try {
-    const parsed = JSON.parse(body) as { detail?: unknown };
-    if (typeof parsed.detail === 'string') return parsed.detail;
-    if (Array.isArray(parsed.detail)) {
-      return parsed.detail
-        .map((item) => {
-          if (typeof item === 'string') return item;
-          if (item && typeof item === 'object' && 'msg' in item) return String(item.msg);
-          return '';
-        })
-        .filter(Boolean)
-        .join('; ') || body;
-    }
-  } catch {
-    return body;
+interface ParsedResponseBody {
+  detail: string;
+  reason?: string;
+}
+
+function detailFromPayload(parsed: { detail?: unknown }, fallback: string): string {
+  if (typeof parsed.detail === 'string') return parsed.detail;
+  if (Array.isArray(parsed.detail)) {
+    return parsed.detail
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object' && 'msg' in item) return String(item.msg);
+        return '';
+      })
+      .filter(Boolean)
+      .join('; ') || fallback;
   }
-  return body;
+  return fallback;
+}
+
+async function parseResponseBody(response: Response): Promise<ParsedResponseBody> {
+  const body = await response.text();
+  const fallback = body || `Request failed: ${response.status}`;
+  if (!body) return { detail: fallback };
+  try {
+    const parsed = JSON.parse(body) as { detail?: unknown; reason?: string };
+    return {
+      detail: detailFromPayload(parsed, fallback),
+      reason: typeof parsed.reason === 'string' ? parsed.reason : undefined,
+    };
+  } catch {
+    return { detail: body };
+  }
+}
+
+async function responseErrorMessage(response: Response): Promise<string> {
+  const parsed = await parseResponseBody(response);
+  return parsed.detail;
+}
+
+function toAuthReason(status: number, reason?: string): AuthReason {
+  if (reason === 'api_token_required' || reason === 'login_required' || reason === 'forbidden') {
+    return reason;
+  }
+  if (status === 403) return 'forbidden';
+  return 'api_token_required';
+}
+
+function toAuthChallenge(status: number, parsed: ParsedResponseBody): AuthChallenge {
+  return {
+    reason: toAuthReason(status, parsed.reason),
+    detail: parsed.detail,
+  };
+}
+
+function noteApiSuccess(): void {
+  clearAuthRequiredFlag();
 }
 
 function authHeaders(extra?: HeadersInit): HeadersInit {
@@ -137,20 +182,28 @@ function authHeaders(extra?: HeadersInit): HeadersInit {
   return headers;
 }
 
-async function handleUnauthorized<T>(
-  message: string,
+async function handleAuthChallenge<T>(
+  challenge: AuthChallenge,
   retried: boolean,
   retry: () => Promise<T>,
 ): Promise<T | null> {
   if (retried) {
     return null;
   }
-  const token = await promptForApiToken(message);
-  if (!token) {
+  markAuthRequired(challenge.reason);
+  const result = await promptForAuth(challenge);
+  if (!result || result.action === 'dismiss' || result.action === 'login') {
     return null;
   }
-  setStoredApiToken(token);
-  return retry();
+  setStoredApiToken(result.token);
+  const retryResult = await retry();
+  noteApiSuccess();
+  return retryResult;
+}
+
+async function showForbiddenChallenge(challenge: AuthChallenge): Promise<void> {
+  markAuthRequired(challenge.reason);
+  await promptForAuth(challenge);
 }
 
 async function uploadRequest<T>(path: string, body: FormData, retried = false): Promise<T> {
@@ -160,16 +213,26 @@ async function uploadRequest<T>(path: string, body: FormData, retried = false): 
     body,
   });
   if (response.status === 401) {
-    const message = await responseErrorMessage(response);
-    const retry = await handleUnauthorized(message, retried, () => uploadRequest<T>(path, body, true));
+    const parsed = await parseResponseBody(response);
+    const challenge = toAuthChallenge(401, parsed);
+    const retry = await handleAuthChallenge(challenge, retried, () => uploadRequest<T>(path, body, true));
     if (retry !== null) {
       return retry;
     }
-    throw new ApiError(401, message);
+    throw new ApiError(401, challenge.detail);
+  }
+  if (response.status === 403) {
+    const parsed = await parseResponseBody(response);
+    const challenge = toAuthChallenge(403, parsed);
+    if (challenge.reason === 'forbidden') {
+      await showForbiddenChallenge(challenge);
+    }
+    throw new ApiError(403, challenge.detail);
   }
   if (!response.ok) {
     throw new ApiError(response.status, await responseErrorMessage(response));
   }
+  noteApiSuccess();
   return (await response.json()) as T;
 }
 
@@ -183,17 +246,29 @@ async function request<T>(path: string, init?: RequestInit, retried = false): Pr
   });
 
   if (response.status === 401) {
-    const message = await responseErrorMessage(response);
-    const retry = await handleUnauthorized(message, retried, () => request<T>(path, init, true));
+    const parsed = await parseResponseBody(response);
+    const challenge = toAuthChallenge(401, parsed);
+    const retry = await handleAuthChallenge(challenge, retried, () => request<T>(path, init, true));
     if (retry !== null) {
       return retry;
     }
-    throw new ApiError(401, message);
+    throw new ApiError(401, challenge.detail);
+  }
+
+  if (response.status === 403) {
+    const parsed = await parseResponseBody(response);
+    const challenge = toAuthChallenge(403, parsed);
+    if (challenge.reason === 'forbidden') {
+      await showForbiddenChallenge(challenge);
+    }
+    throw new ApiError(403, challenge.detail);
   }
 
   if (!response.ok) {
     throw new ApiError(response.status, await responseErrorMessage(response));
   }
+
+  noteApiSuccess();
 
   if (response.status === 204) {
     return undefined as T;

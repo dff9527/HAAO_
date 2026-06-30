@@ -7,6 +7,7 @@ from orchestrator.api import _sqlite_path, router
 from orchestrator.authz import (
     AuthenticationError,
     AuthorizationError,
+    auth_enabled,
     classify_action,
     require_action,
     resolve_auth_context,
@@ -60,6 +61,8 @@ async def api_token_auth(request: Request, call_next):
 
     connection = connect(_sqlite_path(settings.database_url))
     try:
+        settings_repository = SettingsRepository(connection)
+        enforcement_enabled = auth_enabled(settings_repository, api_token=token)
         if _is_runner_endpoint(path):
             runner_token = _runner_token_from_request(request)
             if not runner_token or RunnerRepository(connection).authenticate(runner_token) is None:
@@ -74,13 +77,23 @@ async def api_token_auth(request: Request, call_next):
             expected = f"Bearer {token}"
             has_api_token = request.headers.get("authorization") == expected
             if not has_api_token and not session_token:
-                return JSONResponse({"detail": "Invalid or missing API token"}, status_code=401)
+                return _auth_error_response(
+                    "API token required",
+                    status_code=401,
+                    reason="api_token_required",
+                    www_authenticate='Bearer realm="haao"',
+                )
 
         if session_token and (not has_api_token or not header_user_id):
             try:
                 session = decode_session_token(session_token)
             except OIDCVerificationError as exc:
-                return JSONResponse({"detail": str(exc)}, status_code=401)
+                return _auth_error_response(
+                    "Login required",
+                    status_code=401,
+                    reason="login_required",
+                    www_authenticate='Bearer realm="haao"',
+                )
             header_user_id = session.user_id
             header_workspace_id = session.workspace_id
 
@@ -90,13 +103,20 @@ async def api_token_auth(request: Request, call_next):
                 identity,
                 user_id=header_user_id,
                 workspace_id=header_workspace_id,
+                auth_enabled=enforcement_enabled,
+                api_token_authenticated=has_api_token,
             )
             action = classify_action(request.method, path)
             require_action(auth_context, action)
         except AuthenticationError as exc:
-            return JSONResponse({"detail": str(exc)}, status_code=401)
+            return _auth_error_response(
+                str(exc),
+                status_code=401,
+                reason=exc.reason,
+                www_authenticate='Bearer realm="haao"',
+            )
         except AuthorizationError as exc:
-            return JSONResponse({"detail": str(exc)}, status_code=403)
+            return _auth_error_response(str(exc), status_code=403, reason=exc.reason)
 
         request.state.auth_context = auth_context
         response = await call_next(request)
@@ -131,6 +151,21 @@ def _is_runner_endpoint(path: str) -> bool:
             normalized.startswith("/runner/jobs/")
             and (normalized.endswith("/complete") or normalized.endswith("/release"))
         )
+    )
+
+
+def _auth_error_response(
+    detail: str,
+    *,
+    status_code: int,
+    reason: str,
+    www_authenticate: str | None = None,
+) -> JSONResponse:
+    headers = {"WWW-Authenticate": www_authenticate} if www_authenticate else None
+    return JSONResponse(
+        {"detail": detail, "reason": reason},
+        status_code=status_code,
+        headers=headers,
     )
 
 

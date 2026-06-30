@@ -101,8 +101,13 @@ def test_api_token_auth_for_api_routes_and_health(tmp_path, monkeypatch) -> None
     try:
         client = TestClient(app)
         assert client.get("/health").status_code == 200
-        assert client.get("/api/chat/messages?project_id=default").status_code == 401
-        assert client.get("/config/integrations").status_code == 401
+        missing = client.get("/api/chat/messages?project_id=default")
+        assert missing.status_code == 401
+        assert missing.json()["reason"] == "api_token_required"
+        assert missing.headers["www-authenticate"] == 'Bearer realm="haao"'
+        wrong = client.get("/config/integrations", headers={"Authorization": "Bearer wrong"})
+        assert wrong.status_code == 401
+        assert wrong.json()["reason"] == "api_token_required"
         bare_ok = client.get(
             "/config/integrations",
             headers={"Authorization": "Bearer token-123"},

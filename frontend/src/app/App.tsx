@@ -13,7 +13,7 @@ import { RequirementComposer } from './components/RequirementComposer';
 import { RequirementSummaryModal } from './components/RequirementSummaryModal';
 import { NewTicketModal } from './components/NewTicketModal';
 import { ToastStack, type ToastMessage } from './components/Toast';
-import { ApiTokenPrompt } from './components/ApiTokenPrompt';
+import { AuthPrompt } from './components/AuthPrompt';
 import { ModelsPage } from './components/ModelsPage';
 import { ActivityPage } from './components/ActivityPage';
 import { InsightsPage } from './components/InsightsPage';
@@ -1290,6 +1290,7 @@ export default function App() {
   return (
     <DndProvider backend={HTML5Backend}>
       <div className="h-screen flex flex-col bg-background text-foreground overflow-hidden">
+        <AuthPrompt />
         <TopBar
           darkMode={darkMode}
           onToggleDark={() => setDarkMode((value) => !value)}
@@ -1586,7 +1587,6 @@ export default function App() {
         })()}
 
         <ToastStack toasts={toasts} onDismiss={dismissToast} />
-        <ApiTokenPrompt />
         <OnboardingWizard
           open={onboardingOpen}
           projectPathReady={projectPathReady}

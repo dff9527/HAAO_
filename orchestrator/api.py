@@ -3658,19 +3658,22 @@ async def ticket_logs(
 ) -> None:
     settings = get_settings()
     token = settings.haao_api_token.strip()
-    if token and not _websocket_token_valid(websocket, token):
+    websocket_api_token_authenticated = bool(token and _websocket_token_valid(websocket, token))
+    if token and not websocket_api_token_authenticated:
         await websocket.close(code=1008)
         return
     connection = connect(_sqlite_path(settings.database_url))
     try:
         identity = IdentityRepository(connection)
-        from orchestrator.authz import AuthorizationError, AuthenticationError, require_action, resolve_auth_context
+        from orchestrator.authz import AuthorizationError, AuthenticationError, auth_enabled, require_action, resolve_auth_context
 
         try:
             context = resolve_auth_context(
                 identity,
                 user_id=websocket.headers.get("x-haao-user-id"),
                 workspace_id=websocket.headers.get("x-haao-workspace-id") or project_id,
+                auth_enabled=auth_enabled(SettingsRepository(connection), api_token=token),
+                api_token_authenticated=websocket_api_token_authenticated,
             )
             require_action(context, "read")
         except (AuthenticationError, AuthorizationError):

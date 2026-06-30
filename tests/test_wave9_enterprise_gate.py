@@ -11,9 +11,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from orchestrator.config import get_settings
-from orchestrator.db.sqlite import AuditRepository, IdentityRepository, connect
+from orchestrator.db.sqlite import AuditRepository, IdentityRepository, SettingsRepository, connect
 from orchestrator.main import app
-from orchestrator.sso import issue_session_token
+from orchestrator.sso import OIDCConfigRepository, issue_session_token
 
 
 @pytest.fixture(autouse=True)
@@ -108,6 +108,60 @@ def test_oidc_absent_fallback_stays_unchanged(tmp_path: Path, monkeypatch) -> No
     usage = client.get("/api/workspace/usage")
     assert usage.status_code == 200
     assert usage.json() == {"seats_used": 0, "seat_limit": None, "plan": "self-host"}
+
+
+def test_stray_membership_does_not_disable_implicit_owner_mode(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "haao.sqlite3"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.delenv("HAAO_API_TOKEN", raising=False)
+    monkeypatch.setenv("HAAO_SECRET_KEY", "test-secret")
+    get_settings.cache_clear()
+
+    connection = connect(db_path)
+    IdentityRepository(connection).set_membership(user_id="sso-test-user", workspace_id="default", role="viewer")
+
+    client = TestClient(app)
+    usage = client.get("/api/workspace/usage")
+    admin_write = client.post(
+        "/api/config/integrations",
+        json={"provider": "github", "token": "pat", "scopes": ["repo"], "label": "GitHub"},
+    )
+
+    assert usage.status_code == 200
+    assert usage.json()["seats_used"] == 1
+    assert admin_write.status_code == 200
+
+
+def test_oidc_configured_requires_login_and_accepts_session(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "haao.sqlite3"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.delenv("HAAO_API_TOKEN", raising=False)
+    monkeypatch.setenv("HAAO_SECRET_KEY", "test-secret")
+    get_settings.cache_clear()
+
+    connection = connect(db_path)
+    settings_repository = SettingsRepository(connection)
+    OIDCConfigRepository(settings_repository).set(
+        {
+            "issuer": "https://idp.example.test",
+            "client_id": "haao-client",
+            "client_secret": "oidc-secret",
+            "redirect_uri": "http://localhost/auth/oidc/callback",
+            "workspace_id": "default",
+        }
+    )
+    IdentityRepository(connection).set_membership(user_id="oidc-user", workspace_id="default", role="owner")
+
+    client = TestClient(app)
+    missing = client.get("/api/workspace/usage")
+    session_token = issue_session_token(user_id="oidc-user", workspace_id="default")
+    allowed = client.get("/api/workspace/usage", headers={"X-HAAO-Session": session_token})
+
+    assert missing.status_code == 401
+    assert missing.json()["reason"] == "login_required"
+    assert missing.headers["www-authenticate"] == 'Bearer realm="haao"'
+    assert allowed.status_code == 200
+    assert allowed.json()["seats_used"] == 1
 
 
 def test_retention_policy_round_trip_purge_idempotent_audited_and_null_keep(

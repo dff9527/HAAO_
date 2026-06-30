@@ -35,6 +35,7 @@ def teardown_function() -> None:
 def test_client_runner_round_trip_against_in_process_control_plane(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "haao.sqlite3"
     _configure_env(monkeypatch, db_path)
+    IdentityRepository(connect(db_path)).set_membership(user_id="admin", workspace_id="default", role="admin")
     client = TestClient(app)
     admin_headers = _headers("admin")
     queued = client.post(

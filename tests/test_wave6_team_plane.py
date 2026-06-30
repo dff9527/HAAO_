@@ -78,6 +78,8 @@ def test_rbac_matrix_for_privileged_action(tmp_path: Path, monkeypatch) -> None:
             },
         )
         statuses[role] = response.status_code
+        if response.status_code == 403:
+            assert response.json()["reason"] == "forbidden"
 
     assert statuses == {"owner": 200, "admin": 200, "member": 403, "viewer": 403}
 
