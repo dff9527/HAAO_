@@ -75,7 +75,7 @@ HAAO executes AI-written code and holds model/git credentials, so safety is firs
                   ▼        ▲
         ┌────────────────────────────────┐
         │   Orchestrator (Scrum Master)  │  state machine · routing · retry · escalation · run-events
-        └─┬────────┬───────────┬─────────┬┘
+        └─┬────────┬───────────┬────────┬┘
           │ decompose          │ run tests│ open PR
           │ + audit  │ dispatch │ (sandbox)│
         ┌─▼─────┐ ┌──▼───────┐ ┌▼────────┐ ┌▼──────────────┐
