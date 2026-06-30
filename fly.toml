@@ -1,0 +1,32 @@
+# HAAO control plane — Fly.io deployment.
+# Control plane only coordinates work (queue, leases, run events, audit). It never
+# executes code and never stores provider keys — those live with the client runner.
+# Secrets (HAAO_SECRET_KEY, HAAO_API_TOKEN) are set via `fly secrets set`, NOT here.
+#
+# NOTE: this first cut uses the image's default ephemeral sqlite (writable by the
+# non-root app user). State resets if the machine is recreated. For production,
+# attach a Fly volume at /data, run the app as root (or chown /data via an
+# entrypoint), and set DATABASE_URL=sqlite:////data/haao.sqlite3.
+app = "haao-cp-dff9527"           # must be globally unique — change if taken
+primary_region = "nrt"            # Tokyo; pick the region closest to you
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
