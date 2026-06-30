@@ -18,7 +18,7 @@ class Project(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     env_allowlist: list[str] = Field(default_factory=lambda: ["PATH", "PYTHONPATH"])
     test_allow_network: bool = False
-    sandbox_mode: Literal["auto", "docker", "unshare", "none"] = "auto"
+    sandbox_mode: Literal["auto", "docker", "unshare", "none", "strict"] = "auto"
     setup_cmd: str = ""
     cleanup_cmd: str = ""
     created_at: datetime | None = None

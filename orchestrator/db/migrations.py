@@ -107,6 +107,11 @@ def migrate_wave6_team_plane_tables(connection: sqlite3.Connection) -> None:
     _ensure_team_plane_tables(connection)
 
 
+def migrate_wave9_enterprise_gate_tables(connection: sqlite3.Connection) -> None:
+    _ensure_team_plane_tables(connection)
+    _ensure_wave9_workspace_columns(connection)
+
+
 def _ensure_chat_tables(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
@@ -182,6 +187,7 @@ def _ensure_foundational_contract_tables(connection: sqlite3.Connection) -> None
                     'retry',
                     'escalation',
                     'egress_attempt',
+                    'attachment_egress',
                     'diff_scope_reject',
                     'rollback',
                     'conflict',
@@ -216,7 +222,7 @@ def _ensure_foundational_contract_tables(connection: sqlite3.Connection) -> None
         );
         """
     )
-    _rebuild_run_events_for_wave5_event_types(connection)
+    _rebuild_run_events_for_wave10_event_types(connection)
 
 
 def _ensure_notifications_table(connection: sqlite3.Connection) -> None:
@@ -327,18 +333,43 @@ def _ensure_team_plane_tables(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_runner_jobs_workspace_status
         ON runner_jobs(workspace_id, status, created_at, id);
+
+        CREATE TABLE IF NOT EXISTS git_app_installations (
+            workspace_id TEXT NOT NULL,
+            provider TEXT NOT NULL CHECK (provider IN ('github', 'gitlab')),
+            account TEXT NOT NULL,
+            installation_id TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            revoked_at TEXT NULL,
+            PRIMARY KEY (workspace_id, provider, account)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_git_app_installations_workspace
+        ON git_app_installations(workspace_id, provider, account);
         """
     )
+    _ensure_wave9_workspace_columns(connection)
 
 
-def _rebuild_run_events_for_wave5_event_types(connection: sqlite3.Connection) -> None:
+def _ensure_wave9_workspace_columns(connection: sqlite3.Connection) -> None:
+    columns = _column_names(connection, "workspaces")
+    if "seat_limit" not in columns:
+        connection.execute("ALTER TABLE workspaces ADD COLUMN seat_limit INTEGER NULL")
+    if "plan" not in columns:
+        connection.execute("ALTER TABLE workspaces ADD COLUMN plan TEXT NOT NULL DEFAULT 'self-host'")
+
+
+def _rebuild_run_events_for_wave10_event_types(connection: sqlite3.Connection) -> None:
     row = connection.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'run_events'"
     ).fetchone()
     if row is None:
         return
     sql = row["sql"] or ""
-    if "diff_scope_reject" in sql and "rollback" in sql and "conflict" in sql:
+    required = ("diff_scope_reject", "rollback", "conflict", "attachment_egress")
+    if all(item in sql for item in required):
         return
 
     connection.execute("ALTER TABLE run_events RENAME TO run_events_old")
@@ -359,6 +390,7 @@ def _rebuild_run_events_for_wave5_event_types(connection: sqlite3.Connection) ->
                     'retry',
                     'escalation',
                     'egress_attempt',
+                    'attachment_egress',
                     'diff_scope_reject',
                     'rollback',
                     'conflict',
@@ -648,6 +680,7 @@ MIGRATIONS: list[Migration] = [
     migrate_requirement_templates_table,
     migrate_wave5_trust_tables,
     migrate_wave6_team_plane_tables,
+    migrate_wave9_enterprise_gate_tables,
 ]
 
 

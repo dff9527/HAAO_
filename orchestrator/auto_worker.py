@@ -246,7 +246,7 @@ def _run_tick(
                 execution_policy=ExecutionPolicy(
                     test_allow_network=test_allow_network,
                     env_allowlist=tuple(env_allowlist),
-                    sandbox_mode=sandbox_mode if sandbox_mode in {"auto", "docker", "unshare", "none"} else "auto",
+                    sandbox_mode=sandbox_mode if sandbox_mode in {"auto", "docker", "unshare", "none", "strict"} else "auto",
                 ),
                 setup_cmd=setup_cmd,
                 cleanup_cmd=cleanup_cmd,

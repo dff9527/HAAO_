@@ -21,9 +21,20 @@ interface Props {
       setupCmd: string;
       cleanupCmd: string;
       defaultBranch: string;
+      sandboxMode: 'auto' | 'strict' | 'docker' | 'unshare' | 'none';
     },
   ) => Promise<void>;
   onOpenSetupWizard?: () => void;
+  oidcConfigured?: boolean;
+  ssoLoading?: boolean;
+  ssoError?: string | null;
+  authSummary?: {
+    actorId: string;
+    workspaceId: string;
+    role: string;
+  } | null;
+  onSignInSso?: () => void;
+  onSignOut?: () => void;
 }
 
 export function TopBar({
@@ -37,9 +48,17 @@ export function TopBar({
   onDeleteProject,
   onUpdateProjectSettings,
   onOpenSetupWizard,
+  oidcConfigured = false,
+  ssoLoading = false,
+  ssoError = null,
+  authSummary = null,
+  onSignInSso,
+  onSignOut,
 }: Props) {
   const [helpOpen, setHelpOpen] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
   const helpRef = useRef<HTMLDivElement>(null);
+  const accountRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!helpOpen) return;
@@ -49,6 +68,15 @@ export function TopBar({
     document.addEventListener('mousedown', onPointerDown);
     return () => document.removeEventListener('mousedown', onPointerDown);
   }, [helpOpen]);
+
+  useEffect(() => {
+    if (!accountOpen) return;
+    function onPointerDown(event: MouseEvent) {
+      if (!accountRef.current?.contains(event.target as Node)) setAccountOpen(false);
+    }
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [accountOpen]);
 
   return (
     <header className="relative h-14 flex items-center justify-between px-3 sm:px-4 border-b border-border bg-card shrink-0 gap-2 min-w-0">
@@ -115,6 +143,56 @@ export function TopBar({
         >
           {darkMode ? <Sun size={14} /> : <Moon size={14} />}
         </button>
+        {oidcConfigured && (
+          <div ref={accountRef} className="relative">
+            <button
+              type="button"
+              onClick={() => setAccountOpen((value) => !value)}
+              className="h-7 rounded px-2 text-[11px] border border-border text-muted-foreground hover:bg-muted hover:text-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              aria-label="Account and SSO"
+              aria-expanded={accountOpen}
+            >
+              {authSummary ? authSummary.actorId : 'Sign in with SSO'}
+            </button>
+            {accountOpen && (
+              <div className="absolute right-0 top-[calc(100%+4px)] z-50 w-64 rounded-lg border border-border bg-card p-2 shadow-xl text-[11px] space-y-2">
+                {authSummary ? (
+                  <>
+                    <div className="px-1 text-muted-foreground">
+                      <p className="text-foreground">{authSummary.actorId}</p>
+                      <p>Workspace: {authSummary.workspaceId}</p>
+                      <p>Role: {authSummary.role}</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAccountOpen(false);
+                        onSignOut?.();
+                      }}
+                      disabled={ssoLoading}
+                      className="w-full rounded-md border border-border px-2.5 py-1.5 text-left hover:bg-muted transition-colors disabled:opacity-50"
+                    >
+                      {ssoLoading ? 'Signing out…' : 'Sign out'}
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAccountOpen(false);
+                      onSignInSso?.();
+                    }}
+                    disabled={ssoLoading}
+                    className="w-full rounded-md border border-border px-2.5 py-1.5 text-left hover:bg-muted transition-colors disabled:opacity-50"
+                  >
+                    {ssoLoading ? 'Redirecting…' : 'Sign in with SSO'}
+                  </button>
+                )}
+                {ssoError && <p className="px-1 text-red-600 dark:text-red-400">{ssoError}</p>}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </header>
   );

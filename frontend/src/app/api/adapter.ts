@@ -223,6 +223,7 @@ export function toUiProject(project: BackendProject): Project {
     env: project.env ?? {},
     setupCmd: project.setup_cmd ?? '',
     cleanupCmd: project.cleanup_cmd ?? '',
+    sandboxMode: project.sandbox_mode ?? 'auto',
   };
 }
 

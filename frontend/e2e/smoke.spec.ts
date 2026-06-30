@@ -23,11 +23,9 @@ test.describe('HAAO smoke', () => {
 
   test('opens a ticket detail from mock board', async ({ page }) => {
     await page.goto('/');
-    const ticket = page.getByText('T-001').first();
-    if (await ticket.isVisible()) {
-      await ticket.click();
-      await expect(page.getByLabel('Close ticket details')).toBeVisible();
-    }
+    await expect(page.getByTestId('ticket-open-T-014')).toBeVisible({ timeout: 15_000 });
+    await page.getByTestId('ticket-open-T-014').click();
+    await expect(page.getByTestId('ticket-detail')).toBeVisible();
   });
 });
 
@@ -35,13 +33,37 @@ test.describe('visual baselines', () => {
   test('home board baseline', async ({ page }) => {
     await page.goto('/');
     await expect(page.getByLabel('Main navigation')).toBeVisible();
+    await expect(page.getByTestId('ticket-card-T-014')).toBeVisible({ timeout: 15_000 });
     await expect(page).toHaveScreenshot('home-board.png', { maxDiffPixelRatio: 0.02 });
   });
 
   test('settings baseline', async ({ page }) => {
     await page.goto('/');
     await page.getByTestId('nav-settings').click();
-    await expect(page.getByText('Default model per role')).toBeVisible();
+    await expect(page.getByTestId('settings-cloud-models')).toBeVisible();
     await expect(page).toHaveScreenshot('settings-page.png', { maxDiffPixelRatio: 0.02 });
+  });
+
+  test('decisions baseline', async ({ page }) => {
+    await page.goto('/');
+    await page.getByTestId('nav-decisions').click();
+    await expect(page.getByTestId('decision-group-gate1_scope')).toBeVisible();
+    await expect(page).toHaveScreenshot('decisions-page.png', { maxDiffPixelRatio: 0.02 });
+  });
+
+  test('activity baseline', async ({ page }) => {
+    await page.goto('/');
+    await page.getByTestId('nav-activity').click();
+    await expect(page.getByTestId('activity-run-RUN-demo-1')).toBeVisible();
+    await page.getByTestId('activity-run-RUN-demo-1').click();
+    await expect(page).toHaveScreenshot('activity-page.png', { maxDiffPixelRatio: 0.02 });
+  });
+
+  test('benchmark report baseline', async ({ page }) => {
+    await page.goto('/');
+    await page.getByTestId('nav-insights').click();
+    await page.getByTestId('insights-benchmark-link').click();
+    await expect(page.getByTestId('benchmark-report-content')).toBeVisible();
+    await expect(page).toHaveScreenshot('benchmark-report.png', { maxDiffPixelRatio: 0.02 });
   });
 });

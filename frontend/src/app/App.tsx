@@ -17,6 +17,7 @@ import { ApiTokenPrompt } from './components/ApiTokenPrompt';
 import { ModelsPage } from './components/ModelsPage';
 import { ActivityPage } from './components/ActivityPage';
 import { InsightsPage } from './components/InsightsPage';
+import { BenchmarkReportPage } from './components/BenchmarkReportPage';
 import { InboxPage } from './components/InboxPage';
 import { DecisionCenterPage } from './components/DecisionCenterPage';
 import { OnboardingWizard } from './components/OnboardingWizard';
@@ -32,7 +33,7 @@ import { buildMockGraph, mergeGraphIntoTickets, MOCK_WORKER_STATUS } from './thr
 import { MOCK_INBOX_UNREAD_COUNT } from './inboxUtils';
 import { ONBOARDING_DISMISSED_KEY } from './dxUtils';
 import { MOCK_DECISIONS, decisionTotalCount } from './trustUtils';
-import { MOCK_IDENTITY_CONTEXT, mockTeamPlaneEnabled } from './teamPlaneUtils';
+import { MOCK_IDENTITY_CONTEXT, mockTeamPlaneEnabled, parseGitInstallCallback, roleLabel } from './teamPlaneUtils';
 import { setStoredIdentity } from './api/authIdentity';
 import { DEFAULT_LOCAL_MODELS } from './constants';
 import { boardHasActiveWork, countNeedsAttention } from './ticketAttention';
@@ -70,7 +71,16 @@ export default function App() {
   const [graphLoading, setGraphLoading] = useState(false);
   const boardSearchRef = useRef<HTMLInputElement>(null);
   const [projects, setProjects] = useState<Project[]>([
-    { id: 'default', name: 'HAAO', path: '', defaultBranch: 'main', env: {}, setupCmd: '', cleanupCmd: '' },
+    {
+      id: 'default',
+      name: 'HAAO',
+      path: '',
+      defaultBranch: 'main',
+      env: {},
+      setupCmd: '',
+      cleanupCmd: '',
+      sandboxMode: 'auto',
+    },
   ]);
   const [selectedProjectId, setSelectedProjectId] = useState('default');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>(INITIAL_CHAT_MESSAGES);
@@ -79,6 +89,9 @@ export default function App() {
   const [allowCloudExecutionModel, setAllowCloudExecutionModel] = useState(false);
   const [integrations, setIntegrations] = useState<IntegrationCredential[]>([]);
   const [identityContext, setIdentityContext] = useState<IdentityContext | null>(null);
+  const [oidcConfigured, setOidcConfigured] = useState(false);
+  const [ssoBusy, setSsoBusy] = useState(false);
+  const [ssoError, setSsoError] = useState<string | null>(null);
   const [inboxUnreadCount, setInboxUnreadCount] = useState<InboxUnreadCount>({ total: 0, by_project: {} });
   const [decisionCount, setDecisionCount] = useState(0);
   const [chatReasonerMode, setChatReasonerMode] = useState<'cloud' | 'local'>('cloud');
@@ -126,6 +139,12 @@ export default function App() {
     }, 5000);
   }, []);
 
+  useEffect(() => {
+    if (parseGitInstallCallback(window.location.search)) {
+      setCurrentPage('models');
+    }
+  }, []);
+
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((toast) => toast.id !== id));
   }, []);
@@ -154,6 +173,41 @@ export default function App() {
   function messageFromError(error: unknown, fallback: string): string {
     return error instanceof Error && error.message ? error.message : fallback;
   }
+
+  const loadIdentityContext = useCallback(async () => {
+    if (mockTeamPlaneEnabled()) {
+      setIdentityContext(MOCK_IDENTITY_CONTEXT);
+      setStoredIdentity(MOCK_IDENTITY_CONTEXT.actor_id, MOCK_IDENTITY_CONTEXT.workspace_id);
+      return;
+    }
+    if (usingMockData) {
+      setIdentityContext({
+        identity_configured: false,
+        actor_id: 'implicit-owner',
+        workspace_id: 'default',
+        role: 'owner',
+        implicit_owner: true,
+        permissions: ['read', 'mutate', 'admin'],
+      });
+      return;
+    }
+    try {
+      const context = await apiClient.getIdentityContext();
+      setIdentityContext(context);
+      if (context.identity_configured && !context.implicit_owner) {
+        setStoredIdentity(context.actor_id, context.workspace_id);
+      }
+    } catch {
+      setIdentityContext({
+        identity_configured: false,
+        actor_id: 'implicit-owner',
+        workspace_id: 'default',
+        role: 'owner',
+        implicit_owner: true,
+        permissions: ['read', 'mutate', 'admin'],
+      });
+    }
+  }, [usingMockData]);
 
   const replaceTicketsFromBackend = useCallback((backendTickets: BackendTicket[]) => {
     setTickets((prev) => {
@@ -262,48 +316,59 @@ export default function App() {
   }, [darkMode]);
 
   useEffect(() => {
-    if (mockTeamPlaneEnabled()) {
-      setIdentityContext(MOCK_IDENTITY_CONTEXT);
-      setStoredIdentity(MOCK_IDENTITY_CONTEXT.actor_id, MOCK_IDENTITY_CONTEXT.workspace_id);
+    void loadIdentityContext();
+  }, [loadIdentityContext]);
+
+  useEffect(() => {
+    if (usingMockData || mockTeamPlaneEnabled()) {
+      setOidcConfigured(false);
       return;
     }
-    if (usingMockData) {
-      setIdentityContext({
-        identity_configured: false,
-        actor_id: 'implicit-owner',
-        workspace_id: 'default',
-        role: 'owner',
-        implicit_owner: true,
-        permissions: ['read', 'mutate', 'admin'],
-      });
-      return;
-    }
-    let active = true;
     apiClient
-      .getIdentityContext()
-      .then((context) => {
-        if (!active) return;
-        setIdentityContext(context);
-        if (context.identity_configured && !context.implicit_owner) {
-          setStoredIdentity(context.actor_id, context.workspace_id);
-        }
+      .getOidcProvider()
+      .then((provider) => setOidcConfigured(Boolean(provider?.configured)))
+      .catch(() => setOidcConfigured(false));
+  }, [usingMockData]);
+
+  useEffect(() => {
+    if (!oidcConfigured || usingMockData) return;
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code') ?? undefined;
+    const idToken = params.get('id_token') ?? undefined;
+    const state = params.get('state') ?? undefined;
+    const workspaceId = params.get('workspace_id') ?? undefined;
+    if (!code && !idToken) return;
+    let cancelled = false;
+    setSsoBusy(true);
+    setSsoError(null);
+    apiClient
+      .completeOidcCallback({
+        code,
+        id_token: idToken,
+        state,
+        workspace_id: workspaceId,
       })
-      .catch(() => {
-        if (active) {
-          setIdentityContext({
-            identity_configured: false,
-            actor_id: 'implicit-owner',
-            workspace_id: 'default',
-            role: 'owner',
-            implicit_owner: true,
-            permissions: ['read', 'mutate', 'admin'],
-          });
-        }
+      .then(async () => {
+        if (cancelled) return;
+        const clean = new URL(window.location.href);
+        clean.searchParams.delete('code');
+        clean.searchParams.delete('id_token');
+        clean.searchParams.delete('state');
+        clean.searchParams.delete('workspace_id');
+        window.history.replaceState({}, '', clean.pathname + clean.search + clean.hash);
+        await loadIdentityContext();
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setSsoError(messageFromError(error, 'SSO callback failed.'));
+      })
+      .finally(() => {
+        if (!cancelled) setSsoBusy(false);
       });
     return () => {
-      active = false;
+      cancelled = true;
     };
-  }, [usingMockData]);
+  }, [loadIdentityContext, oidcConfigured, usingMockData]);
 
   useEffect(() => {
     if (currentPage !== 'home') setSelectedTicketId(null);
@@ -811,6 +876,10 @@ export default function App() {
           : ticket,
       ),
     );
+    if (usingMockData) {
+      pushToast('Ticket approved for development.', 'success');
+      return;
+    }
     void apiClient
       .approveTicket(ticketId, selectedProjectId)
       .then((updated) => {
@@ -821,7 +890,7 @@ export default function App() {
         setTickets(previous);
         pushToast(messageFromError(error, 'Gate 1 approve failed.'));
       });
-  }, [pushToast, replaceTicketFromBackend, selectedProjectId, tickets]);
+  }, [pushToast, replaceTicketFromBackend, selectedProjectId, tickets, usingMockData]);
 
   const handleAccept = useCallback((ticketId: string) => {
     const previous = tickets;
@@ -830,6 +899,10 @@ export default function App() {
         ticket.id === ticketId ? { ...ticket, status: 'Done' as TicketStatus, awaitingAcceptance: false } : ticket,
       ),
     );
+    if (usingMockData) {
+      pushToast('Ticket accepted and closed.', 'success');
+      return;
+    }
     void apiClient
       .acceptTicket(ticketId, selectedProjectId)
       .then((updated) => {
@@ -840,7 +913,7 @@ export default function App() {
         setTickets(previous);
         pushToast(messageFromError(error, 'Gate 2 accept failed.'));
       });
-  }, [pushToast, replaceTicketFromBackend, selectedProjectId, tickets]);
+  }, [pushToast, replaceTicketFromBackend, selectedProjectId, tickets, usingMockData]);
   const handleEscalate = useCallback(
     (ticketId: string) => runAndReplace(ticketId, (id, projectId) => apiClient.escalateTicket(id, { reason: 'manual_escalation' }, projectId)),
     [runAndReplace],
@@ -867,6 +940,22 @@ export default function App() {
 
   const handleSplitTicket = useCallback(
     async (ticketId: string, feedback: string) => {
+      if (usingMockData) {
+        setTickets((prev) =>
+          prev.map((ticket) =>
+            ticket.id === ticketId
+              ? {
+                  ...ticket,
+                  status: 'Split' as TicketStatus,
+                  splitFeedback: feedback,
+                  childTicketIds: [`${ticketId}-a`, `${ticketId}-b`],
+                }
+              : ticket,
+          ),
+        );
+        pushToast(`Split ${ticketId} into smaller tickets (demo).`, 'success');
+        return;
+      }
       try {
         const result = await apiClient.splitTicket(ticketId, feedback, selectedProjectId);
         const ticketsToMerge = [result.ticket, ...(result.children ?? [])];
@@ -879,19 +968,48 @@ export default function App() {
         pushToast(messageFromError(error, 'Split failed.'));
       }
     },
-    [pushToast, replaceTicketsFromBackend, selectedProjectId],
+    [pushToast, replaceTicketsFromBackend, selectedProjectId, usingMockData],
   );
 
   const handleAbandonTicket = useCallback(
-    (ticketId: string, reason: string) => runAndReplace(
-      ticketId,
-      (id, projectId) => apiClient.abandonTicket(id, reason, projectId),
-      'Ticket abandoned.',
-    ),
-    [runAndReplace],
+    (ticketId: string, reason: string) => {
+      if (usingMockData) {
+        setTickets((prev) =>
+          prev.map((ticket) =>
+            ticket.id === ticketId
+              ? { ...ticket, status: 'Abandoned' as TicketStatus, abandonReason: reason }
+              : ticket,
+          ),
+        );
+        pushToast('Ticket abandoned.', 'success');
+        return;
+      }
+      void runAndReplace(
+        ticketId,
+        (id, projectId) => apiClient.abandonTicket(id, reason, projectId),
+        'Ticket abandoned.',
+      );
+    },
+    [pushToast, runAndReplace, usingMockData],
   );
 
   const handleAssignModelAndRetry = useCallback(async (ticketId: string, model: string) => {
+    if (usingMockData) {
+      setTickets((prev) =>
+        prev.map((ticket) =>
+          ticket.id === ticketId
+            ? {
+                ...ticket,
+                assignedModel: model as AssignedModel,
+                status: 'In Progress' as TicketStatus,
+                retryCount: 0,
+              }
+            : ticket,
+        ),
+      );
+      pushToast('Model changed and ticket retried.', 'success');
+      return;
+    }
     try {
       await apiClient.assignModel(ticketId, model, selectedProjectId);
       const updated = await apiClient.retryTicket(ticketId, selectedProjectId);
@@ -900,7 +1018,7 @@ export default function App() {
     } catch (error) {
       pushToast(messageFromError(error, 'Could not change model and retry.'));
     }
-  }, [pushToast, replaceTicketFromBackend, selectedProjectId]);
+  }, [pushToast, replaceTicketFromBackend, selectedProjectId, usingMockData]);
 
   const handleUpdateDependsOn = useCallback(async (ticketId: string, dependsOn: string[]) => {
     if (usingMockData) {
@@ -949,6 +1067,7 @@ export default function App() {
         setupCmd: string;
         cleanupCmd: string;
         defaultBranch: string;
+        sandboxMode: 'auto' | 'strict' | 'docker' | 'unshare' | 'none';
       },
     ) => {
       const project = toUiProject(
@@ -957,6 +1076,7 @@ export default function App() {
           setup_cmd: payload.setupCmd,
           cleanup_cmd: payload.cleanupCmd,
           default_branch: payload.defaultBranch,
+          sandbox_mode: payload.sandboxMode,
         }),
       );
       setProjects((prev) => prev.map((item) => (item.id === project.id ? project : item)));
@@ -1130,6 +1250,43 @@ export default function App() {
     });
   }, []);
 
+  const handleSsoLogin = useCallback(async () => {
+    if (!oidcConfigured) return;
+    setSsoBusy(true);
+    setSsoError(null);
+    try {
+      const url = await apiClient.getOidcLoginUrl(identityContext?.workspace_id);
+      window.location.assign(url);
+    } catch (error) {
+      setSsoError(messageFromError(error, 'Could not start SSO login.'));
+      setSsoBusy(false);
+    }
+  }, [identityContext?.workspace_id, oidcConfigured]);
+
+  const handleSsoLogout = useCallback(async () => {
+    setSsoBusy(true);
+    setSsoError(null);
+    try {
+      await apiClient.logout();
+      setStoredIdentity('', 'default');
+      await loadIdentityContext();
+    } catch (error) {
+      setSsoError(messageFromError(error, 'Could not sign out.'));
+    } finally {
+      setSsoBusy(false);
+    }
+  }, [loadIdentityContext]);
+
+  const authSummary = useMemo(() => {
+    if (!oidcConfigured || !identityContext) return null;
+    if (!identityContext.identity_configured || identityContext.implicit_owner) return null;
+    return {
+      actorId: identityContext.actor_id,
+      workspaceId: identityContext.workspace_id,
+      role: roleLabel(identityContext.role),
+    };
+  }, [identityContext, oidcConfigured]);
+
   return (
     <DndProvider backend={HTML5Backend}>
       <div className="h-screen flex flex-col bg-background text-foreground overflow-hidden">
@@ -1144,6 +1301,12 @@ export default function App() {
           onDeleteProject={handleDeleteProject}
           onUpdateProjectSettings={handleUpdateProjectSettings}
           onOpenSetupWizard={() => setOnboardingOpen(true)}
+          oidcConfigured={oidcConfigured}
+          ssoLoading={ssoBusy}
+          ssoError={ssoError}
+          authSummary={authSummary}
+          onSignInSso={handleSsoLogin}
+          onSignOut={handleSsoLogout}
         />
         {usingMockData && (
           <div className="px-4 py-2 text-xs bg-amber-50 text-amber-800 border-b border-amber-200 dark:bg-amber-950 dark:text-amber-200 dark:border-amber-900">
@@ -1252,6 +1415,12 @@ export default function App() {
                 projectId={selectedProjectId}
                 cloudModels={cloudModels}
                 usingMockData={usingMockData}
+                onOpenBenchmark={() => setCurrentPage('benchmark')}
+              />
+            ) : currentPage === 'benchmark' ? (
+              <BenchmarkReportPage
+                usingMockData={usingMockData}
+                onBack={() => setCurrentPage('insights')}
               />
             ) : currentPage === 'inbox' ? (
               <InboxPage

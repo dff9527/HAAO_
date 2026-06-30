@@ -112,17 +112,171 @@ export function formatRelativeHeartbeat(ts: string | null | undefined): string {
   return `${deltaHr}h ago`;
 }
 
+export function hasConnectedRunner(runners: RunnerRecord[]): boolean {
+  return runners.some((runner) => runner.status === 'online');
+}
+
+export function activeRunners(runners: RunnerRecord[]): RunnerRecord[] {
+  return runners.filter((runner) => runner.status !== 'revoked');
+}
+
+export function maskInstallationId(installationId: string): string {
+  const trimmed = installationId.trim();
+  if (trimmed.length <= 4) return '••••';
+  return `••••${trimmed.slice(-4)}`;
+}
+
+export function controlPlaneOrigin(): string {
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    return window.location.origin;
+  }
+  return 'http://localhost:8000';
+}
+
+export function buildRunnerStartCommand(opts: {
+  token: string;
+  runnerId: string;
+  workspaceId: string;
+  label: string;
+  controlPlaneUrl?: string;
+}): string {
+  const controlPlaneUrl = opts.controlPlaneUrl ?? controlPlaneOrigin();
+  const stateJson = JSON.stringify({
+    runner_id: opts.runnerId,
+    token: opts.token,
+  });
+  return [
+    'mkdir -p .haao',
+    "cat > .haao/runner-state.json <<'EOF'",
+    stateJson,
+    'EOF',
+    `HAAO_CONTROL_PLANE_URL=${controlPlaneUrl} \\`,
+    `HAAO_RUNNER_WORKSPACE_ID=${opts.workspaceId} \\`,
+    `HAAO_RUNNER_LABEL=${opts.label} \\`,
+    'python3 scripts/run_haao_runner.py',
+  ].join('\n');
+}
+
+export function appendInstallState(installUrl: string, workspaceId: string): string {
+  try {
+    const url = new URL(installUrl, controlPlaneOrigin());
+    url.searchParams.set('state', workspaceId);
+    return url.toString();
+  } catch {
+    const separator = installUrl.includes('?') ? '&' : '?';
+    return `${installUrl}${separator}state=${encodeURIComponent(workspaceId)}`;
+  }
+}
+
+export interface GitInstallCallback {
+  provider: 'github' | 'gitlab';
+  workspaceId: string;
+  status: 'success' | 'cancelled' | 'error';
+  installationId?: string;
+  account?: string;
+  error?: string;
+}
+
+export function parseGitInstallCallback(search: string): GitInstallCallback | null {
+  const params = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);
+  const provider = params.get('haao_git_install');
+  if (provider !== 'github' && provider !== 'gitlab') return null;
+  const workspaceId = params.get('state')?.trim() || 'default';
+  const setupAction = params.get('setup_action');
+  const error = params.get('error')?.trim() || params.get('error_description')?.trim();
+  if (error) {
+    return { provider, workspaceId, status: 'error', error };
+  }
+  if (setupAction === 'cancel' || params.get('status') === 'cancelled') {
+    return { provider, workspaceId, status: 'cancelled' };
+  }
+  const installationId = params.get('installation_id')?.trim();
+  if (!installationId) {
+    return {
+      provider,
+      workspaceId,
+      status: 'error',
+      error: 'Install callback missing installation_id.',
+    };
+  }
+  const account = params.get('account')?.trim()
+    || params.get('login')?.trim()
+    || `${provider}-account`;
+  return {
+    provider,
+    workspaceId,
+    status: 'success',
+    installationId,
+    account,
+  };
+}
+
+export function clearGitInstallCallbackParams(): void {
+  if (typeof window === 'undefined') return;
+  const url = new URL(window.location.href);
+  const keys = [
+    'haao_git_install',
+    'installation_id',
+    'setup_action',
+    'state',
+    'account',
+    'login',
+    'status',
+    'error',
+    'error_description',
+  ];
+  let changed = false;
+  for (const key of keys) {
+    if (url.searchParams.has(key)) {
+      url.searchParams.delete(key);
+      changed = true;
+    }
+  }
+  if (changed) {
+    window.history.replaceState({}, '', url.pathname + url.search + url.hash);
+  }
+}
+
+const mockCredentialPreferences: Record<string, GitCredentialKind> = {
+  'default:github': 'app',
+  'default:gitlab': 'pat',
+};
+
+function preferenceKey(workspaceId: string, provider: 'github' | 'gitlab'): string {
+  return `${workspaceId}:${provider}`;
+}
+
+export function getMockGitCredentialPreference(
+  workspaceId: string,
+  provider: 'github' | 'gitlab',
+): GitCredentialKind | null {
+  return mockCredentialPreferences[preferenceKey(workspaceId, provider)] ?? null;
+}
+
+export function setMockGitCredentialPreference(
+  workspaceId: string,
+  provider: 'github' | 'gitlab',
+  kind: GitCredentialKind,
+): void {
+  mockCredentialPreferences[preferenceKey(workspaceId, provider)] = kind;
+}
+
 export function activeGitCredentialKind(
   provider: 'github' | 'gitlab',
   integrations: IntegrationCredential[],
+  preference?: GitCredentialKind | null,
 ): GitCredentialKind | null {
   const providerCreds = integrations.filter(
     (item) => item.provider === provider && item.configured,
   );
   if (providerCreds.length === 0) return null;
-  const appCred = providerCreds.find((item) => item.credential_type === 'app');
-  if (appCred) return 'app';
-  return 'pat';
+  const hasApp = providerCreds.some((item) => item.credential_type === 'app');
+  const hasPat = providerCreds.some((item) => item.credential_type !== 'app');
+  if (preference === 'app' && hasApp) return 'app';
+  if (preference === 'pat' && hasPat) return 'pat';
+  if (hasApp) return 'app';
+  if (hasPat) return 'pat';
+  return null;
 }
 
 export function isForbiddenError(error: unknown): boolean {
@@ -262,6 +416,8 @@ export const MOCK_GIT_APP_INSTALL = {
     installed: true,
     credential_id: 'github-app-default',
     label: 'HAAO GitHub App',
+    account: 'acme-corp',
+    installation_id: '12345678',
   },
   gitlab: {
     provider: 'gitlab' as const,

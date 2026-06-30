@@ -72,7 +72,8 @@ def run_with_policy(
 
     env = _filter_env(env, policy)
 
-    if policy.test_allow_network or policy.sandbox_mode == "none":
+    strict = policy.sandbox_mode == "strict"
+    if not strict and (policy.test_allow_network or policy.sandbox_mode == "none"):
         completed = _run(argv, cwd=cwd, env=env, timeout=timeout)
         primitive: SandboxPrimitive = "none" if policy.sandbox_mode == "none" else "local"
         return SandboxRunResult(completed=completed, primitive=primitive, network_disabled=False)
@@ -82,22 +83,25 @@ def run_with_policy(
         choice = PrimitiveChoice(None, "docker sandbox requires a worktree cwd")
 
     if choice.primitive == "docker":
-        completed = _run_docker(argv, cwd=cwd, env=env, timeout=timeout)
+        completed = _run_docker(argv, cwd=cwd, env=env, timeout=timeout, policy=policy, strict=strict)
         primitive = "docker"
     elif choice.primitive == "unshare":
         completed = _run(["unshare", "-n", "--", *argv], cwd=cwd, env=env, timeout=timeout)
         primitive = "unshare"
     else:
         primitive = "local"
+        reason = "sandbox_strict_unavailable" if strict else "sandbox_unavailable"
         message = (
-            "Network isolation unavailable; running DoD/test command without a sandbox. "
-            f"Reason: {choice.reason or 'no supported primitive available'}"
+            "Strict sandbox unavailable; refusing to claim multi-tenant isolation. "
+            if strict
+            else "Network isolation unavailable; running DoD/test command without a sandbox. "
         )
+        message += f"Reason: {choice.reason or 'no supported primitive available'}"
         _emit(
             audit_sink,
             SandboxAudit(
                 event_type="egress_attempt",
-                reason="sandbox_unavailable",
+                reason=reason,
                 command=command,
                 primitive=primitive,
                 blocked=False,
@@ -108,7 +112,7 @@ def run_with_policy(
             audit_sink,
             SandboxAudit(
                 event_type="error",
-                reason="sandbox_unavailable",
+                reason=reason,
                 command=command,
                 primitive=primitive,
                 blocked=False,
@@ -134,6 +138,8 @@ def run_with_policy(
 
 
 def choose_primitive(mode: str) -> PrimitiveChoice:
+    if mode == "strict":
+        return PrimitiveChoice("docker") if docker_available() else PrimitiveChoice(None, "strict docker unavailable")
     if mode == "docker":
         return PrimitiveChoice("docker") if docker_available() else PrimitiveChoice(None, "docker unavailable")
     if mode == "unshare":
@@ -222,6 +228,8 @@ def _run_docker(
     cwd: Path | None,
     env: dict[str, str],
     timeout: int,
+    policy: ExecutionPolicy,
+    strict: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     if cwd is None:
         raise ValueError("Docker sandbox requires a worktree cwd")
@@ -237,6 +245,24 @@ def _run_docker(
         "-w",
         "/workspace",
     ]
+    if strict:
+        docker_argv.extend(
+            [
+                "--cpus",
+                str(policy.cpu_limit),
+                "--memory",
+                f"{policy.memory_mb}m",
+                "--pids-limit",
+                str(policy.pids_limit),
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--read-only",
+                "--tmpfs",
+                "/tmp:rw,nosuid,nodev,size=64m",
+            ]
+        )
     for key, value in sorted(env.items()):
         if key == "PATH":
             continue

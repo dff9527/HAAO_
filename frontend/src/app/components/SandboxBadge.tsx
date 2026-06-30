@@ -8,10 +8,18 @@ export function sandboxLabelFromPayload(payload: Record<string, unknown>): { lab
   const reason = typeof payload.reason === 'string' ? payload.reason : '';
   const primitive = typeof payload.primitive === 'string' ? payload.primitive : '';
   const kind = typeof payload.kind === 'string' ? payload.kind : '';
+  const mode = typeof payload.sandbox_mode === 'string' ? payload.sandbox_mode : '';
+  const strictMode = mode === 'strict' || reason === 'sandbox_strict_unavailable';
 
   if (stage === 'sandbox' || reason.startsWith('sandbox') || reason === 'network_blocked_by_sandbox') {
+    if (reason === 'sandbox_strict_unavailable') {
+      return { label: 'Strict requested, ran in weaker mode (runtime unavailable)', degraded: true };
+    }
     if (reason === 'sandbox_unavailable' || primitive === 'none' || primitive === 'local') {
       return { label: 'Tests ran best-effort (sandbox unavailable)', degraded: true };
+    }
+    if (strictMode || primitive === 'docker') {
+      return { label: 'Tests ran in strict sandbox', degraded: false };
     }
     if (reason === 'network_blocked_by_sandbox' || ['docker', 'unshare'].includes(primitive)) {
       return { label: 'Tests ran sandboxed (network restricted)', degraded: false };
@@ -25,6 +33,9 @@ export function sandboxLabelFromPayload(payload: Record<string, unknown>): { lab
     const value = payload.sandbox_primitive;
     if (!value || value === 'none' || value === 'local') {
       return { label: 'Tests ran best-effort (no sandbox)', degraded: true };
+    }
+    if (value === 'docker' && strictMode) {
+      return { label: 'Tests ran in strict sandbox', degraded: false };
     }
     return { label: `Tests ran in ${value} sandbox`, degraded: false };
   }

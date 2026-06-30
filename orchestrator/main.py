@@ -14,6 +14,7 @@ from orchestrator.authz import (
 from orchestrator.auto_worker import auto_worker
 from orchestrator.config import get_settings
 from orchestrator.db.sqlite import AuditRepository, IdentityRepository, RunnerRepository, SettingsRepository, connect
+from orchestrator.sso import OIDCVerificationError, SESSION_COOKIE_NAME, decode_session_token
 from orchestrator.role_routing import role_routing_store
 
 
@@ -37,7 +38,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Every route is declared once on `router` with a bare path and served at both the
+# bare path and under `/api` (single source of truth, consistent public surface).
 app.include_router(router)
+app.include_router(router, prefix="/api")
 
 
 @app.middleware("http")
@@ -51,6 +55,8 @@ async def api_token_auth(request: Request, call_next):
     # open — an auth bypass. Token-set => everything but /health requires it.
     if path == "/health":
         return await call_next(request)
+    if _is_public_auth_endpoint(path):
+        return await call_next(request)
 
     connection = connect(_sqlite_path(settings.database_url))
     try:
@@ -60,17 +66,30 @@ async def api_token_auth(request: Request, call_next):
                 return JSONResponse({"detail": "Invalid or missing runner token"}, status_code=401)
             return await call_next(request)
 
+        header_user_id = request.headers.get("x-haao-user-id")
+        header_workspace_id = request.headers.get("x-haao-workspace-id")
+        session_token = _session_token_from_request(request)
+        has_api_token = False
         if token:
             expected = f"Bearer {token}"
-            if request.headers.get("authorization") != expected:
+            has_api_token = request.headers.get("authorization") == expected
+            if not has_api_token and not session_token:
                 return JSONResponse({"detail": "Invalid or missing API token"}, status_code=401)
+
+        if session_token and (not has_api_token or not header_user_id):
+            try:
+                session = decode_session_token(session_token)
+            except OIDCVerificationError as exc:
+                return JSONResponse({"detail": str(exc)}, status_code=401)
+            header_user_id = session.user_id
+            header_workspace_id = session.workspace_id
 
         identity = IdentityRepository(connection)
         try:
             auth_context = resolve_auth_context(
                 identity,
-                user_id=request.headers.get("x-haao-user-id"),
-                workspace_id=request.headers.get("x-haao-workspace-id"),
+                user_id=header_user_id,
+                workspace_id=header_workspace_id,
             )
             action = classify_action(request.method, path)
             require_action(auth_context, action)
@@ -107,9 +126,17 @@ def health() -> dict[str, str]:
 def _is_runner_endpoint(path: str) -> bool:
     normalized = path[4:] if path.startswith("/api/") else path
     return (
-        normalized in {"/runner/heartbeat", "/runner/lease", "/runner/events"}
-        or (normalized.startswith("/runner/jobs/") and normalized.endswith("/complete"))
+        normalized in {"/runner/heartbeat", "/runner/lease", "/runner/events", "/runner/complete"}
+        or (
+            normalized.startswith("/runner/jobs/")
+            and (normalized.endswith("/complete") or normalized.endswith("/release"))
+        )
     )
+
+
+def _is_public_auth_endpoint(path: str) -> bool:
+    normalized = path[4:] if path.startswith("/api/") else path
+    return normalized in {"/auth/oidc/login", "/auth/oidc/callback"}
 
 
 def _runner_token_from_request(request: Request) -> str:
@@ -119,4 +146,19 @@ def _runner_token_from_request(request: Request) -> str:
     authorization = request.headers.get("authorization", "")
     if authorization.startswith("Bearer "):
         return authorization.removeprefix("Bearer ").strip()
+    return ""
+
+
+def _session_token_from_request(request: Request) -> str:
+    header = request.headers.get("x-haao-session", "")
+    if header:
+        return header
+    cookie = request.cookies.get(SESSION_COOKIE_NAME, "")
+    if cookie:
+        return cookie
+    authorization = request.headers.get("authorization", "")
+    if authorization.startswith("Bearer "):
+        bearer = authorization.removeprefix("Bearer ").strip()
+        if bearer.startswith("hses."):
+            return bearer
     return ""

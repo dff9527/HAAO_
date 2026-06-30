@@ -11,6 +11,7 @@ import {
   ShieldAlert,
   ShieldX,
   GitMerge,
+  Send,
 } from 'lucide-react';
 import { apiClient } from '../api/client';
 import type { RunEvent } from '../api/types';
@@ -205,7 +206,7 @@ function RunEventItem({
       );
     case 'egress_attempt':
       return (
-        <div className="rounded-lg border border-orange-300 dark:border-orange-800 bg-orange-50/80 dark:bg-orange-950/30 px-3 py-2">
+        <div data-testid="run-event-egress_attempt" className="rounded-lg border border-orange-300 dark:border-orange-800 bg-orange-50/80 dark:bg-orange-950/30 px-3 py-2">
           <div className="flex items-center gap-1.5 text-[11px] text-orange-800 dark:text-orange-200 font-medium">
             <ShieldAlert size={12} />
             <span>
@@ -230,6 +231,30 @@ function RunEventItem({
           </div>
         </div>
       );
+    case 'attachment_egress': {
+      const provider = payloadString(payload, 'provider') ?? 'provider';
+      const model = payloadString(payload, 'model');
+      const attachmentId = payloadString(payload, 'attachment_id');
+      const target = model ? `${provider}/${model}` : provider;
+      return (
+        <div className="rounded-lg border border-violet-300 dark:border-violet-800 bg-violet-50/80 dark:bg-violet-950/30 px-3 py-2">
+          <div className="flex items-center gap-1.5 text-[11px] text-violet-800 dark:text-violet-200 font-medium">
+            <Send size={12} />
+            <span>Sent this attachment to {target}</span>
+          </div>
+          {attachmentId && (
+            <p className="text-xs font-mono mt-1 break-all text-violet-900 dark:text-violet-100">
+              {attachmentId}
+            </p>
+          )}
+          {payloadString(payload, 'ref') && (
+            <p className="text-[11px] text-violet-700 dark:text-violet-300 mt-1">
+              Ref: {payloadString(payload, 'ref')}
+            </p>
+          )}
+        </div>
+      );
+    }
     case 'conflict':
       return (
         <div className="rounded-lg border border-violet-300 dark:border-violet-800 bg-violet-50/80 dark:bg-violet-950/30 px-3 py-2">
@@ -244,7 +269,7 @@ function RunEventItem({
       );
     case 'diff_scope_reject':
       return (
-        <div className="rounded-lg border border-amber-300 dark:border-amber-800 bg-amber-50/80 dark:bg-amber-950/30 px-3 py-2">
+        <div data-testid="run-event-diff_scope_reject" className="rounded-lg border border-amber-300 dark:border-amber-800 bg-amber-50/80 dark:bg-amber-950/30 px-3 py-2">
           <div className="flex items-center gap-1.5 text-[11px] text-amber-800 dark:text-amber-200 font-medium">
             <ShieldX size={12} />
             <span>Rejected an out-of-scope edit</span>
@@ -343,11 +368,14 @@ function RunCard({
   const provenance = provenanceFromRunStarted(startedEvent?.payload ?? undefined);
   const sandboxEvent = [...run.events].reverse().find((event) => {
     const payload = event.payload ?? {};
-    return payload.stage === 'sandbox' || typeof payload.sandbox_primitive === 'string';
+    return payload.stage === 'sandbox' || typeof payload.sandbox_primitive === 'string' || typeof payload.sandbox_mode === 'string';
   });
 
   return (
-    <div className={`rounded-xl border bg-card overflow-hidden ${run.hasAttention ? 'border-amber-300 dark:border-amber-800' : 'border-border'}`}>
+    <div
+      data-testid={`activity-run-${run.runId}`}
+      className={`rounded-xl border bg-card overflow-hidden ${run.hasAttention ? 'border-amber-300 dark:border-amber-800' : 'border-border'}`}
+    >
       <button
         type="button"
         onClick={onToggle}
@@ -530,7 +558,7 @@ export function ActivityPage({ projectId, tickets, cloudModels, usingMockData, o
   }
 
   return (
-    <div className="flex-1 overflow-y-auto bg-background">
+    <div className="flex-1 overflow-y-auto bg-background" data-testid="activity-page">
       <div className="mx-auto max-w-3xl px-4 sm:px-6 py-8 space-y-4">
         <div className="flex items-start justify-between gap-3">
           <div>

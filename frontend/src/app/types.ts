@@ -33,6 +33,7 @@ export interface Project {
   env: Record<string, string>;
   setupCmd: string;
   cleanupCmd: string;
+  sandboxMode: 'auto' | 'strict' | 'docker' | 'unshare' | 'none';
 }
 
 export interface ContextFile {

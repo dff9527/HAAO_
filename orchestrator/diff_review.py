@@ -8,6 +8,7 @@ from orchestrator.execution_safety import DiffScopeError, GitWorkspaceGuard
 from orchestrator.git_flow import GitTicketFlow, now_iso
 from orchestrator.models.ticket import Result, Ticket, TicketStatus
 from orchestrator.state_machine import InvalidTransitionError, TicketStateService
+from orchestrator.supply_chain import build_supply_chain_signal
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ class DiffReviewService:
         metadata["git_commit"] = commit.commit
         metadata["git_base_branch"] = commit.base_branch
         metadata["diff_approved_at"] = now_iso()
+        metadata["supply_chain"] = build_supply_chain_signal(diff)
         ticket_json["audit"] = {"verdict": "pending", "feedback": "", "reviewed_by": ""}
         self.repository.save(Ticket.from_dict(ticket_json))
         moved = self.state_service.move(ticket.id, TicketStatus.REVIEW).ticket

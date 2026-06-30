@@ -100,7 +100,7 @@ export function DecisionCenterPage({
           </div>
         ) : (
           orderedGroups.map((group) => (
-            <section key={group.id} className="space-y-2">
+            <section key={group.id} className="space-y-2" data-testid={`decision-group-${group.id}`}>
               <div className="flex items-center justify-between gap-2">
                 <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{group.title}</h2>
                 <span className="text-[11px] text-muted-foreground tabular-nums">{group.items.length}</span>
@@ -115,6 +115,7 @@ export function DecisionCenterPage({
                   return (
                     <div
                       key={`${group.id}-${item.type}-${item.id}`}
+                      data-testid={`decision-item-${item.id}`}
                       className="rounded-xl border border-border bg-card px-4 py-3"
                     >
                       <div className="flex flex-wrap items-start justify-between gap-2">

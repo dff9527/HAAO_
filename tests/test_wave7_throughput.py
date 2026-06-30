@@ -4,6 +4,7 @@ import asyncio
 import copy
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,6 +45,92 @@ def test_ticket_lease_prevents_double_claim_and_expires(
     assert reclaimed.metadata.model_dump(mode="json")["lease_worker_id"] == "worker-b"
 
 
+def test_parallel_workers_claim_each_ready_ticket_once_under_load(
+    tmp_path: Path,
+    fresh_ticket_dict: dict,
+) -> None:
+    db_path = tmp_path / "haao.sqlite3"
+    repository = TicketRepository(connect(db_path))
+    expected_ids = [f"T-{700 + index}" for index in range(20)]
+    for index, ticket_id in enumerate(expected_ids):
+        repository.create(
+            _ticket(
+                fresh_ticket_dict,
+                ticket_id=ticket_id,
+                status="ready",
+                target_files=[f"module_{index}.py"],
+            )
+        )
+    repository.connection.close()
+
+    processed: list[str] = []
+    lock = threading.Lock()
+
+    def worker(worker_index: int) -> None:
+        local_repository = TicketRepository(connect(db_path))
+        local_processed: list[str] = []
+        try:
+            while True:
+                claim = local_repository.claim_next_ready_ticket(
+                    worker_id=f"worker-{worker_index}",
+                    ttl_sec=60,
+                )
+                if claim.ticket is None:
+                    break
+                payload = claim.ticket.to_dict()
+                payload["status"] = "done"
+                local_repository.save(Ticket.from_dict(payload))
+                local_repository.release_lease(claim.ticket.id, worker_id=f"worker-{worker_index}")
+                local_processed.append(claim.ticket.id)
+        finally:
+            local_repository.connection.close()
+        with lock:
+            processed.extend(local_processed)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(worker, range(8)))
+
+    assert sorted(processed) == expected_ids
+    assert len(processed) == len(set(processed))
+
+
+def test_expired_crashed_worker_lease_is_reclaimed_by_one_contender(
+    tmp_path: Path,
+    fresh_ticket_dict: dict,
+) -> None:
+    db_path = tmp_path / "haao.sqlite3"
+    repository = TicketRepository(connect(db_path))
+    repository.create(_ticket(fresh_ticket_dict, ticket_id="T-701", status="ready"))
+    leased = repository.lease("T-701", worker_id="crashed-worker", ttl_sec=60)
+    assert leased is not None
+    expired = leased.to_dict()
+    expired["metadata"]["lease_expires_at"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    repository.save(Ticket.from_dict(expired))
+    repository.connection.close()
+
+    winners: list[str] = []
+    lock = threading.Lock()
+
+    def contender(worker_index: int) -> None:
+        local_repository = TicketRepository(connect(db_path))
+        try:
+            claimed = local_repository.lease("T-701", worker_id=f"worker-{worker_index}", ttl_sec=60)
+            if claimed is not None:
+                with lock:
+                    winners.append(f"worker-{worker_index}")
+        finally:
+            local_repository.connection.close()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(contender, range(8)))
+
+    assert len(winners) == 1
+    repository = TicketRepository(connect(db_path))
+    current = repository.get("T-701")
+    assert current is not None
+    assert current.metadata.model_dump(mode="json")["lease_worker_id"] == winners[0]
+
+
 def test_claim_next_ready_respects_depends_on_and_reclaims_after_dependency_done(
     tmp_path: Path,
     fresh_ticket_dict: dict,
@@ -71,6 +158,59 @@ def test_claim_next_ready_respects_depends_on_and_reclaims_after_dependency_done
     assert third.ticket.id == "T-701"
 
 
+def test_depends_on_ordering_holds_under_parallel_claims(
+    tmp_path: Path,
+    fresh_ticket_dict: dict,
+) -> None:
+    db_path = tmp_path / "haao.sqlite3"
+    repository = TicketRepository(connect(db_path))
+    repository.create(_ticket(fresh_ticket_dict, ticket_id="T-700", status="ready", target_files=["base.py"]))
+    child_ids = [f"T-{701 + index}" for index in range(5)]
+    for index, ticket_id in enumerate(child_ids):
+        child = _ticket(
+            fresh_ticket_dict,
+            ticket_id=ticket_id,
+            status="ready",
+            target_files=[f"child_{index}.py"],
+        )
+        payload = child.to_dict()
+        payload["depends_on"] = ["T-700"]
+        payload["dependencies"] = ["T-700"]
+        repository.create(Ticket.from_dict(payload))
+    repository.connection.close()
+
+    def claim_once(worker_index: int) -> str | None:
+        local_repository = TicketRepository(connect(db_path))
+        try:
+            claim = local_repository.claim_next_ready_ticket(
+                worker_id=f"worker-{worker_index}",
+                ttl_sec=60,
+            )
+            return claim.ticket.id if claim.ticket is not None else None
+        finally:
+            local_repository.connection.close()
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        first_wave = list(pool.map(claim_once, range(6)))
+
+    assert first_wave.count("T-700") == 1
+    assert not set(child_ids).intersection(ticket_id for ticket_id in first_wave if ticket_id)
+
+    repository = TicketRepository(connect(db_path))
+    parent = repository.get("T-700")
+    assert parent is not None
+    payload = parent.to_dict()
+    payload["status"] = "done"
+    repository.save(Ticket.from_dict(payload))
+    repository.release_lease("T-700")
+    repository.connection.close()
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        second_wave = list(pool.map(claim_once, range(10, 15)))
+
+    assert set(second_wave) == set(child_ids)
+
+
 def test_overlapping_target_files_serialize_and_emit_conflict_event(
     tmp_path: Path,
     fresh_ticket_dict: dict,
@@ -96,6 +236,95 @@ def test_overlapping_target_files_serialize_and_emit_conflict_event(
     event = RunEventRepository(connection).list_run_events("default", ticket_id="T-702")[0]
     assert event.event_type == "conflict"
     assert event.payload["reason"] == "target_file_overlap"
+    assert event.payload["conflicting_ticket_ids"] == ["T-701"]
+
+
+def test_overlapping_target_files_do_not_execute_concurrently_under_workers(
+    tmp_path: Path,
+    fresh_ticket_dict: dict,
+) -> None:
+    db_path = tmp_path / "haao.sqlite3"
+    setup_repository = TicketRepository(connect(db_path))
+    setup_repository.create(
+        _ticket(fresh_ticket_dict, ticket_id="T-701", status="ready", target_files=["shared.py"])
+    )
+    setup_repository.create(
+        _ticket(fresh_ticket_dict, ticket_id="T-702", status="ready", target_files=["shared.py"])
+    )
+    setup_repository.connection.close()
+
+    entered = threading.Event()
+    release = threading.Event()
+    active_files: set[str] = set()
+    max_active = 0
+    executed: list[str] = []
+    lock = threading.Lock()
+
+    class BlockingExecution:
+        def __init__(self, repository: TicketRepository) -> None:
+            self.repository = repository
+
+        def run_ticket(self, ticket_id: str):
+            nonlocal max_active
+            ticket = self.repository.get(ticket_id)
+            assert ticket is not None
+            with lock:
+                assert not active_files.intersection(ticket.task.target_files)
+                active_files.update(ticket.task.target_files)
+                executed.append(ticket_id)
+                max_active = max(max_active, len(active_files))
+            entered.set()
+            assert release.wait(timeout=2)
+            with lock:
+                for path in ticket.task.target_files:
+                    active_files.discard(path)
+            payload = ticket.to_dict()
+            payload["status"] = "done"
+            updated = self.repository.save(Ticket.from_dict(payload))
+            return SimpleNamespace(ticket=updated, escalated=False)
+
+    first_repository = TicketRepository(connect(db_path))
+    second_repository = TicketRepository(connect(db_path))
+    first = AutoOrchestrator(
+        first_repository,
+        execution_loop=BlockingExecution(first_repository),
+        review_service=SimpleNamespace(review_ticket=lambda ticket_id: None),
+        escalation_service=SimpleNamespace(handle_blocked_ticket=lambda ticket_id: None),
+        repo_root=tmp_path,
+        allow_dirty_workspace=True,
+        worker_id="worker-a",
+    )
+    second = AutoOrchestrator(
+        second_repository,
+        execution_loop=SimpleNamespace(run_ticket=lambda ticket_id: (_ for _ in ()).throw(AssertionError())),
+        review_service=SimpleNamespace(review_ticket=lambda ticket_id: None),
+        escalation_service=SimpleNamespace(handle_blocked_ticket=lambda ticket_id: None),
+        repo_root=tmp_path,
+        allow_dirty_workspace=True,
+        worker_id="worker-b",
+    )
+
+    first_result = None
+
+    def run_first() -> None:
+        nonlocal first_result
+        first_result = first.run_once()
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert entered.wait(timeout=2)
+
+    second_result = second.run_once()
+    release.set()
+    thread.join(timeout=2)
+
+    assert first_result is not None
+    assert first_result.executed_ticket_ids == ["T-701"]
+    assert second_result.skipped_reason == "target_file_conflict"
+    assert executed == ["T-701"]
+    assert max_active == 1
+    event = RunEventRepository(second_repository.connection).list_run_events("default", ticket_id="T-702")[0]
+    assert event.event_type == "conflict"
     assert event.payload["conflicting_ticket_ids"] == ["T-701"]
 
 

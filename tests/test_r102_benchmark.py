@@ -154,6 +154,87 @@ def test_aggregate_excludes_infra_errors_from_one_shot_denominator() -> None:
     assert summary["infra_errors"] == 1
     assert summary["trials_counted"] == 0
     assert summary["one_shot_rate"] == 0.0
+    assert summary["trial_group_stats"]["one_shot_rate"]["n"] == 0
+
+
+def test_aggregate_reports_trial_variance_fields_and_sample_size() -> None:
+    trials = [
+        RequirementTrialResult(
+            task_id="C-01",
+            trial=1,
+            repo="click",
+            category="bugfix",
+            result="one_shot",
+            mechanical_failure=False,
+            ticket_count=1,
+            max_attempts=0,
+            baseline_failed_first=True,
+            counted_in_metrics=True,
+            verified_one_shot=True,
+            verified_local_finish=True,
+            existing_tests_still_green=True,
+            dod_passed_after=True,
+            local_inference_sec=10,
+        ),
+        RequirementTrialResult(
+            task_id="C-02",
+            trial=1,
+            repo="click",
+            category="bugfix",
+            result="blocked",
+            mechanical_failure=False,
+            ticket_count=1,
+            max_attempts=2,
+            baseline_failed_first=True,
+            counted_in_metrics=True,
+            verified_one_shot=False,
+            verified_local_finish=False,
+            existing_tests_still_green=False,
+            dod_passed_after=False,
+            local_inference_sec=20,
+        ),
+        RequirementTrialResult(
+            task_id="C-01",
+            trial=2,
+            repo="click",
+            category="bugfix",
+            result="one_shot",
+            mechanical_failure=False,
+            ticket_count=1,
+            max_attempts=0,
+            baseline_failed_first=True,
+            counted_in_metrics=True,
+            verified_one_shot=True,
+            verified_local_finish=True,
+            existing_tests_still_green=True,
+            dod_passed_after=True,
+            local_inference_sec=30,
+        ),
+        RequirementTrialResult(
+            task_id="C-02",
+            trial=2,
+            repo="click",
+            category="bugfix",
+            result="infra_error",
+            mechanical_failure=True,
+            ticket_count=0,
+            max_attempts=0,
+            baseline_failed_first=True,
+        ),
+    ]
+
+    summary = aggregate_trial_results(trials)
+
+    assert summary["sample_size"] == 3
+    assert summary["trial_sample_size"] == 2
+    assert summary["infra_errors"] == 1
+    one_shot_stats = summary["trial_group_stats"]["one_shot_rate"]
+    assert one_shot_stats["n"] == 2
+    assert one_shot_stats["mean"] == 0.75
+    assert one_shot_stats["min"] == 0.5
+    assert one_shot_stats["max"] == 1.0
+    assert one_shot_stats["range"] == 0.5
+    assert one_shot_stats["ci95_half_width"] > 0
 
 
 def test_measure_target_file_sizes_records_missing_and_existing(tmp_path, fresh_ticket_dict) -> None:

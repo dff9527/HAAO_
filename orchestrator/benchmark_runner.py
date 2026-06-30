@@ -351,9 +351,48 @@ def aggregate_trial_results(trials: list[RequirementTrialResult]) -> dict[str, A
         round(statistics.median(local_durations), 2) if local_durations else 0.0
     )
     total_cloud_cost_usd = round(sum(trial.cloud_cost_usd for trial in counted), 4)
+    trial_numbers = sorted({trial.trial for trial in trials})
+    trial_group_stats = {
+        "one_shot_rate": _series_stats(
+            [
+                _rate_for_trial_number(counted, trial_number, "verified_one_shot")
+                for trial_number in trial_numbers
+            ],
+        ),
+        "local_finish_rate": _series_stats(
+            [
+                _rate_for_trial_number(counted, trial_number, "verified_local_finish")
+                for trial_number in trial_numbers
+            ],
+        ),
+        "escalation_rate": _series_stats(
+            [
+                _blocked_rate_for_trial_number(counted, trial_number)
+                for trial_number in trial_numbers
+            ],
+        ),
+        "existing_tests_still_green_rate": _series_stats(
+            [
+                _rate_for_trial_number(counted, trial_number, "existing_tests_still_green")
+                for trial_number in trial_numbers
+            ],
+        ),
+        "local_inference_sec": _series_stats(
+            [
+                trial.local_inference_sec
+                for trial in counted
+                if trial.local_inference_sec > 0
+            ],
+        ),
+        "cloud_cost_usd": _series_stats(
+            [trial.cloud_cost_usd for trial in counted],
+        ),
+    }
     return {
         "trials_total": len(trials),
         "trials_counted": total_counted,
+        "sample_size": total_counted,
+        "trial_sample_size": len(trial_numbers),
         "trials_excluded_baseline_passed": excluded_baseline,
         "baseline_failed_first": baseline_failed_first,
         "existing_tests_still_green": existing_green,
@@ -374,9 +413,59 @@ def aggregate_trial_results(trials: list[RequirementTrialResult]) -> dict[str, A
         ),
         "median_local_inference_sec": median_local_inference_sec,
         "total_cloud_cost_usd": total_cloud_cost_usd,
+        "trial_group_stats": trial_group_stats,
         # Backward-compatible alias for older report readers.
         "trials": total_counted,
     }
+
+
+def _series_stats(values: list[float | None]) -> dict[str, float | int]:
+    clean = [float(value) for value in values if value is not None]
+    if not clean:
+        return {
+            "n": 0,
+            "mean": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "range": 0.0,
+            "variance": 0.0,
+            "stdev": 0.0,
+            "ci95_half_width": 0.0,
+        }
+    variance = statistics.variance(clean) if len(clean) > 1 else 0.0
+    stdev = statistics.stdev(clean) if len(clean) > 1 else 0.0
+    return {
+        "n": len(clean),
+        "mean": round(statistics.mean(clean), 4),
+        "min": round(min(clean), 4),
+        "max": round(max(clean), 4),
+        "range": round(max(clean) - min(clean), 4),
+        "variance": round(variance, 4),
+        "stdev": round(stdev, 4),
+        "ci95_half_width": round(1.96 * stdev / (len(clean) ** 0.5), 4) if len(clean) > 1 else 0.0,
+    }
+
+
+def _rate_for_trial_number(
+    trials: list[RequirementTrialResult],
+    trial_number: int,
+    field_name: str,
+) -> float | None:
+    bucket = [trial for trial in trials if trial.trial == trial_number]
+    if not bucket:
+        return None
+    numerator = sum(1 for trial in bucket if bool(getattr(trial, field_name)))
+    return numerator / len(bucket)
+
+
+def _blocked_rate_for_trial_number(
+    trials: list[RequirementTrialResult],
+    trial_number: int,
+) -> float | None:
+    bucket = [trial for trial in trials if trial.trial == trial_number]
+    if not bucket:
+        return None
+    return sum(1 for trial in bucket if trial.result == "blocked") / len(bucket)
 
 
 def probe_dest_relative(task_id: str) -> str:

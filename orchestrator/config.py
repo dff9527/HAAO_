@@ -26,6 +26,20 @@ class Settings(BaseSettings):
     claude_model: str = Field(default="claude-sonnet-4-6", alias="CLAUDE_MODEL")
     haao_api_token: str = Field(default="", alias="HAAO_API_TOKEN")
     haao_sandbox_mode: str = Field(default="", alias="HAAO_SANDBOX_MODE")
+    github_app_id: str = Field(default="", alias="GITHUB_APP_ID")
+    github_app_private_key: str = Field(default="", alias="GITHUB_APP_PRIVATE_KEY")
+    github_api_base_url: str = Field(
+        default="https://api.github.com",
+        alias="GITHUB_API_BASE_URL",
+    )
+    gitlab_api_base_url: str = Field(
+        default="https://gitlab.com/api/v4",
+        alias="GITLAB_API_BASE_URL",
+    )
+    gitlab_app_bootstrap_token: str = Field(
+        default="",
+        alias="GITLAB_APP_BOOTSTRAP_TOKEN",
+    )
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

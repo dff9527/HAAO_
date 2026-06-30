@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Loader2, CheckCircle2, XCircle, Info, Plus, RefreshCw, Trash2, Cloud, Link2 } from 'lucide-react';
 import { ModelCard } from './ModelCard';
 import { Switch } from './ui/switch';
@@ -20,7 +20,10 @@ import { MembersPanel } from './MembersPanel';
 import { AuditLogPanel } from './AuditLogPanel';
 import { RunnersPanel } from './RunnersPanel';
 import { GitCredentialConnect } from './GitCredentialConnect';
+import { RetentionPanel } from './RetentionPanel';
 import {
+  activeGitCredentialKind,
+  getMockGitCredentialPreference,
   hasTeamPermission,
   isReadOnlyTeamRole,
   mockIntegrationsWithApp,
@@ -84,14 +87,16 @@ function ConnectionBlock({
   hint,
   children,
   className = '',
+  'data-testid': testId,
 }: {
   title: string;
   hint?: string;
   children: ReactNode;
   className?: string;
+  'data-testid'?: string;
 }) {
   return (
-    <div className={`rounded-xl border border-border bg-card px-4 py-4 ${className}`}>
+    <div data-testid={testId} className={`rounded-xl border border-border bg-card px-4 py-4 ${className}`}>
       <div className="mb-3">
         <h3 className="text-xs font-semibold text-foreground">{title}</h3>
         {hint && <p className="text-[11px] text-muted-foreground mt-0.5">{hint}</p>}
@@ -106,14 +111,16 @@ function CollapsibleConnectionBlock({
   hint,
   children,
   defaultOpen = false,
+  'data-testid': testId,
 }: {
   title: string;
   hint?: string;
   children: ReactNode;
   defaultOpen?: boolean;
+  'data-testid'?: string;
 }) {
   return (
-    <details className="rounded-xl border border-border bg-card group" open={defaultOpen}>
+    <details data-testid={testId} className="rounded-xl border border-border bg-card group" open={defaultOpen}>
       <summary className="px-4 py-3 cursor-pointer list-none flex items-center gap-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-xl">
         <span className="text-xs font-semibold text-foreground">{title}</span>
         {hint && <span className="text-[11px] text-muted-foreground truncate">{hint}</span>}
@@ -295,26 +302,42 @@ export function ModelsPage({
     return false;
   }
 
-  useEffect(() => {
-    let active = true;
+  const reloadIntegrations = useCallback(async () => {
     setIntegrationsLoading(true);
-    const load = mockTeamPlaneEnabled()
-      ? Promise.resolve(mockIntegrationsWithApp())
-      : apiClient.listIntegrations();
-    load
-      .then((items) => {
-        if (active) setIntegrations(items);
-      })
-      .catch(() => {
-        if (active) setIntegrations([]);
-      })
-      .finally(() => {
-        if (active) setIntegrationsLoading(false);
-      });
-    return () => {
-      active = false;
-    };
+    try {
+      const items = mockTeamPlaneEnabled()
+        ? mockIntegrationsWithApp()
+        : await apiClient.listIntegrations();
+      setIntegrations(items);
+    } catch {
+      setIntegrations(mockTeamPlaneEnabled() ? mockIntegrationsWithApp() : []);
+    } finally {
+      setIntegrationsLoading(false);
+    }
   }, []);
+
+  const githubPrCredential = teamActive
+    ? activeGitCredentialKind(
+        'github',
+        integrations,
+        mockTeamPlaneEnabled()
+          ? getMockGitCredentialPreference(identityContext?.workspace_id ?? 'default', 'github')
+          : null,
+      )
+    : null;
+  const gitlabPrCredential = teamActive
+    ? activeGitCredentialKind(
+        'gitlab',
+        integrations,
+        mockTeamPlaneEnabled()
+          ? getMockGitCredentialPreference(identityContext?.workspace_id ?? 'default', 'gitlab')
+          : null,
+      )
+    : null;
+
+  useEffect(() => {
+    void reloadIntegrations();
+  }, [reloadIntegrations]);
 
   useEffect(() => {
     setEndpointRows(localModelEndpoints);
@@ -687,7 +710,7 @@ export function ModelsPage({
             )}
           </CollapsibleConnectionBlock>
 
-          <ConnectionBlock title="Cloud models & API keys" hint="Encrypted on server; Claude default uses env key.">
+          <ConnectionBlock title="Cloud models & API keys" hint="Encrypted on server; Claude default uses env key." data-testid="settings-cloud-models">
                 {cloudModels.length > 0 && (
                   <div className="space-y-2 mb-3">
                     {cloudModels.map((model) => (
@@ -903,6 +926,19 @@ export function ModelsPage({
           </ConnectionBlock>
 
           <CollapsibleConnectionBlock title="Integrations" hint="GitHub, GitLab, Slack — encrypted tokens.">
+                {teamActive && identityContext && (
+                  <p className="text-[11px] text-muted-foreground mb-2">
+                    Pull requests · GitHub{' '}
+                    <span className="font-medium text-foreground">
+                      {githubPrCredential ? (githubPrCredential === 'app' ? 'App' : 'PAT') : 'not configured'}
+                    </span>
+                    {' · '}
+                    GitLab{' '}
+                    <span className="font-medium text-foreground">
+                      {gitlabPrCredential ? (gitlabPrCredential === 'app' ? 'App' : 'PAT') : 'not configured'}
+                    </span>
+                  </p>
+                )}
                 {integrationsLoading ? (
                   <div className="flex items-center gap-2 text-xs text-muted-foreground py-1">
                     <Loader2 size={12} className="animate-spin" />
@@ -966,12 +1002,14 @@ export function ModelsPage({
                       identityContext={identityContext}
                       integrations={integrations}
                       onForbidden={onForbidden}
+                      onIntegrationsChange={() => void reloadIntegrations()}
                     />
                     <GitCredentialConnect
                       provider="gitlab"
                       identityContext={identityContext}
                       integrations={integrations}
                       onForbidden={onForbidden}
+                      onIntegrationsChange={() => void reloadIntegrations()}
                     />
                   </div>
                 )}
@@ -1097,13 +1135,16 @@ export function ModelsPage({
 
           {teamActive && identityContext && (
             <>
-              <CollapsibleConnectionBlock title="Members" hint="Workspace roles and invites.">
+              <CollapsibleConnectionBlock title="Members" hint="Workspace roles and invites." data-testid="settings-members">
                 <MembersPanel identityContext={identityContext} onForbidden={onForbidden} />
+              </CollapsibleConnectionBlock>
+              <CollapsibleConnectionBlock title="Retention" hint="Workspace data retention policy and purge.">
+                <RetentionPanel identityContext={identityContext} onForbidden={onForbidden} />
               </CollapsibleConnectionBlock>
               <CollapsibleConnectionBlock title="Audit log" hint="Append-only privileged action history.">
                 <AuditLogPanel identityContext={identityContext} />
               </CollapsibleConnectionBlock>
-              <CollapsibleConnectionBlock title="Runners" hint="Where execution runs — split-plane seam.">
+              <CollapsibleConnectionBlock title="Runners" hint="Where execution runs — split-plane seam." data-testid="settings-runners" defaultOpen>
                 <RunnersPanel identityContext={identityContext} onForbidden={onForbidden} />
               </CollapsibleConnectionBlock>
             </>

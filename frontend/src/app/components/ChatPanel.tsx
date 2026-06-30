@@ -228,6 +228,7 @@ function MessageBubble({
             {requirement && (
               <button
                 type="button"
+                data-testid={`chat-proposal-${message.requirement_id}`}
                 onClick={() => onOpenRequirement(message.requirement_id!)}
                 className="w-full text-left rounded-lg border border-border bg-card px-2.5 py-2 text-xs hover:bg-muted/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
@@ -389,6 +390,7 @@ export function ChatPanel({
 
   return (
     <aside
+      data-testid="chat-panel"
       className={`shrink-0 border-r border-border bg-card flex flex-col min-h-0 transition-[width] duration-200 ${
         isRail ? 'w-[220px]' : 'w-[min(420px,38vw)]'
       } ${dragActive ? 'ring-2 ring-inset ring-primary/40' : ''}`}
@@ -546,12 +548,14 @@ export function ChatPanel({
             rows={isRail ? 2 : 3}
             placeholder={isRail ? 'Reply…' : 'Describe what you want built…'}
             aria-label="Chat message"
+            data-testid="chat-message-input"
             className="flex-1 resize-none rounded-lg border border-border bg-background px-2.5 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
           />
           <button
             type="submit"
             disabled={!canSend}
             aria-label="Send message"
+            data-testid="chat-send"
             className="h-8 w-8 shrink-0 flex items-center justify-center rounded-lg bg-primary text-primary-foreground disabled:opacity-50 hover:opacity-90 transition-opacity focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             {sending ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}

@@ -63,6 +63,7 @@ interface Props {
   projectId: string;
   cloudModels: CloudModel[];
   usingMockData: boolean;
+  onOpenBenchmark?: () => void;
 }
 
 function MetricCard({
@@ -88,7 +89,7 @@ function MetricCard({
   );
 }
 
-export function InsightsPage({ projectId, cloudModels, usingMockData }: Props) {
+export function InsightsPage({ projectId, cloudModels, usingMockData, onOpenBenchmark }: Props) {
   const [range, setRange] = useState<InsightsRange>('30d');
   const [data, setData] = useState<InsightsPayload | null>(usingMockData ? MOCK_INSIGHTS : null);
   const [loading, setLoading] = useState(!usingMockData);
@@ -163,6 +164,16 @@ export function InsightsPage({ projectId, cloudModels, usingMockData }: Props) {
             <p className="text-xs text-muted-foreground mt-1">
               Throughput, cycle time, escalation, cost, and per-model scorecards.
             </p>
+            {onOpenBenchmark && (
+              <button
+                type="button"
+                data-testid="insights-benchmark-link"
+                onClick={onOpenBenchmark}
+                className="mt-2 text-xs text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded"
+              >
+                View real-repo benchmark proof →
+              </button>
+            )}
           </div>
           <div className="flex items-center gap-1 rounded-lg border border-border bg-muted/40 p-0.5">
             {RANGE_OPTIONS.map((option) => (

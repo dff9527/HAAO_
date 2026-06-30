@@ -359,6 +359,7 @@ export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApp
       <div className="fixed inset-0 bg-black/20 dark:bg-black/40 z-40 backdrop-blur-[1px]" onClick={onClose} aria-hidden="true" />
 
       <div
+        data-testid="ticket-detail"
         className="fixed inset-y-0 right-0 w-full max-w-[580px] bg-card border-l border-border z-50 flex flex-col shadow-xl"
         role="dialog"
         aria-modal="true"
@@ -535,6 +536,7 @@ export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApp
                 </p>
                 <button
                   type="button"
+                  data-testid="gate1-approve"
                   onClick={onApprove}
                   className="mt-2 flex items-center gap-1.5 text-xs px-3 py-1.5 rounded bg-primary text-primary-foreground hover:opacity-90 transition-opacity focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
@@ -998,6 +1000,7 @@ export function TicketDetail({ ticket, onClose, onUpdate, onMove, onRetry, onApp
               {!showRejectInput ? (
                 <div className="flex gap-2">
                   <button
+                    data-testid="gate2-accept"
                     onClick={onAccept}
                     className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded bg-emerald-600 text-white hover:bg-emerald-700 transition-colors"
                   >

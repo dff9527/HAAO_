@@ -8,6 +8,7 @@ from typing import Any, Literal
 from orchestrator.db.sqlite import RequirementRepository, TicketRepository
 from orchestrator.models.requirement import Requirement
 from orchestrator.models.ticket import Ticket
+from orchestrator.supply_chain import build_supply_chain_signal
 
 
 CLOUD_MODEL_HINTS = (
@@ -106,6 +107,9 @@ def build_acceptance_summary(ticket: Ticket) -> dict:
     diff_present = bool(str(result.get("diff") or "").strip())
     pr_url = _string_or_none(metadata.get("pr_url"))
     pr_ready = dod_passed and audit_approved and awaiting_or_done
+    supply_chain = metadata.get("supply_chain")
+    if not isinstance(supply_chain, dict):
+        supply_chain = build_supply_chain_signal(str(result.get("diff") or ""))
     checks = [
         _check("dod_passed", "Definition of Done passed", dod_passed, "critical", str(result.get("outcome") or "pending")),
         _check("gatekeeper_approved", "Gatekeeper approved", audit_approved, "critical", str(audit.get("verdict") or "pending")),
@@ -141,6 +145,7 @@ def build_acceptance_summary(ticket: Ticket) -> dict:
             "provider": _string_or_none(metadata.get("pr_provider")),
             "ready": pr_ready,
         },
+        "supply_chain": supply_chain,
         "derived_only": True,
     }
 

@@ -29,7 +29,13 @@ import type {
   AuditEvent,
   RunnerRecord,
   GitAppInstallInfo,
+  GitCredentialKind,
+  GitCredentialPreference,
   MembershipRole,
+  OIDCProvider,
+  RetentionPolicy,
+  RetentionPurgeCounts,
+  WorkspaceUsage,
 } from './types';
 import type { ChatAttachment, ChatMessage, ChatSegment, CloudModel } from '../types';
 import { getStoredApiToken, promptForApiToken, setStoredApiToken } from './authToken';
@@ -242,7 +248,7 @@ export const apiClient = {
       env?: Record<string, string>;
       env_allowlist?: string[];
       test_allow_network?: boolean;
-      sandbox_mode?: 'auto' | 'docker' | 'unshare' | 'none';
+      sandbox_mode?: 'auto' | 'strict' | 'docker' | 'unshare' | 'none';
       setup_cmd?: string;
       cleanup_cmd?: string;
       default_branch?: string;
@@ -828,6 +834,78 @@ export const apiClient = {
     };
   },
 
+  getOidcProvider: async (): Promise<OIDCProvider | null> => {
+    const data = await requestOptional<{ provider: OIDCProvider | null }>('/auth/oidc');
+    return data?.provider ?? null;
+  },
+
+  getOidcLoginUrl: async (workspaceId?: string): Promise<string> => {
+    const params = new URLSearchParams();
+    if (workspaceId) params.set('workspace_id', workspaceId);
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    const data = await request<{ authorization_url: string }>(`/auth/oidc/login${suffix}`);
+    return data.authorization_url;
+  },
+
+  completeOidcCallback: async (payload: {
+    code?: string;
+    id_token?: string;
+    state?: string;
+    workspace_id?: string;
+  }): Promise<{
+    session_token: string;
+    expires_at: number;
+    user: { id: string; email?: string | null; display_name?: string | null };
+    membership: { user_id: string; workspace_id: string; role: MembershipRole };
+  }> =>
+    request('/auth/oidc/callback', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  logout: async (): Promise<void> => {
+    await request('/auth/logout', { method: 'POST' });
+  },
+
+  getRetentionPolicy: async (workspaceId?: string): Promise<RetentionPolicy> => {
+    const params = new URLSearchParams();
+    if (workspaceId) params.set('workspace', workspaceId);
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    const data = await request<{ policy: RetentionPolicy }>(`/retention${suffix}`);
+    return data.policy;
+  },
+
+  updateRetentionPolicy: async (
+    policy: RetentionPolicy,
+    workspaceId?: string,
+  ): Promise<RetentionPolicy> => {
+    const params = new URLSearchParams();
+    if (workspaceId) params.set('workspace', workspaceId);
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    const data = await request<{ policy: RetentionPolicy }>(`/retention${suffix}`, {
+      method: 'PUT',
+      body: JSON.stringify(policy),
+    });
+    return data.policy;
+  },
+
+  purgeRetentionNow: async (workspaceId?: string): Promise<RetentionPurgeCounts> => {
+    const params = new URLSearchParams();
+    if (workspaceId) params.set('workspace', workspaceId);
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    const data = await request<{ counts: RetentionPurgeCounts }>(`/retention/purge${suffix}`, {
+      method: 'POST',
+    });
+    return data.counts;
+  },
+
+  getWorkspaceUsage: async (workspaceId?: string): Promise<WorkspaceUsage> => {
+    const params = new URLSearchParams();
+    if (workspaceId) params.set('workspace', workspaceId);
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    return request(`/workspace/usage${suffix}`);
+  },
+
   listMemberships: async (workspaceId: string): Promise<WorkspaceMembership[]> => {
     const params = new URLSearchParams({ workspace: workspaceId });
     const data = await requestOptional<{ memberships: WorkspaceMembership[] }>(`/memberships?${params.toString()}`);
@@ -901,4 +979,38 @@ export const apiClient = {
     const params = new URLSearchParams({ provider, workspace: workspaceId });
     return requestOptional<GitAppInstallInfo>(`/config/integrations/app-install?${params.toString()}`);
   },
+
+  upsertGitAppInstallation: async (payload: {
+    workspace_id: string;
+    provider: 'github' | 'gitlab';
+    account: string;
+    installation_id: string;
+    payload?: Record<string, unknown>;
+  }): Promise<GitAppInstallInfo> => {
+    const data = await request<GitAppInstallInfo>('/config/integrations/app-install', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    return data;
+  },
+
+  getGitCredentialPreference: async (
+    provider: 'github' | 'gitlab',
+    workspaceId: string,
+  ): Promise<GitCredentialPreference | null> => {
+    const params = new URLSearchParams({ provider, workspace: workspaceId });
+    return requestOptional<GitCredentialPreference>(
+      `/config/integrations/active-credential?${params.toString()}`,
+    );
+  },
+
+  setGitCredentialPreference: async (payload: {
+    workspace_id: string;
+    provider: 'github' | 'gitlab';
+    credential_kind: GitCredentialKind;
+  }): Promise<GitCredentialPreference> =>
+    request('/config/integrations/active-credential', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
 };

@@ -9,9 +9,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
-from starlette.responses import FileResponse
+from starlette.responses import FileResponse, RedirectResponse
 
 from clients.lmstudio import LMStudioClient
 from clients.claude_po import list_available_claude_models
@@ -24,6 +24,8 @@ from clients.factory import (
 )
 from clients.tech_lead import ClaudeTechLeadClient
 from orchestrator.attachments import AttachmentStorage, AttachmentStorageError
+from orchestrator.attachment_audit import cloud_destination_from_reasoner, record_attachment_egress
+from orchestrator.app_tokens import RealAppTokenMinter
 from orchestrator.auto_orchestrator import AutoOrchestrator
 from orchestrator.auto_worker import auto_worker
 from orchestrator.chat_flow import ChatMessage, ChatService, ReasonerTurn, WorkItem
@@ -52,6 +54,7 @@ from orchestrator.db.sqlite import (
     ChatRepository,
     DuplicateTicketError,
     EvalRunRepository,
+    GitAppInstallationRepository,
     IdentityRepository,
     IntegrationProvider,
     IntegrationRepository,
@@ -62,6 +65,7 @@ from orchestrator.db.sqlite import (
     RunnerTokenRecord,
     RequirementTemplateRepository,
     RunEventRepository,
+    SeatLimitExceededError,
     SettingsRepository,
     TicketDeletionError,
     TicketRepository,
@@ -112,11 +116,19 @@ from orchestrator.pr_flow import (
     PullRequestFlowError,
     PullRequestService,
 )
+from orchestrator.retention import RetentionPolicy, RetentionPurgeService, RetentionRepository
 from orchestrator.requirements_flow import RequirementService
 from orchestrator.review_flow import ReviewService
 from orchestrator.role_routing import role_routing_store
 from orchestrator.runner.dod_runner import TestRunner
 from orchestrator.secrets_crypto import SecretEncryptionError
+from orchestrator.sso import (
+    OIDCConfigRepository,
+    OIDCConfigurationError,
+    OIDCService,
+    OIDCVerificationError,
+    SESSION_COOKIE_NAME,
+)
 from orchestrator.state_machine import InvalidTransitionError, TicketStateService
 
 
@@ -411,12 +423,13 @@ class RequirementServiceGateway:
         attachment_ids: list[str] | None = None,
     ) -> str:
         service = self._service_for_project(project_id)
+        stored_attachments = self.chat_repository.attachments_by_ids(
+            project_id,
+            attachment_ids or [],
+        )
         attachments = [
             RequirementAttachment(type=attachment.kind, value=attachment.stored_path)
-            for attachment in self.chat_repository.attachments_by_ids(
-                project_id,
-                attachment_ids or [],
-            )
+            for attachment in stored_attachments
         ]
         missing_count = len(set(attachment_ids or [])) - len(attachments)
         if missing_count > 0:
@@ -429,6 +442,21 @@ class RequirementServiceGateway:
             attachments=attachments,
             status=RequirementStatus.DRAFT,
         )
+        provider, model = cloud_destination_from_reasoner(self.tech_lead)
+        for attachment in stored_attachments:
+            record_attachment_egress(
+                self.ticket_repository.connection,
+                project_id=project_id,
+                attachment_id=attachment.id,
+                provider=provider,
+                model=model,
+                requirement_id=requirement.id,
+                extra={
+                    "attachment_kind": attachment.kind,
+                    "mime": attachment.mime,
+                    "derived_content": attachment.kind == "file",
+                },
+            )
         result = service.decompose_preview(requirement)
         return result.requirement.id
 
@@ -459,7 +487,7 @@ class ProjectSettingsRequest(BaseModel):
     env: dict[str, str] | None = None
     env_allowlist: list[str] | None = None
     test_allow_network: bool | None = None
-    sandbox_mode: Literal["auto", "docker", "unshare", "none"] | None = None
+    sandbox_mode: Literal["auto", "docker", "unshare", "none", "strict"] | None = None
     setup_cmd: str | None = None
     cleanup_cmd: str | None = None
     default_branch: str | None = None
@@ -665,10 +693,31 @@ class IntegrationCredentialResponse(BaseModel):
     configured: bool
     created_at: str
     updated_at: str
+    credential_type: Literal["pat", "app"] = "pat"
 
 
 class IntegrationCredentialsResponse(BaseModel):
     integrations: list[IntegrationCredentialResponse]
+
+
+class GitAppInstallationRequest(BaseModel):
+    workspace_id: str = "default"
+    provider: Literal["github", "gitlab"]
+    account: str = Field(min_length=1)
+    installation_id: str = Field(min_length=1)
+    payload: dict = Field(default_factory=dict)
+
+
+class GitAppInstallationResponse(BaseModel):
+    workspace_id: str
+    provider: Literal["github", "gitlab"]
+    account: str
+    installation_id: str
+    payload: dict
+    created_at: str
+    updated_at: str
+    revoked_at: str | None = None
+    configured: bool
 
 
 class IntegrationDeleteResponse(BaseModel):
@@ -768,6 +817,81 @@ class MembershipResponse(BaseModel):
     membership: dict
 
 
+class WorkspaceUsageResponse(BaseModel):
+    seats_used: int
+    seat_limit: int | None = None
+    plan: str
+
+
+class WorkspaceSettingsRequest(BaseModel):
+    workspace_id: str = "default"
+    name: str | None = None
+    seat_limit: int | None = Field(default=None, ge=0)
+    plan: str = "self-host"
+
+
+class WorkspaceSettingsResponse(BaseModel):
+    workspace: dict
+
+
+class RetentionPolicyRequest(BaseModel):
+    run_events_days: int | None = Field(default=None, ge=0)
+    ticket_logs_days: int | None = Field(default=None, ge=0)
+    diffs_days: int | None = Field(default=None, ge=0)
+    prompts_days: int | None = Field(default=None, ge=0)
+    attachments_days: int | None = Field(default=None, ge=0)
+
+
+class RetentionPolicyResponse(BaseModel):
+    policy: dict
+
+
+class RetentionPurgeResponse(BaseModel):
+    counts: dict
+
+
+class OIDCProviderRequest(BaseModel):
+    issuer: str = ""
+    client_id: str = ""
+    client_secret: str = ""
+    redirect_uri: str = ""
+    authorization_endpoint: str = ""
+    token_endpoint: str = ""
+    jwks_uri: str = ""
+    jwks: dict | None = None
+    scopes: list[str] = Field(default_factory=lambda: ["openid", "email", "profile"])
+    workspace_id: str = "default"
+    group_claim: str = "groups"
+    role_mapping: dict[str, Literal["owner", "admin", "member", "viewer"]] = Field(default_factory=dict)
+    default_role: Literal["owner", "admin", "member", "viewer"] = "member"
+
+
+class OIDCProviderResponse(BaseModel):
+    provider: dict | None = None
+
+
+class OIDCLoginResponse(BaseModel):
+    authorization_url: str
+
+
+class OIDCCallbackRequest(BaseModel):
+    code: str | None = None
+    id_token: str | None = None
+    state: str | None = None
+    workspace_id: str | None = None
+
+
+class OIDCCallbackResponse(BaseModel):
+    session_token: str
+    expires_at: int
+    user: dict
+    membership: dict
+
+
+class LogoutResponse(BaseModel):
+    ok: bool
+
+
 class AuditEventsResponse(BaseModel):
     events: list[dict]
     next_cursor: int | None = None
@@ -802,6 +926,7 @@ class RunnerLeaseRequest(BaseModel):
 
 
 class RunnerEventsRequest(BaseModel):
+    job_id: str = Field(min_length=1)
     events: list[dict]
 
 
@@ -810,6 +935,7 @@ class RunnerEventsResponse(BaseModel):
 
 
 class RunnerCompleteRequest(BaseModel):
+    job_id: str | None = None
     status: Literal["terminal"] = "terminal"
     result: dict = Field(default_factory=dict)
 
@@ -1035,6 +1161,16 @@ def get_integration_repository(
     connection = connect(_sqlite_path(settings.database_url))
     try:
         yield IntegrationRepository(connection)
+    finally:
+        connection.close()
+
+
+def get_git_app_installation_repository(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Generator[GitAppInstallationRepository]:
+    connection = connect(_sqlite_path(settings.database_url))
+    try:
+        yield GitAppInstallationRepository(connection)
     finally:
         connection.close()
 
@@ -1270,6 +1406,11 @@ def get_pull_request_service(
     integrations: Annotated[IntegrationRepository, Depends(get_integration_repository)],
     run_events: Annotated[RunEventRepository, Depends(get_run_event_repository)],
     project_repository: Annotated[ProjectRepository, Depends(get_project_repository)],
+    app_installations: Annotated[
+        GitAppInstallationRepository,
+        Depends(get_git_app_installation_repository),
+    ],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> PullRequestService:
     project = _resolve_project(project_repository, repository.project_id)
     return PullRequestService(
@@ -1279,6 +1420,8 @@ def get_pull_request_service(
         repo_root=Path(project.path),
         base_branch=project.default_branch,
         workspace_guard=GitWorkspaceGuard(project.path),
+        app_token_minter=RealAppTokenMinter(settings),
+        app_installations=app_installations,
     )
 
 
@@ -1310,7 +1453,6 @@ def get_auto_orchestrator(
     )
 
 
-@router.post("/api/demo/seed", response_model=DemoSeedResponse)
 @router.post("/demo/seed", response_model=DemoSeedResponse)
 def seed_demo_project(
     repository: Annotated[ProjectRepository, Depends(get_project_repository)],
@@ -1408,7 +1550,6 @@ def list_tickets(
     )
 
 
-@router.get("/api/tickets/graph", response_model=TicketGraphResponse)
 @router.get("/tickets/graph", response_model=TicketGraphResponse)
 def tickets_graph(
     repository: Annotated[TicketRepository, Depends(get_repository)],
@@ -1512,7 +1653,6 @@ def delete_ticket(
     return DeleteTicketResponse(deleted=True, ticket_id=ticket_id)
 
 
-@router.get("/api/requirement-templates", response_model=RequirementTemplatesResponse)
 @router.get("/requirement-templates", response_model=RequirementTemplatesResponse)
 def list_requirement_templates(
     repository: Annotated[
@@ -1525,7 +1665,6 @@ def list_requirement_templates(
     )
 
 
-@router.post("/api/requirement-templates", response_model=RequirementTemplateResponse)
 @router.post("/requirement-templates", response_model=RequirementTemplateResponse)
 def upsert_requirement_template(
     request: RequirementTemplateRequest,
@@ -1547,7 +1686,6 @@ def upsert_requirement_template(
     return RequirementTemplateResponse(template=template.to_dict())
 
 
-@router.delete("/api/requirement-templates/{template_id}", response_model=RequirementTemplateDeleteResponse)
 @router.delete("/requirement-templates/{template_id}", response_model=RequirementTemplateDeleteResponse)
 def delete_requirement_template(
     template_id: str,
@@ -1721,7 +1859,6 @@ def get_requirement(
     return RequirementDetailResponse(requirement=requirement.to_dict())
 
 
-@router.get("/api/requirements/{requirement_id}/summary", response_model=RequirementSummaryResponse)
 @router.get("/requirements/{requirement_id}/summary", response_model=RequirementSummaryResponse)
 def get_requirement_summary(
     requirement_id: str,
@@ -1739,7 +1876,6 @@ def get_requirement_summary(
     return RequirementSummaryResponse(summary=summary)
 
 
-@router.post("/api/chat/attachments", response_model=ChatAttachmentResponse)
 @router.post("/chat/attachments", response_model=ChatAttachmentResponse)
 async def upload_chat_attachment(
     repository: Annotated[ChatRepository, Depends(get_chat_repository)],
@@ -1761,7 +1897,6 @@ async def upload_chat_attachment(
     return _chat_attachment_response(attachment)
 
 
-@router.get("/api/chat/attachments/{attachment_id}/content")
 @router.get("/chat/attachments/{attachment_id}/content")
 def get_chat_attachment_content(
     attachment_id: str,
@@ -1778,7 +1913,6 @@ def get_chat_attachment_content(
     return FileResponse(path, media_type=attachment.mime, filename=attachment.filename)
 
 
-@router.post("/api/chat/messages", response_model=ChatTurnResponse)
 @router.post("/chat/messages", response_model=ChatTurnResponse)
 def create_chat_message(
     request: ChatMessageCreateRequest,
@@ -1809,7 +1943,6 @@ def create_chat_message(
     )
 
 
-@router.get("/api/chat/messages", response_model=ChatMessagesResponse)
 @router.get("/chat/messages", response_model=ChatMessagesResponse)
 def list_chat_messages(
     repository: Annotated[ChatRepository, Depends(get_chat_repository)],
@@ -1831,7 +1964,6 @@ def list_chat_messages(
     )
 
 
-@router.post("/api/chat/segments", response_model=ChatSegmentResponse)
 @router.post("/chat/segments", response_model=ChatSegmentResponse)
 def create_chat_segment(
     request: ChatSegmentCreateRequest,
@@ -1844,7 +1976,6 @@ def create_chat_segment(
     return ChatSegmentResponse(**segment.to_dict())
 
 
-@router.get("/api/chat/segments", response_model=ChatSegmentsResponse)
 @router.get("/chat/segments", response_model=ChatSegmentsResponse)
 def list_chat_segments(
     repository: Annotated[ChatRepository, Depends(get_chat_repository)],
@@ -1858,7 +1989,6 @@ def list_chat_segments(
     )
 
 
-@router.get("/api/run-events", response_model=RunEventsResponse)
 @router.get("/run-events", response_model=RunEventsResponse)
 def list_run_events(
     repository: Annotated[RunEventRepository, Depends(get_run_event_repository)],
@@ -1880,7 +2010,6 @@ def list_run_events(
     )
 
 
-@router.get("/api/audit", response_model=AuditEventsResponse)
 @router.get("/audit", response_model=AuditEventsResponse)
 def list_audit_events(
     repository: Annotated[AuditRepository, Depends(get_audit_repository)],
@@ -1895,7 +2024,198 @@ def list_audit_events(
     )
 
 
-@router.post("/api/memberships", response_model=MembershipResponse)
+@router.get("/auth/oidc", response_model=OIDCProviderResponse)
+def get_oidc_provider(
+    settings_repository: Annotated[SettingsRepository, Depends(get_settings_repository)],
+) -> OIDCProviderResponse:
+    try:
+        config = OIDCConfigRepository(settings_repository).get()
+    except SecretEncryptionError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return OIDCProviderResponse(provider=config.public_dict() if config else None)
+
+
+@router.put("/auth/oidc", response_model=OIDCProviderResponse)
+def set_oidc_provider(
+    request: OIDCProviderRequest,
+    settings_repository: Annotated[SettingsRepository, Depends(get_settings_repository)],
+) -> OIDCProviderResponse:
+    try:
+        config = OIDCConfigRepository(settings_repository).set(request.model_dump(mode="json"))
+    except (OIDCConfigurationError, SecretEncryptionError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OIDCProviderResponse(provider=config.public_dict())
+
+
+@router.get("/auth/oidc/login", response_model=OIDCLoginResponse)
+def oidc_login(
+    settings: Annotated[Settings, Depends(get_settings)],
+    workspace_id: str | None = None,
+    redirect: bool = False,
+):
+    connection = connect(_sqlite_path(settings.database_url))
+    try:
+        config = OIDCConfigRepository(SettingsRepository(connection)).get()
+        if config is None or not config.configured:
+            raise HTTPException(status_code=404, detail="OIDC provider is not configured")
+        url = OIDCService(
+            identity=IdentityRepository(connection),
+            audit=AuditRepository(connection),
+            config=config,
+        ).authorization_url(workspace_id=workspace_id)
+    finally:
+        connection.close()
+    if redirect:
+        return RedirectResponse(url)
+    return OIDCLoginResponse(authorization_url=url)
+
+
+@router.post("/auth/oidc/callback", response_model=OIDCCallbackResponse)
+def oidc_callback(
+    request_body: OIDCCallbackRequest,
+    response: Response,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> OIDCCallbackResponse:
+    payload = _complete_oidc_login(
+        settings=settings,
+        code=request_body.code,
+        id_token=request_body.id_token,
+        state=request_body.state,
+        workspace_id=request_body.workspace_id,
+        ip=request.client.host if request.client else None,
+    )
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        payload["session_token"],
+        httponly=True,
+        samesite="lax",
+        max_age=max(0, int(payload["expires_at"]) - int(datetime.now(UTC).timestamp())),
+    )
+    return OIDCCallbackResponse(**payload)
+
+
+@router.get("/auth/oidc/callback", response_model=OIDCCallbackResponse)
+def oidc_callback_get(
+    response: Response,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    code: str | None = None,
+    id_token: str | None = None,
+    state: str | None = None,
+    workspace_id: str | None = None,
+) -> OIDCCallbackResponse:
+    payload = _complete_oidc_login(
+        settings=settings,
+        code=code,
+        id_token=id_token,
+        state=state,
+        workspace_id=workspace_id,
+        ip=request.client.host if request.client else None,
+    )
+    response.set_cookie(SESSION_COOKIE_NAME, payload["session_token"], httponly=True, samesite="lax")
+    return OIDCCallbackResponse(**payload)
+
+
+@router.post("/auth/logout", response_model=LogoutResponse)
+def logout(
+    response: Response,
+    request: Request,
+    audit: Annotated[AuditRepository, Depends(get_audit_repository)],
+) -> LogoutResponse:
+    auth_context = request.state.auth_context
+    audit.append(
+        actor_id=auth_context.actor_id,
+        workspace_id=auth_context.workspace_id,
+        action="auth.logout",
+        target="session",
+    )
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return LogoutResponse(ok=True)
+
+
+@router.get("/retention", response_model=RetentionPolicyResponse)
+def get_retention_policy(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    workspace: str | None = None,
+) -> RetentionPolicyResponse:
+    workspace_id = workspace or request.state.auth_context.workspace_id
+    connection = connect(_sqlite_path(settings.database_url))
+    try:
+        policy = RetentionRepository(connection).get_policy(workspace_id)
+        return RetentionPolicyResponse(policy=policy.to_dict())
+    finally:
+        connection.close()
+
+
+@router.put("/retention", response_model=RetentionPolicyResponse)
+def set_retention_policy(
+    request_body: RetentionPolicyRequest,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    workspace: str | None = None,
+) -> RetentionPolicyResponse:
+    workspace_id = workspace or request.state.auth_context.workspace_id
+    connection = connect(_sqlite_path(settings.database_url))
+    try:
+        policy = RetentionPolicy.from_dict(request_body.model_dump(mode="json"))
+        saved = RetentionRepository(connection).set_policy(workspace_id, policy)
+        return RetentionPolicyResponse(policy=saved.to_dict())
+    finally:
+        connection.close()
+
+
+@router.post("/retention/purge", response_model=RetentionPurgeResponse)
+def purge_retention(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    workspace: str | None = None,
+) -> RetentionPurgeResponse:
+    auth_context = request.state.auth_context
+    workspace_id = workspace or auth_context.workspace_id
+    connection = connect(_sqlite_path(settings.database_url))
+    try:
+        policy = RetentionRepository(connection).get_policy(workspace_id)
+        counts = RetentionPurgeService(connection).purge(
+            workspace_id=workspace_id,
+            policy=policy,
+            actor_id=auth_context.actor_id,
+        )
+        return RetentionPurgeResponse(counts=counts)
+    finally:
+        connection.close()
+
+
+@router.get("/workspace/usage", response_model=WorkspaceUsageResponse)
+def workspace_usage(
+    request: Request,
+    repository: Annotated[IdentityRepository, Depends(get_identity_repository)],
+    workspace: str | None = None,
+) -> WorkspaceUsageResponse:
+    workspace_id = workspace or request.state.auth_context.workspace_id
+    workspace_record = repository.get_workspace(workspace_id)
+    return WorkspaceUsageResponse(
+        seats_used=repository.count_memberships(workspace_id=workspace_id),
+        seat_limit=workspace_record.seat_limit if workspace_record else None,
+        plan=workspace_record.plan if workspace_record else "self-host",
+    )
+
+
+@router.put("/workspace", response_model=WorkspaceSettingsResponse)
+def update_workspace_settings(
+    request: WorkspaceSettingsRequest,
+    repository: Annotated[IdentityRepository, Depends(get_identity_repository)],
+) -> WorkspaceSettingsResponse:
+    workspace = repository.update_workspace(
+        workspace_id=request.workspace_id,
+        name=request.name,
+        seat_limit=request.seat_limit,
+        plan=request.plan,
+    )
+    return WorkspaceSettingsResponse(workspace=workspace.to_dict())
+
+
 @router.post("/memberships", response_model=MembershipResponse)
 def upsert_membership(
     request: MembershipUpsertRequest,
@@ -1906,15 +2226,17 @@ def upsert_membership(
         email=request.email,
         display_name=request.display_name,
     )
-    membership = repository.set_membership(
-        user_id=request.user_id,
-        workspace_id=request.workspace_id,
-        role=request.role,
-    )
+    try:
+        membership = repository.set_membership(
+            user_id=request.user_id,
+            workspace_id=request.workspace_id,
+            role=request.role,
+        )
+    except SeatLimitExceededError as exc:
+        raise HTTPException(status_code=402, detail=str(exc)) from exc
     return MembershipResponse(membership=membership.to_dict())
 
 
-@router.post("/api/runner/register", response_model=RunnerRegisterResponse)
 @router.post("/runner/register", response_model=RunnerRegisterResponse)
 def register_runner(
     request: RunnerRegisterRequest,
@@ -1932,7 +2254,6 @@ def register_runner(
     return RunnerRegisterResponse(runner=issued.runner.to_dict(), token=issued.token)
 
 
-@router.post("/api/runner/revoke/{runner_id}", response_model=RunnerHeartbeatResponse)
 @router.post("/runner/revoke/{runner_id}", response_model=RunnerHeartbeatResponse)
 def revoke_runner(
     runner_id: str,
@@ -1952,7 +2273,6 @@ def revoke_runner(
     return RunnerHeartbeatResponse(runner=runner.to_dict())
 
 
-@router.post("/api/runner/jobs", response_model=RunnerJobResponse)
 @router.post("/runner/jobs", response_model=RunnerJobResponse)
 def enqueue_runner_job(
     request: RunnerJobCreateRequest,
@@ -1966,7 +2286,6 @@ def enqueue_runner_job(
     return RunnerJobResponse(job=job.to_dict())
 
 
-@router.post("/api/runner/heartbeat", response_model=RunnerHeartbeatResponse)
 @router.post("/runner/heartbeat", response_model=RunnerHeartbeatResponse)
 def runner_heartbeat(
     request: Request,
@@ -1977,7 +2296,6 @@ def runner_heartbeat(
     return RunnerHeartbeatResponse(runner=(refreshed or runner).to_dict())
 
 
-@router.post("/api/runner/lease", response_model=RunnerJobResponse)
 @router.post("/runner/lease", response_model=RunnerJobResponse)
 def lease_runner_job(
     request_body: RunnerLeaseRequest,
@@ -1989,7 +2307,6 @@ def lease_runner_job(
     return RunnerJobResponse(job=job.to_dict() if job else None)
 
 
-@router.post("/api/runner/events", response_model=RunnerEventsResponse)
 @router.post("/runner/events", response_model=RunnerEventsResponse)
 def ingest_runner_events(
     request_body: RunnerEventsRequest,
@@ -1998,14 +2315,18 @@ def ingest_runner_events(
     run_events: Annotated[RunEventRepository, Depends(get_run_event_repository)],
 ) -> RunnerEventsResponse:
     runner = _require_runner(request, runner_repository)
+    try:
+        job = runner_repository.require_active_lease(job_id=request_body.job_id, runner=runner)
+    except KeyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     accepted = 0
     for event in request_body.events:
         if not isinstance(event, dict):
             continue
         run_events.append_run_event(
-            project_id=str(event.get("project_id") or runner.workspace_id),
+            project_id=runner.workspace_id,
             requirement_id=_string_or_none(event.get("requirement_id")),
-            ticket_id=_string_or_none(event.get("ticket_id")),
+            ticket_id=_string_or_none(event.get("ticket_id")) or job.ticket_id,
             run_id=_string_or_none(event.get("run_id")),
             event_type=str(event.get("event_type") or "report"),
             model_id=_string_or_none(event.get("model_id")),
@@ -2015,7 +2336,6 @@ def ingest_runner_events(
     return RunnerEventsResponse(accepted=accepted)
 
 
-@router.post("/api/runner/jobs/{job_id}/complete", response_model=RunnerJobResponse)
 @router.post("/runner/jobs/{job_id}/complete", response_model=RunnerJobResponse)
 def complete_runner_job(
     job_id: str,
@@ -2025,6 +2345,7 @@ def complete_runner_job(
 ) -> RunnerJobResponse:
     runner = _require_runner(request, repository)
     try:
+        repository.require_active_lease(job_id=job_id, runner=runner)
         job = repository.complete_job(
             job_id=job_id,
             runner=runner,
@@ -2036,7 +2357,31 @@ def complete_runner_job(
     return RunnerJobResponse(job=job.to_dict())
 
 
-@router.get("/api/insights", response_model=InsightsResponse)
+@router.post("/runner/complete", response_model=RunnerJobResponse)
+def complete_runner_job_by_body(
+    request_body: RunnerCompleteRequest,
+    request: Request,
+    repository: Annotated[RunnerRepository, Depends(get_runner_repository)],
+) -> RunnerJobResponse:
+    if not request_body.job_id:
+        raise HTTPException(status_code=422, detail="job_id is required")
+    return complete_runner_job(request_body.job_id, request_body, request, repository)
+
+
+@router.post("/runner/jobs/{job_id}/release", response_model=RunnerJobResponse)
+def release_runner_job(
+    job_id: str,
+    request: Request,
+    repository: Annotated[RunnerRepository, Depends(get_runner_repository)],
+) -> RunnerJobResponse:
+    runner = _require_runner(request, repository)
+    try:
+        job = repository.release_job(job_id=job_id, runner=runner)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return RunnerJobResponse(job=job.to_dict())
+
+
 @router.get("/insights", response_model=InsightsResponse)
 def get_insights(
     repository: Annotated[TicketRepository, Depends(get_repository)],
@@ -2051,7 +2396,6 @@ def get_insights(
     )
 
 
-@router.get("/api/decisions", response_model=DecisionsResponse)
 @router.get("/decisions", response_model=DecisionsResponse)
 def get_decisions(
     repository: Annotated[TicketRepository, Depends(get_repository)],
@@ -2060,7 +2404,6 @@ def get_decisions(
     return DecisionsResponse(**build_decision_center(repository.connection, project_id=project_id))
 
 
-@router.get("/api/tickets/{ticket_id}/signals", response_model=TicketSignalsResponse)
 @router.get("/tickets/{ticket_id}/signals", response_model=TicketSignalsResponse)
 def get_ticket_signals(
     ticket_id: str,
@@ -2072,7 +2415,6 @@ def get_ticket_signals(
     return TicketSignalsResponse(signals=build_ticket_signals(ticket))
 
 
-@router.get("/api/requirements/{requirement_id}/signals", response_model=RequirementSignalsResponse)
 @router.get("/requirements/{requirement_id}/signals", response_model=RequirementSignalsResponse)
 def get_requirement_signals(
     requirement_id: str,
@@ -2085,7 +2427,6 @@ def get_requirement_signals(
     return RequirementSignalsResponse(signals=build_requirement_signals(requirement))
 
 
-@router.get("/api/tickets/{ticket_id}/acceptance-summary", response_model=AcceptanceSummaryResponse)
 @router.get("/tickets/{ticket_id}/acceptance-summary", response_model=AcceptanceSummaryResponse)
 def get_acceptance_summary(
     ticket_id: str,
@@ -2097,7 +2438,6 @@ def get_acceptance_summary(
     return AcceptanceSummaryResponse(summary=build_acceptance_summary(ticket))
 
 
-@router.get("/api/evals/task-sets", response_model=EvalTaskSetsResponse)
 @router.get("/evals/task-sets", response_model=EvalTaskSetsResponse)
 def list_eval_task_sets(
     repository: Annotated[EvalRunRepository, Depends(get_eval_repository)],
@@ -2109,7 +2449,6 @@ def list_eval_task_sets(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.get("/api/evals", response_model=EvalRunsResponse)
 @router.get("/evals", response_model=EvalRunsResponse)
 def list_eval_runs(
     repository: Annotated[EvalRunRepository, Depends(get_eval_repository)],
@@ -2129,7 +2468,6 @@ def list_eval_runs(
     )
 
 
-@router.post("/api/evals/run", response_model=EvalRunResponse)
 @router.post("/evals/run", response_model=EvalRunResponse)
 def start_eval_run(
     request: EvalRunRequest,
@@ -2157,7 +2495,6 @@ def start_eval_run(
     return EvalRunResponse(eval_run=run.to_dict())
 
 
-@router.get("/api/notifications", response_model=NotificationsResponse)
 @router.get("/notifications", response_model=NotificationsResponse)
 def list_notifications(
     repository: Annotated[NotificationRepository, Depends(get_notification_repository)],
@@ -2178,7 +2515,6 @@ def list_notifications(
     )
 
 
-@router.post("/api/notifications/{notification_id}/read", response_model=NotificationReadResponse)
 @router.post("/notifications/{notification_id}/read", response_model=NotificationReadResponse)
 def mark_notification_read(
     notification_id: int,
@@ -2194,7 +2530,6 @@ def mark_notification_read(
     )
 
 
-@router.post("/api/notifications/read-all", response_model=NotificationReadAllResponse)
 @router.post("/notifications/read-all", response_model=NotificationReadAllResponse)
 def mark_all_notifications_read(
     repository: Annotated[NotificationRepository, Depends(get_notification_repository)],
@@ -2288,7 +2623,6 @@ def accept_ticket(
     return OperationResponse(ticket=result.ticket.to_dict())
 
 
-@router.post("/api/tickets/{ticket_id}/pr", response_model=PullRequestResponse)
 @router.post("/tickets/{ticket_id}/pr", response_model=PullRequestResponse)
 def open_ticket_pr(
     ticket_id: str,
@@ -2338,7 +2672,6 @@ def reject_ticket(
     return OperationResponse(ticket=result.ticket.to_dict())
 
 
-@router.post("/api/tickets/{ticket_id}/split", response_model=SplitTicketResponse)
 @router.post("/tickets/{ticket_id}/split", response_model=SplitTicketResponse)
 def split_ticket(
     ticket_id: str,
@@ -2414,7 +2747,6 @@ def split_ticket(
     )
 
 
-@router.post("/api/tickets/{ticket_id}/abandon", response_model=OperationResponse)
 @router.post("/tickets/{ticket_id}/abandon", response_model=OperationResponse)
 def abandon_ticket(
     ticket_id: str,
@@ -3049,7 +3381,6 @@ def update_cloud_reasoner_config(
     )
 
 
-@router.get("/api/config/cloud-models", response_model=CloudModelsResponse)
 @router.get("/config/cloud-models", response_model=CloudModelsResponse)
 def get_cloud_models(
     settings: Annotated[Settings, Depends(get_settings)],
@@ -3063,7 +3394,6 @@ def get_cloud_models(
     )
 
 
-@router.post("/api/config/cloud-models", response_model=CloudModelResponse)
 @router.post("/config/cloud-models", response_model=CloudModelResponse)
 def create_cloud_model(
     request: CloudModelCreateRequest,
@@ -3085,7 +3415,6 @@ def create_cloud_model(
     return CloudModelResponse(**model.to_public_dict(), deletable=True)
 
 
-@router.post("/api/config/cloud-models/test", response_model=CloudModelTestResponse)
 @router.post("/config/cloud-models/test", response_model=CloudModelTestResponse)
 def test_cloud_model_connection(
     request: CloudModelTestRequest,
@@ -3115,7 +3444,6 @@ def test_cloud_model_connection(
     return CloudModelTestResponse(ok=True, message="Connection OK")
 
 
-@router.post("/api/config/cloud-models/list-models", response_model=CloudModelListResponse)
 @router.post("/config/cloud-models/list-models", response_model=CloudModelListResponse)
 def list_provider_models(
     request: CloudModelListRequest,
@@ -3147,7 +3475,6 @@ def list_provider_models(
     return CloudModelListResponse(ok=True, models=sorted(models))
 
 
-@router.delete("/api/config/cloud-models/{model_id:path}", response_model=CloudModelDeleteResponse)
 @router.delete("/config/cloud-models/{model_id:path}", response_model=CloudModelDeleteResponse)
 def remove_cloud_model(
     model_id: str,
@@ -3162,7 +3489,6 @@ def remove_cloud_model(
     return CloudModelDeleteResponse(deleted=True, model_id=model_id)
 
 
-@router.get("/api/config/integrations", response_model=IntegrationCredentialsResponse)
 @router.get("/config/integrations", response_model=IntegrationCredentialsResponse)
 def list_integrations(
     repository: Annotated[IntegrationRepository, Depends(get_integration_repository)],
@@ -3176,7 +3502,73 @@ def list_integrations(
     )
 
 
-@router.post("/api/config/integrations", response_model=IntegrationCredentialResponse)
+@router.get("/config/integrations/app-install", response_model=GitAppInstallationResponse | None)
+def get_git_app_installation(
+    repository: Annotated[
+        GitAppInstallationRepository,
+        Depends(get_git_app_installation_repository),
+    ],
+    provider: Literal["github", "gitlab"],
+    workspace: str = "default",
+    account: str | None = None,
+) -> GitAppInstallationResponse | None:
+    record = repository.get(workspace_id=workspace, provider=provider, account=account)
+    return GitAppInstallationResponse(**record.to_dict()) if record else None
+
+
+@router.post("/config/integrations/app-install", response_model=GitAppInstallationResponse)
+def upsert_git_app_installation(
+    request: GitAppInstallationRequest,
+    repository: Annotated[
+        GitAppInstallationRepository,
+        Depends(get_git_app_installation_repository),
+    ],
+    audit: Annotated[AuditRepository, Depends(get_audit_repository)],
+) -> GitAppInstallationResponse:
+    try:
+        record = repository.upsert(
+            workspace_id=request.workspace_id,
+            provider=request.provider,
+            account=request.account,
+            installation_id=request.installation_id,
+            payload=request.payload,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    audit.append(
+        actor_id="control-plane",
+        workspace_id=record.workspace_id,
+        action="git.app_install.upsert",
+        target=f"{record.provider}/{record.account}",
+        payload={"installation_id": record.installation_id},
+    )
+    return GitAppInstallationResponse(**record.to_dict())
+
+
+@router.delete("/config/integrations/app-install/{provider}/{account}", response_model=GitAppInstallationResponse)
+def revoke_git_app_installation(
+    provider: Literal["github", "gitlab"],
+    account: str,
+    repository: Annotated[
+        GitAppInstallationRepository,
+        Depends(get_git_app_installation_repository),
+    ],
+    audit: Annotated[AuditRepository, Depends(get_audit_repository)],
+    workspace: str = "default",
+) -> GitAppInstallationResponse:
+    try:
+        record = repository.revoke(workspace_id=workspace, provider=provider, account=account)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    audit.append(
+        actor_id="control-plane",
+        workspace_id=record.workspace_id,
+        action="git.app_install.revoke",
+        target=f"{record.provider}/{record.account}",
+    )
+    return GitAppInstallationResponse(**record.to_dict())
+
+
 @router.post("/config/integrations", response_model=IntegrationCredentialResponse)
 def upsert_integration(
     request: IntegrationCredentialRequest,
@@ -3471,6 +3863,41 @@ def _runner_token_from_request(request: Request) -> str:
     return ""
 
 
+def _complete_oidc_login(
+    *,
+    settings: Settings,
+    code: str | None,
+    id_token: str | None,
+    state: str | None,
+    workspace_id: str | None,
+    ip: str | None,
+) -> dict[str, object]:
+    connection = connect(_sqlite_path(settings.database_url))
+    try:
+        settings_repository = SettingsRepository(connection)
+        config = OIDCConfigRepository(settings_repository).get()
+        if config is None or not config.configured:
+            raise HTTPException(status_code=404, detail="OIDC provider is not configured")
+        try:
+            return OIDCService(
+                identity=IdentityRepository(connection),
+                audit=AuditRepository(connection),
+                config=config,
+            ).complete_login(
+                code=code,
+                id_token=id_token,
+                state=state,
+                workspace_id=workspace_id,
+                ip=ip,
+            )
+        except SeatLimitExceededError as exc:
+            raise HTTPException(status_code=402, detail=str(exc)) from exc
+        except (OIDCConfigurationError, OIDCVerificationError, SecretEncryptionError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        connection.close()
+
+
 def _string_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
@@ -3529,9 +3956,10 @@ def _ticket_lease_payload(ticket: Ticket) -> dict | None:
 
 def _effective_sandbox_mode(project_mode: str, settings: Settings) -> str:
     override = (getattr(settings, "haao_sandbox_mode", "") or "").strip().lower()
-    if override in {"auto", "docker", "unshare", "none"}:
+    allowed = {"auto", "docker", "unshare", "none", "strict"}
+    if override in allowed:
         return override
-    return project_mode if project_mode in {"auto", "docker", "unshare", "none"} else "auto"
+    return project_mode if project_mode in allowed else "auto"
 
 
 def _split_child_ticket_payloads(

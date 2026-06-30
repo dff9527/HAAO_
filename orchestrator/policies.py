@@ -8,7 +8,7 @@ from orchestrator.db.sqlite import RunEventRepository, SettingsRepository
 
 RUN_EVENT_RETENTION_SETTINGS_KEY = "run_event_retention_policy"
 EXECUTION_POLICY_SETTINGS_KEY = "execution_policy"
-SandboxMode = Literal["auto", "docker", "unshare", "none"]
+SandboxMode = Literal["auto", "docker", "unshare", "none", "strict"]
 
 
 @dataclass(frozen=True)
@@ -28,12 +28,18 @@ class ExecutionPolicy:
     test_allow_network: bool = False
     env_allowlist: tuple[str, ...] = ("PATH", "PYTHONPATH")
     sandbox_mode: SandboxMode = "auto"
+    cpu_limit: float = 1.0
+    memory_mb: int = 512
+    pids_limit: int = 128
 
     def to_dict(self) -> dict[str, object]:
         return {
             "test_allow_network": self.test_allow_network,
             "env_allowlist": list(self.env_allowlist),
             "sandbox_mode": self.sandbox_mode,
+            "cpu_limit": self.cpu_limit,
+            "memory_mb": self.memory_mb,
+            "pids_limit": self.pids_limit,
         }
 
 
@@ -64,6 +70,9 @@ def get_execution_policy(repository: SettingsRepository) -> ExecutionPolicy:
         test_allow_network=bool(stored.get("test_allow_network", False)),
         env_allowlist=tuple(str(item) for item in allowlist if str(item).strip()) or ("PATH", "PYTHONPATH"),
         sandbox_mode=sandbox_mode,
+        cpu_limit=max(0.1, float(stored.get("cpu_limit") or 1.0)),
+        memory_mb=max(64, int(stored.get("memory_mb") or 512)),
+        pids_limit=max(16, int(stored.get("pids_limit") or 128)),
     )
 
 
@@ -73,7 +82,7 @@ def set_execution_policy(repository: SettingsRepository, policy: ExecutionPolicy
 
 
 def _normalize_sandbox_mode(value: object) -> SandboxMode:
-    if value in {"auto", "docker", "unshare", "none"}:
+    if value in {"auto", "docker", "unshare", "none", "strict"}:
         return value  # type: ignore[return-value]
     return "auto"
 

@@ -1,6 +1,6 @@
 import { Home, Cpu, FileText, Activity, BarChart3, Inbox, ClipboardCheck } from 'lucide-react';
 
-export type Page = 'home' | 'activity' | 'insights' | 'decisions' | 'inbox' | 'requirements' | 'models';
+export type Page = 'home' | 'activity' | 'insights' | 'benchmark' | 'decisions' | 'inbox' | 'requirements' | 'models';
 
 interface Props {
   currentPage: Page;

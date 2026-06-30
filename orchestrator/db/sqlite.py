@@ -40,6 +40,7 @@ RunEventType = Literal[
     "retry",
     "escalation",
     "egress_attempt",
+    "attachment_egress",
     "diff_scope_reject",
     "rollback",
     "conflict",
@@ -49,6 +50,7 @@ RunEventType = Literal[
 ]
 CostStatus = Literal["actual", "estimated", "unknown"]
 IntegrationProvider = Literal["github", "gitlab", "slack"]
+GitAppProvider = Literal["github", "gitlab"]
 NotificationKind = Literal["needs_you", "done", "blocked"]
 EvalRunStatus = Literal["running", "completed", "failed"]
 MembershipRole = Literal["owner", "admin", "member", "viewer"]
@@ -65,6 +67,10 @@ class TicketDeletionError(ValueError):
 
 class AmbiguousTicketError(ValueError):
     """Raised when an unscoped ticket id exists in multiple projects."""
+
+
+class SeatLimitExceededError(ValueError):
+    """Raised when adding a membership would exceed a workspace seat limit."""
 
 
 @dataclass(frozen=True)
@@ -147,9 +153,17 @@ class WorkspaceRecord:
     id: str
     name: str
     created_at: str
+    seat_limit: int | None = None
+    plan: str = "self-host"
 
     def to_dict(self) -> dict[str, object]:
-        return {"id": self.id, "name": self.name, "created_at": self.created_at}
+        return {
+            "id": self.id,
+            "name": self.name,
+            "created_at": self.created_at,
+            "seat_limit": self.seat_limit,
+            "plan": self.plan,
+        }
 
 
 @dataclass(frozen=True)
@@ -257,6 +271,7 @@ class IntegrationCredential:
     updated_at: str
 
     def to_public_dict(self) -> dict[str, object]:
+        credential_type = "app" if "credential:app" in self.scopes else "pat"
         return {
             "provider": self.provider,
             "id": self.id,
@@ -265,6 +280,32 @@ class IntegrationCredential:
             "configured": self.configured,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "credential_type": credential_type,
+        }
+
+
+@dataclass(frozen=True)
+class GitAppInstallationRecord:
+    workspace_id: str
+    provider: GitAppProvider
+    account: str
+    installation_id: str
+    payload: dict
+    created_at: str
+    updated_at: str
+    revoked_at: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "workspace_id": self.workspace_id,
+            "provider": self.provider,
+            "account": self.account,
+            "installation_id": self.installation_id,
+            "payload": self.payload,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "revoked_at": self.revoked_at,
+            "configured": self.revoked_at is None,
         }
 
 
@@ -1480,9 +1521,12 @@ class RunEventRepository:
             run_id=run_id,
             ts=timestamp,
         )
-        redacted_payload = redact_json(
-            event_payload,
-            extra_secrets=_configured_secret_values(self.connection),
+        extra_secrets = _configured_secret_values(self.connection)
+        redacted_payload = redact_json(event_payload, extra_secrets=extra_secrets)
+        redacted_model_id = (
+            redact_text(model_id, extra_secrets=extra_secrets)
+            if model_id is not None
+            else None
         )
         payload_json = json.dumps(redacted_payload, ensure_ascii=False, sort_keys=True)
         cursor = self.connection.execute(
@@ -1500,7 +1544,7 @@ class RunEventRepository:
                 run_id,
                 event_type,
                 timestamp,
-                model_id,
+                redacted_model_id,
                 input_tokens,
                 output_tokens,
                 cost_usd,
@@ -1517,7 +1561,7 @@ class RunEventRepository:
             run_id=run_id,
             event_type=event_type,
             ts=timestamp,
-            model_id=model_id,
+            model_id=redacted_model_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cost_usd=cost_usd,
@@ -1615,21 +1659,66 @@ class IdentityRepository:
         row = self.connection.execute("SELECT 1 FROM memberships LIMIT 1").fetchone()
         return row is not None
 
-    def create_workspace(self, *, workspace_id: str, name: str) -> WorkspaceRecord:
+    def create_workspace(
+        self,
+        *,
+        workspace_id: str,
+        name: str,
+        seat_limit: int | None = None,
+        plan: str | None = None,
+    ) -> WorkspaceRecord:
         now = _now()
+        existing = self.get_workspace(workspace_id)
+        effective_limit = seat_limit if seat_limit is not None else (existing.seat_limit if existing else None)
+        effective_plan = (plan or (existing.plan if existing else "self-host")).strip() or "self-host"
         self.connection.execute(
             """
-            INSERT INTO workspaces (id, name, created_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET name = excluded.name
+            INSERT INTO workspaces (id, name, created_at, seat_limit, plan)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                seat_limit = excluded.seat_limit,
+                plan = excluded.plan
             """,
-            (workspace_id, name, now),
+            (workspace_id, name, now, effective_limit, effective_plan),
         )
         self.connection.commit()
         record = self.get_workspace(workspace_id)
         if record is None:
             raise KeyError(f"Workspace not found after create: {workspace_id}")
         return record
+
+    def update_workspace(
+        self,
+        *,
+        workspace_id: str,
+        name: str | None = None,
+        seat_limit: int | None = None,
+        plan: str | None = None,
+    ) -> WorkspaceRecord:
+        existing = self.get_workspace(workspace_id)
+        if existing is None:
+            return self.create_workspace(
+                workspace_id=workspace_id,
+                name=name or workspace_id,
+                seat_limit=seat_limit,
+                plan=plan,
+            )
+        updated_name = name if name is not None else existing.name
+        updated_plan = (plan if plan is not None else existing.plan).strip() or "self-host"
+        self.connection.execute(
+            """
+            UPDATE workspaces
+            SET name = ?, seat_limit = ?, plan = ?
+            WHERE id = ?
+            """,
+            (updated_name, seat_limit, updated_plan, workspace_id),
+        )
+        self.connection.commit()
+        updated = self.get_workspace(workspace_id)
+        if updated is None:
+            raise KeyError(f"Workspace not found after update: {workspace_id}")
+        return updated
 
     def get_workspace(self, workspace_id: str) -> WorkspaceRecord | None:
         row = self.connection.execute(
@@ -1676,8 +1765,17 @@ class IdentityRepository:
         workspace_id: str,
         role: MembershipRole,
     ) -> MembershipRecord:
-        self.create_user(user_id=user_id)
+        if self.get_user(user_id) is None:
+            self.create_user(user_id=user_id)
         self.create_workspace(workspace_id=workspace_id, name=workspace_id)
+        existing = self.get_membership(user_id=user_id, workspace_id=workspace_id)
+        if existing is None:
+            workspace = self.get_workspace(workspace_id)
+            seats_used = self.count_memberships(workspace_id=workspace_id)
+            if workspace and workspace.seat_limit is not None and seats_used >= workspace.seat_limit:
+                raise SeatLimitExceededError(
+                    f"Workspace {workspace_id} seat limit reached ({workspace.seat_limit})"
+                )
         now = _now()
         self.connection.execute(
             """
@@ -1702,6 +1800,24 @@ class IdentityRepository:
             (user_id, workspace_id),
         ).fetchone()
         return _membership_from_row(row) if row is not None else None
+
+    def list_memberships(self, *, workspace_id: str) -> list[MembershipRecord]:
+        rows = self.connection.execute(
+            """
+            SELECT * FROM memberships
+            WHERE workspace_id = ?
+            ORDER BY created_at ASC, user_id ASC
+            """,
+            (workspace_id,),
+        ).fetchall()
+        return [_membership_from_row(row) for row in rows]
+
+    def count_memberships(self, *, workspace_id: str) -> int:
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM memberships WHERE workspace_id = ?",
+            (workspace_id,),
+        ).fetchone()
+        return int(row["count"] if row is not None else 0)
 
 
 class AuditRepository:
@@ -1830,17 +1946,27 @@ class RunnerRepository:
             raise KeyError(f"Runner not found after revoke: {runner_id}")
         return record
 
-    def heartbeat(self, token: str) -> RunnerTokenRecord | None:
+    def heartbeat(self, token: str, *, lease_ttl_sec: int = 300) -> RunnerTokenRecord | None:
         runner = self.authenticate(token)
         if runner is None:
             return None
+        now_dt = datetime.now(UTC)
+        lease_expires_at = now_dt + timedelta(seconds=max(1, int(lease_ttl_sec)))
         self.connection.execute(
             """
             UPDATE runner_tokens
             SET last_heartbeat_at = ?
             WHERE id = ?
             """,
-            (_now(), runner.id),
+            (now_dt.isoformat(), runner.id),
+        )
+        self.connection.execute(
+            """
+            UPDATE runner_jobs
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE workspace_id = ? AND lease_runner_id = ? AND status = 'leased'
+            """,
+            (lease_expires_at.isoformat(), now_dt.isoformat(), runner.workspace_id, runner.id),
         )
         self.connection.commit()
         return self.get_runner(runner.id)
@@ -1943,6 +2069,41 @@ class RunnerRepository:
         job = self.get_job(job_id)
         if job is None:
             raise KeyError(f"Runner job not found after complete: {job_id}")
+        return job
+
+    def release_job(self, *, job_id: str, runner: RunnerTokenRecord) -> RunnerJobRecord:
+        now = _now()
+        cursor = self.connection.execute(
+            """
+            UPDATE runner_jobs
+            SET status = 'queued',
+                lease_runner_id = NULL,
+                lease_expires_at = NULL,
+                updated_at = ?
+            WHERE id = ? AND workspace_id = ? AND lease_runner_id = ? AND status = 'leased'
+            """,
+            (now, job_id, runner.workspace_id, runner.id),
+        )
+        if cursor.rowcount == 0:
+            raise KeyError(f"Runner job not leased by runner: {job_id}")
+        self.connection.commit()
+        job = self.get_job(job_id)
+        if job is None:
+            raise KeyError(f"Runner job not found after release: {job_id}")
+        return job
+
+    def require_active_lease(self, *, job_id: str, runner: RunnerTokenRecord) -> RunnerJobRecord:
+        job = self.get_job(job_id)
+        if (
+            job is None
+            or job.workspace_id != runner.workspace_id
+            or job.lease_runner_id != runner.id
+            or job.status != "leased"
+        ):
+            raise KeyError(f"Runner job not actively leased by runner: {job_id}")
+        lease_expires = _parse_datetime(job.lease_expires_at)
+        if lease_expires is not None and lease_expires <= datetime.now(UTC):
+            raise KeyError(f"Runner job lease expired: {job_id}")
         return job
 
     def get_job(self, job_id: str) -> RunnerJobRecord | None:
@@ -2470,6 +2631,146 @@ class IntegrationRepository:
         return decrypt_secret(row["encrypted_token"])
 
 
+class GitAppInstallationRepository:
+    def __init__(self, connection: sqlite3.Connection):
+        self.connection = connection
+        initialize_database(connection)
+
+    def upsert(
+        self,
+        *,
+        workspace_id: str,
+        provider: GitAppProvider,
+        account: str,
+        installation_id: str,
+        payload: dict | None = None,
+    ) -> GitAppInstallationRecord:
+        cleaned_workspace = workspace_id.strip() or "default"
+        cleaned_account = account.strip() or cleaned_workspace
+        cleaned_installation_id = installation_id.strip()
+        if not cleaned_installation_id:
+            raise ValueError("installation_id cannot be empty")
+        now = _now()
+        self.connection.execute(
+            """
+            INSERT INTO git_app_installations (
+                workspace_id, provider, account, installation_id, payload_json,
+                created_at, updated_at, revoked_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(workspace_id, provider, account) DO UPDATE SET
+                installation_id = excluded.installation_id,
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at,
+                revoked_at = NULL
+            """,
+            (
+                cleaned_workspace,
+                provider,
+                cleaned_account,
+                cleaned_installation_id,
+                json.dumps(payload or {}, ensure_ascii=False, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+        self.connection.commit()
+        record = self.get(
+            workspace_id=cleaned_workspace,
+            provider=provider,
+            account=cleaned_account,
+            include_revoked=True,
+        )
+        if record is None:
+            raise KeyError("Git App installation not found after upsert")
+        return record
+
+    def get(
+        self,
+        *,
+        workspace_id: str,
+        provider: GitAppProvider,
+        account: str | None = None,
+        include_revoked: bool = False,
+    ) -> GitAppInstallationRecord | None:
+        clauses = ["workspace_id = ?", "provider = ?"]
+        params: list[object] = [workspace_id.strip() or "default", provider]
+        if account is not None:
+            clauses.append("account = ?")
+            params.append(account.strip() or (workspace_id.strip() or "default"))
+        if not include_revoked:
+            clauses.append("revoked_at IS NULL")
+        row = self.connection.execute(
+            f"""
+            SELECT * FROM git_app_installations
+            WHERE {' AND '.join(clauses)}
+            ORDER BY updated_at DESC, account ASC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        return _git_app_installation_from_row(row) if row is not None else None
+
+    def list(
+        self,
+        *,
+        workspace_id: str,
+        provider: GitAppProvider | None = None,
+        include_revoked: bool = False,
+    ) -> list[GitAppInstallationRecord]:
+        clauses = ["workspace_id = ?"]
+        params: list[object] = [workspace_id.strip() or "default"]
+        if provider is not None:
+            clauses.append("provider = ?")
+            params.append(provider)
+        if not include_revoked:
+            clauses.append("revoked_at IS NULL")
+        rows = self.connection.execute(
+            f"""
+            SELECT * FROM git_app_installations
+            WHERE {' AND '.join(clauses)}
+            ORDER BY provider ASC, account ASC
+            """,
+            params,
+        ).fetchall()
+        return [_git_app_installation_from_row(row) for row in rows]
+
+    def revoke(
+        self,
+        *,
+        workspace_id: str,
+        provider: GitAppProvider,
+        account: str | None = None,
+    ) -> GitAppInstallationRecord:
+        record = self.get(
+            workspace_id=workspace_id,
+            provider=provider,
+            account=account,
+            include_revoked=True,
+        )
+        if record is None:
+            raise KeyError(f"Git App installation not found: {provider}/{account or workspace_id}")
+        now = _now()
+        self.connection.execute(
+            """
+            UPDATE git_app_installations
+            SET revoked_at = COALESCE(revoked_at, ?), updated_at = ?
+            WHERE workspace_id = ? AND provider = ? AND account = ?
+            """,
+            (now, now, record.workspace_id, record.provider, record.account),
+        )
+        self.connection.commit()
+        updated = self.get(
+            workspace_id=record.workspace_id,
+            provider=record.provider,
+            account=record.account,
+            include_revoked=True,
+        )
+        if updated is None:
+            raise KeyError("Git App installation not found after revoke")
+        return updated
+
+
 class SettingsRepository:
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
@@ -2760,7 +3061,7 @@ def _event_payload_with_contract_fields(
     ts: str,
 ) -> dict:
     enriched = dict(payload)
-    if event_type not in {"egress_attempt", "diff_scope_reject", "rollback"}:
+    if event_type not in {"egress_attempt", "attachment_egress", "diff_scope_reject", "rollback"}:
         return enriched
     enriched.setdefault("kind", event_type)
     enriched.setdefault("ticket_id", ticket_id)
@@ -2939,7 +3240,14 @@ def _user_from_row(row: sqlite3.Row) -> UserRecord:
 
 
 def _workspace_from_row(row: sqlite3.Row) -> WorkspaceRecord:
-    return WorkspaceRecord(id=row["id"], name=row["name"], created_at=row["created_at"])
+    keys = set(row.keys())
+    return WorkspaceRecord(
+        id=row["id"],
+        name=row["name"],
+        created_at=row["created_at"],
+        seat_limit=row["seat_limit"] if "seat_limit" in keys else None,
+        plan=row["plan"] if "plan" in keys else "self-host",
+    )
 
 
 def _membership_from_row(row: sqlite3.Row) -> MembershipRecord:
@@ -3002,6 +3310,23 @@ def _runner_job_from_row(row: sqlite3.Row) -> RunnerJobRecord:
         result=result if isinstance(result, dict) else {},
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def _git_app_installation_from_row(row: sqlite3.Row) -> GitAppInstallationRecord:
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    return GitAppInstallationRecord(
+        workspace_id=row["workspace_id"],
+        provider=row["provider"],
+        account=row["account"],
+        installation_id=row["installation_id"],
+        payload=payload if isinstance(payload, dict) else {},
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        revoked_at=row["revoked_at"],
     )
 
 

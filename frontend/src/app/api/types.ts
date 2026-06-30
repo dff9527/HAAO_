@@ -116,7 +116,7 @@ export interface BackendProject {
   env?: Record<string, string>;
   env_allowlist?: string[];
   test_allow_network?: boolean;
-  sandbox_mode?: 'auto' | 'docker' | 'unshare' | 'none';
+  sandbox_mode?: 'auto' | 'strict' | 'docker' | 'unshare' | 'none';
   setup_cmd?: string;
   cleanup_cmd?: string;
   created_at?: string;
@@ -203,6 +203,7 @@ export type RunEventType =
   | 'retry'
   | 'escalation'
   | 'egress_attempt'
+  | 'attachment_egress'
   | 'diff_scope_reject'
   | 'rollback'
   | 'conflict'
@@ -362,6 +363,20 @@ export interface AcceptanceSummary {
   recommendation: string;
   checks: AcceptanceCheck[];
   signals?: TicketSignals;
+  supply_chain?: {
+    changed_manifests: string[];
+    added_deps: Array<{
+      manifest?: string;
+      name?: string;
+      version?: string;
+    }>;
+    findings: Array<{
+      severity?: string;
+      source?: string;
+      package?: string;
+      detail?: string;
+    }>;
+  };
   pr?: {
     url?: string | null;
     status?: string | null;
@@ -538,6 +553,51 @@ export interface GitAppInstallInfo {
   installed: boolean;
   credential_id?: string;
   label?: string;
+  account?: string;
+  installation_id?: string;
 }
 
 export type GitCredentialKind = 'pat' | 'app';
+
+export interface GitCredentialPreference {
+  workspace_id: string;
+  provider: 'github' | 'gitlab';
+  credential_kind: GitCredentialKind;
+}
+
+export interface OIDCProvider {
+  issuer: string;
+  client_id: string;
+  redirect_uri: string;
+  authorization_endpoint: string;
+  token_endpoint: string;
+  workspace_id: string;
+  group_claim?: string | null;
+  role_mapping: Record<string, MembershipRole>;
+  default_role: MembershipRole;
+  configured: boolean;
+  client_secret_configured: boolean;
+}
+
+export interface RetentionPolicy {
+  run_events_days: number | null;
+  ticket_logs_days: number | null;
+  diffs_days: number | null;
+  prompts_days: number | null;
+  attachments_days: number | null;
+}
+
+export interface RetentionPurgeCounts {
+  run_events_deleted: number;
+  ticket_logs_deleted: number;
+  ticket_diffs_redacted: number;
+  requirement_prompts_redacted: number;
+  chat_messages_redacted: number;
+  attachments_deleted: number;
+}
+
+export interface WorkspaceUsage {
+  seats_used: number;
+  seat_limit: number | null;
+  plan: string;
+}

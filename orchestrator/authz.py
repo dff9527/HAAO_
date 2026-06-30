@@ -24,6 +24,8 @@ ADMIN_PATH_MARKERS = (
     "/runner/revoke",
     "/runner/jobs",
     "/members",
+    "/retention",
+    "/auth/oidc",
 )
 
 MUTATION_METHODS = {"POST", "PUT", "PATCH", "DELETE"}

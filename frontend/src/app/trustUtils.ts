@@ -161,6 +161,14 @@ export const MOCK_ACCEPTANCE_SUMMARY: AcceptanceSummary = {
     { id: 'pr_ready', label: 'PR can be opened or updated', passed: true, severity: 'warning', detail: 'eligible' },
   ],
   pr: { ready: true, url: null, status: null, branch: null, provider: null },
+  supply_chain: {
+    changed_manifests: ['requirements.txt', 'package.json'],
+    added_deps: [
+      { manifest: 'requirements.txt', name: 'requests', version: '==2.32.0' },
+      { manifest: 'package.json', name: 'left-pad', version: '1.3.0' },
+    ],
+    findings: [],
+  },
   signals: deriveTicketSignals({
     targetFiles: ['tests/test_password_policy.py'],
     assignedModel: 'gemma-4-26b-a4b',

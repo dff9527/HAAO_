@@ -68,6 +68,7 @@ export function TicketCard({ ticket, isSelected, onClick, onApprove, onAccept, o
   return (
     <div
       ref={ref}
+      data-testid={`ticket-card-${ticket.id}`}
       onClick={onClick}
       style={{
         opacity: isDragging ? 0.4 : 1,
@@ -89,7 +90,7 @@ export function TicketCard({ ticket, isSelected, onClick, onApprove, onAccept, o
             className={`w-1.5 h-1.5 rounded-full shrink-0 ${PRIORITY_DOT[ticket.priority]}`}
             title={`${ticket.priority} priority`}
           />
-          <span className="text-xs text-muted-foreground font-mono">{ticket.id}</span>
+          <span data-testid={`ticket-open-${ticket.id}`} className="text-xs text-muted-foreground font-mono">{ticket.id}</span>
           {ticket.projectName && (
             <span className="text-[10px] px-1 py-0 rounded border border-border bg-muted text-muted-foreground">
               {ticket.projectName}

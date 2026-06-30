@@ -13,6 +13,7 @@ import httpx
 
 from orchestrator.db.sqlite import (
     AuditRepository,
+    GitAppInstallationRepository,
     IntegrationCredential,
     IntegrationRepository,
     RunEventRepository,
@@ -142,24 +143,20 @@ class AppGitCredential:
         integrations: IntegrationRepository,
         minter: AppTokenMinter | None,
         audit: AuditRepository,
+        installations: GitAppInstallationRepository | None = None,
     ) -> None:
         self.credential = credential
         self.integrations = integrations
         self.minter = minter
         self.audit = audit
+        self.installations = installations
         self.provider = credential.provider  # type: ignore[assignment]
         self.credential_id = credential.id
 
     def resolve_token(self) -> ResolvedGitCredential:
         if self.minter is None:
             raise MissingAppTokenMinter("Git App credential selected but no token minter is configured")
-        raw = self.integrations.decrypted_token(self.credential.provider, self.credential.id)
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            payload = {"installation_id": raw}
-        if not isinstance(payload, dict):
-            payload = {"installation_id": str(payload)}
+        payload = self._app_payload()
         token = self.minter.mint_installation_token(self.provider, payload)
         self.audit.append(
             actor_id="control-plane",
@@ -175,6 +172,31 @@ class AppGitCredential:
             credential_id=self.credential.id,
         )
 
+    def _app_payload(self) -> dict[str, Any]:
+        raw = self.integrations.decrypted_token(self.credential.provider, self.credential.id)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = {"installation_id": raw}
+        if not isinstance(payload, dict):
+            payload = {"installation_id": str(payload)}
+        workspace_id = str(payload.get("workspace_id") or "default")
+        account = payload.get("account")
+        if self.installations is not None:
+            record = self.installations.get(
+                workspace_id=workspace_id,
+                provider=self.provider,
+                account=str(account) if isinstance(account, str) and account else None,
+            )
+            if record is not None:
+                merged = dict(record.payload)
+                merged.update(payload)
+                merged["workspace_id"] = record.workspace_id
+                merged["account"] = record.account
+                merged["installation_id"] = record.installation_id
+                return merged
+        return payload
+
 
 class PullRequestService:
     def __init__(
@@ -189,6 +211,7 @@ class PullRequestService:
         provider_factory: Any | None = None,
         git_credential_factory: Any | None = None,
         app_token_minter: AppTokenMinter | None = None,
+        app_installations: GitAppInstallationRepository | None = None,
     ) -> None:
         self.repository = repository
         self.integrations = integrations
@@ -199,6 +222,7 @@ class PullRequestService:
         self.provider_factory = provider_factory or create_pull_request_provider
         self.audit = AuditRepository(repository.connection)
         self.app_token_minter = app_token_minter
+        self.app_installations = app_installations
         self.git_credential_factory = git_credential_factory or self._create_git_credential
 
     def has_pr_integration(self) -> bool:
@@ -307,6 +331,7 @@ class PullRequestService:
                 self.integrations,
                 self.app_token_minter,
                 self.audit,
+                self.app_installations,
             )
         return PatGitCredential(credential, self.integrations)
 

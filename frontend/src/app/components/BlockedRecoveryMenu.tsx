@@ -27,7 +27,7 @@ export function BlockedRecoveryMenu({
   const [model, setModel] = useState(assignedModel);
 
   return (
-    <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/60 dark:bg-amber-950/30 p-3 space-y-3">
+    <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/60 dark:bg-amber-950/30 p-3 space-y-3" data-testid="blocked-recovery-menu">
       <p className="text-xs font-semibold text-amber-800 dark:text-amber-200">Recovery options</p>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
         <ActionButton icon={Scissors} label="Split into smaller tickets" onClick={() => splitFeedback.trim() && void onSplit(splitFeedback.trim())} disabled={pending || !splitFeedback.trim()}>
@@ -35,6 +35,7 @@ export function BlockedRecoveryMenu({
             value={splitFeedback}
             onChange={(event) => setSplitFeedback(event.target.value)}
             placeholder="What should be split?"
+            data-testid="blocked-recovery-split-input"
             className="w-full mt-1 text-[11px] bg-background border border-border rounded px-2 py-1"
           />
         </ActionButton>
@@ -48,6 +49,7 @@ export function BlockedRecoveryMenu({
           <select
             value={model}
             onChange={(event) => setModel(event.target.value)}
+            data-testid="blocked-recovery-model-select"
             className="w-full mt-1 text-[11px] bg-background border border-border rounded px-2 py-1"
           >
             {localModelIds.map((id) => (
@@ -61,6 +63,7 @@ export function BlockedRecoveryMenu({
             value={abandonReason}
             onChange={(event) => setAbandonReason(event.target.value)}
             placeholder="Why abandon?"
+            data-testid="blocked-recovery-abandon-input"
             className="w-full mt-1 text-[11px] bg-background border border-border rounded px-2 py-1"
           />
         </ActionButton>

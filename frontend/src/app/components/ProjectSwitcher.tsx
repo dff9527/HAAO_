@@ -15,6 +15,7 @@ interface Props {
       setupCmd: string;
       cleanupCmd: string;
       defaultBranch: string;
+      sandboxMode: 'auto' | 'strict' | 'docker' | 'unshare' | 'none';
     },
   ) => Promise<void>;
 }
@@ -36,6 +37,7 @@ export function ProjectSwitcher({
   const [envText, setEnvText] = useState('');
   const [setupCmd, setSetupCmd] = useState('');
   const [cleanupCmd, setCleanupCmd] = useState('');
+  const [sandboxMode, setSandboxMode] = useState<'auto' | 'strict' | 'docker' | 'unshare' | 'none'>('auto');
   const [error, setError] = useState('');
   const [isSaving, setIsSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -48,6 +50,7 @@ export function ProjectSwitcher({
     setEnvText(formatEnv(selectedProject.env));
     setSetupCmd(selectedProject.setupCmd);
     setCleanupCmd(selectedProject.cleanupCmd);
+    setSandboxMode(selectedProject.sandboxMode);
   }
 
   function closePanels() {
@@ -118,6 +121,7 @@ export function ProjectSwitcher({
         setupCmd: setupCmd.trim(),
         cleanupCmd: cleanupCmd.trim(),
         defaultBranch: defaultBranch.trim() || selectedProject.defaultBranch,
+        sandboxMode,
       });
       setIsEditing(false);
       setConfirmDelete(false);
@@ -257,6 +261,23 @@ export function ProjectSwitcher({
             />
             <span className="block text-[11px] leading-relaxed text-muted-foreground">
               Optional. One KEY=value per line; passed to setup, tests, and cleanup.
+            </span>
+          </label>
+          <label className="block space-y-1">
+            <span className="text-[11px] font-medium text-muted-foreground">Sandbox tier</span>
+            <select
+              value={sandboxMode}
+              onChange={(event) => setSandboxMode(event.target.value as 'auto' | 'strict' | 'docker' | 'unshare' | 'none')}
+              className="w-full rounded border border-border bg-background px-2 py-1.5 text-xs font-mono outline-none focus:ring-1 focus:ring-ring"
+            >
+              <option value="auto">auto</option>
+              <option value="strict">strict</option>
+              <option value="docker">docker</option>
+              <option value="unshare">unshare</option>
+              <option value="none">none</option>
+            </select>
+            <span className="block text-[11px] leading-relaxed text-muted-foreground">
+              `strict` prefers hard isolation and degrades loudly if unavailable.
             </span>
           </label>
           <label className="block space-y-1">

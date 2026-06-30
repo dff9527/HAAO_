@@ -168,6 +168,7 @@ def test_runner_protocol_round_trip_and_revocation(tmp_path: Path, monkeypatch) 
         "/api/runner/events",
         headers=runner_headers,
         json={
+            "job_id": job_id,
             "events": [
                 {
                     "project_id": "default",

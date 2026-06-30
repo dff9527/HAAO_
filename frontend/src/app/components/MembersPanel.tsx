@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Loader2, Plus, Trash2, UserPlus } from 'lucide-react';
 import { apiClient } from '../api/client';
-import type { IdentityContext, MembershipRole, WorkspaceMembership } from '../api/types';
+import { ApiError } from '../api/client';
+import type { IdentityContext, MembershipRole, WorkspaceMembership, WorkspaceUsage } from '../api/types';
 import {
   MOCK_MEMBERSHIPS,
   canManageTeam,
@@ -34,11 +35,24 @@ export function MembersPanel({ identityContext, onForbidden }: Props) {
   const [inviteEmail, setInviteEmail] = useState('');
   const [inviteRole, setInviteRole] = useState<MembershipRole>('member');
   const [message, setMessage] = useState('');
+  const [usage, setUsage] = useState<WorkspaceUsage | null>(null);
 
   const sortedMembers = useMemo(
     () => [...members].sort((a, b) => a.created_at.localeCompare(b.created_at)),
     [members],
   );
+
+  async function refreshUsage() {
+    if (mockTeamPlaneEnabled()) {
+      setUsage(null);
+      return;
+    }
+    try {
+      setUsage(await apiClient.getWorkspaceUsage(workspaceId));
+    } catch {
+      setUsage(null);
+    }
+  }
 
   useEffect(() => {
     let active = true;
@@ -56,6 +70,25 @@ export function MembersPanel({ identityContext, onForbidden }: Props) {
       .finally(() => {
         if (active) setLoading(false);
       });
+    return () => {
+      active = false;
+    };
+  }, [workspaceId]);
+
+  useEffect(() => {
+    let active = true;
+    if (!mockTeamPlaneEnabled()) {
+      apiClient
+        .getWorkspaceUsage(workspaceId)
+        .then((next) => {
+          if (active) setUsage(next);
+        })
+        .catch(() => {
+          if (active) setUsage(null);
+        });
+    } else {
+      setUsage(null);
+    }
     return () => {
       active = false;
     };
@@ -89,9 +122,12 @@ export function MembersPanel({ identityContext, onForbidden }: Props) {
       setInviteUserId('');
       setInviteEmail('');
       setInviteRole('member');
+      await refreshUsage();
     } catch (error) {
       if (isForbiddenError(error)) {
         onForbidden?.(forbiddenMessage(error));
+      } else if (error instanceof ApiError && (error.status === 402 || error.status === 409)) {
+        setMessage('Seat limit reached — upgrade or free a seat before inviting another member.');
       } else {
         setMessage(error instanceof Error ? error.message : 'Could not save membership.');
       }
@@ -116,6 +152,7 @@ export function MembersPanel({ identityContext, onForbidden }: Props) {
             display_name: existing.display_name,
           });
       setMembers((prev) => prev.map((item) => (item.user_id === userId ? membership : item)));
+      await refreshUsage();
     } catch (error) {
       if (isForbiddenError(error)) {
         onForbidden?.(forbiddenMessage(error));
@@ -139,6 +176,7 @@ export function MembersPanel({ identityContext, onForbidden }: Props) {
         await apiClient.removeMembership(workspaceId, userId);
       }
       setMembers((prev) => prev.filter((item) => item.user_id !== userId));
+      await refreshUsage();
     } catch (error) {
       if (isForbiddenError(error)) {
         onForbidden?.(forbiddenMessage(error));
@@ -152,6 +190,32 @@ export function MembersPanel({ identityContext, onForbidden }: Props) {
 
   return (
     <div className="space-y-3">
+      {usage && (
+        <div className="rounded border border-border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground flex flex-wrap items-center gap-1.5">
+          <span className="font-medium text-foreground">Plan:</span>
+          <span>{usage.plan}</span>
+          <span>·</span>
+          <span className="font-medium text-foreground">Seats:</span>
+          <span>
+            {usage.seats_used}
+            {usage.seat_limit != null ? ` / ${usage.seat_limit}` : ' / unlimited'}
+          </span>
+          {usage.seat_limit != null && usage.seats_used >= usage.seat_limit && (
+            <>
+              <span>·</span>
+              <span className="text-amber-700 dark:text-amber-300">Seat limit reached</span>
+              <a
+                href="https://haao.ai/early-access"
+                target="_blank"
+                rel="noreferrer"
+                className="underline text-foreground hover:text-foreground/80"
+              >
+                Upgrade or contact early access
+              </a>
+            </>
+          )}
+        </div>
+      )}
       <p className="text-[11px] text-muted-foreground">
         Workspace members and roles. Owner and admin can invite or change roles; members and viewers are read-only here.
       </p>

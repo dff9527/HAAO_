@@ -1046,6 +1046,7 @@ export function RequirementComposer({
                           env: {},
                           setupCmd: '',
                           cleanupCmd: '',
+                          sandboxMode: 'auto',
                         }]).map((project) => (
                         <option key={project.id} value={project.id}>{project.name}</option>
                       ))}
