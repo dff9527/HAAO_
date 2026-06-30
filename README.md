@@ -53,7 +53,7 @@ The non-obvious choice: the **human is the PO, not the Scrum Master**. Process m
 - **The Atomic Ticket is a machine contract.** A [JSON-Schema ticket](./atomic_ticket.schema.json) is the handover format between the cloud Tech Lead and a coder: self-contained (code is **injected**, not referenced) with a **machine-verifiable** Definition of Done.
 - **Hybrid cost routing, made visible.** Work stays local by default; a retry budget governs self-correction; only exhausted tickets escalate to cloud. Cost is tracked per ticket with an honest `actual / estimated / unknown` status — no false precision.
 - **Bring any model.** Register multiple cloud providers (Anthropic / OpenAI / OpenRouter / …) with encrypted keys, or run everything local. Assign a specific model per role; discover a provider's models from your key.
-- **Ships real work.** On accept, opens a branch + PR (least-privilege, idempotent) to GitHub/GitLab.
+- **Ships real work.** On accept, opens a branch + PR (least-privilege, idempotent) to GitHub/GitLab — via a personal access token **or** a GitHub/GitLab App installation.
 - **Observability built in.** **Activity** (live run-event stream: model calls, diffs, retries, escalations, cost), **Insights** (throughput, cycle time, escalation rate, local-vs-cloud mix, cost dashboard, per-model scorecards), **Inbox** (cross-project needs-you / done / blocked).
 - **Two human gates, nothing in between.** Approve the backlog (front), accept the result (tail). Everything else is automatic.
 
@@ -112,11 +112,15 @@ pytest
 - [x] End-to-end loop (decompose → approve → execute + test → audit → accept)
 - [x] Conversational agent intake (chat → backlog proposals + progress reports)
 - [x] Multi-provider cloud model registry + per-role assignment, local or cloud execution
-- [x] PR delivery to GitHub/GitLab on accept
+- [x] PR delivery to GitHub/GitLab on accept (PAT **or** GitHub/GitLab App)
 - [x] Observability: Activity / Insights / Inbox
 - [x] Security: sandboxed execution, encrypted secrets, prompt-injection wrapping, optional auth
-- [ ] Hosted control plane (split-plane: vendor hosts coordination, execution stays client-side)
-- [ ] In-product model eval harness expansion
+- [x] Trust & recovery: PO Decision Center, richer gates, blocked-ticket recovery, diff-scope guards
+- [x] Throughput: parallel worker pool + dependency graph + conflict detection
+- [x] Split-plane foundations: client runner ↔ hosted control plane (keys stay client-side) — validated end-to-end over the internet
+- [x] Team foundations: workspaces, role-based access, audit log, OIDC SSO
+- [ ] Hosted Team service (managed control plane + billing) — foundations done, productionizing
+- [ ] Wider benchmark + in-product eval harness expansion
 
 ## Design notes
 
