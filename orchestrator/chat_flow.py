@@ -23,6 +23,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
+from orchestrator.attachments import build_attachment_context
+
 Role = Literal["user", "agent", "system_report"]
 ReportKind = Literal["done", "blocked", "needs_you"]
 
@@ -45,6 +47,15 @@ class ChatMessage:
     ticket_id: str | None = None
     report_kind: ReportKind | None = None
     attachment_ids: list[str] = field(default_factory=list)
+
+
+class ChatAttachmentLike(Protocol):
+    id: str
+    filename: str
+    mime: str
+    size: int
+    kind: str
+    stored_path: str
 
 
 @dataclass(frozen=True)
@@ -106,6 +117,12 @@ class ChatRepository(Protocol):
     def get_summary(self, project_id: str, segment_id: str) -> str: ...
 
     def set_summary(self, project_id: str, segment_id: str, summary: str) -> None: ...
+
+    def attachments_by_ids(
+        self,
+        project_id: str,
+        attachment_ids: list[str],
+    ) -> list[ChatAttachmentLike]: ...
 
 
 class ChatReasoner(Protocol):
@@ -198,7 +215,11 @@ class ChatService:
         recent = self.repository.list_messages(
             project_id, segment_id=segment_id, limit=window_size(self.reasoner)
         )
-        turn = self.reasoner.respond(summary=summary, recent=recent, user_text=text)
+        attachment_context = _attachment_context_for_reasoner(
+            self.repository.attachments_by_ids(project_id, cleaned_attachment_ids)
+        )
+        reasoner_user_text = _user_text_with_attachment_context(text, attachment_context)
+        turn = self.reasoner.respond(summary=summary, recent=recent, user_text=reasoner_user_text)
 
         filed_ids: list[str] = []
         if turn.work_items:
@@ -232,3 +253,39 @@ class ChatService:
             self.repository.set_summary(project_id, segment_id, turn.updated_summary)
 
         return ChatTurnResult(messages=produced, filed_requirement_ids=filed_ids)
+
+
+def _user_text_with_attachment_context(user_text: str, attachment_context: str) -> str:
+    if not attachment_context:
+        return user_text
+    return f"{user_text}\n\nAttached files available to the agent:\n{attachment_context}"
+
+
+def _attachment_context_for_reasoner(attachments: list[ChatAttachmentLike]) -> str:
+    if not attachments:
+        return ""
+    parts: list[str] = []
+    for index, attachment in enumerate(attachments, start=1):
+        payload = build_attachment_context(
+            {
+                "id": attachment.id,
+                "type": attachment.kind,
+                "value": attachment.stored_path,
+                "filename": attachment.filename,
+                "mime": attachment.mime,
+                "size": attachment.size,
+            }
+        )
+        header = (
+            f"[Attachment {index}: {attachment.filename} | "
+            f"{attachment.kind} | {attachment.mime} | {attachment.size} bytes]"
+        )
+        content = payload.get("content")
+        if isinstance(content, str) and content.strip():
+            suffix = "\n[Attachment content truncated]" if payload.get("content_truncated") else ""
+            parts.append(f"{header}\n{content.strip()}{suffix}")
+        elif attachment.kind == "image":
+            parts.append(f"{header}\nImage content is attached, but no text was extracted.")
+        else:
+            parts.append(f"{header}\nFile content could not be extracted as text.")
+    return "\n\n".join(parts)

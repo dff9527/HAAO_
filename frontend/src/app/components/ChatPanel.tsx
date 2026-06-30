@@ -285,6 +285,8 @@ export function ChatPanel({
   const listRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
+  const ignoreNextCompositionEndRef = useRef(false);
+  const [isComposing, setIsComposing] = useState(false);
   const isRail = layoutMode === 'rail';
   const reports = useMemo(() => latestReports(messages), [messages]);
   const hasImageAttachment = pendingAttachments.some((attachment) => attachment.kind === 'image');
@@ -342,6 +344,9 @@ export function ChatPanel({
     event.preventDefault();
     const text = draft.trim();
     if (!text || sending || uploading) return;
+    if (isComposing) {
+      ignoreNextCompositionEndRef.current = true;
+    }
     onSend(
       text,
       pendingAttachments.map((attachment) => attachment.id),
@@ -539,8 +544,28 @@ export function ChatPanel({
           <textarea
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
+            onCompositionStart={() => {
+              ignoreNextCompositionEndRef.current = false;
+              setIsComposing(true);
+            }}
+            onCompositionEnd={(event) => {
+              setIsComposing(false);
+              if (sending || ignoreNextCompositionEndRef.current) {
+                ignoreNextCompositionEndRef.current = false;
+                return;
+              }
+              const target = event.target as HTMLTextAreaElement;
+              if (target.value !== draft) {
+                setDraft(target.value);
+              }
+            }}
             onKeyDown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey) {
+              if (
+                event.key === 'Enter' &&
+                !event.shiftKey &&
+                !isComposing &&
+                !event.nativeEvent.isComposing
+              ) {
                 event.preventDefault();
                 handleSubmit(event);
               }

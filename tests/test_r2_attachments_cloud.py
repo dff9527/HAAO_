@@ -39,7 +39,11 @@ from orchestrator.state_machine import TicketStateService
 class _StaticReasoner:
     is_local = False
 
+    def __init__(self) -> None:
+        self.calls = []
+
     def respond(self, *, summary, recent, user_text):
+        self.calls.append({"summary": summary, "recent": recent, "user_text": user_text})
         return ReasonerTurn(
             reply="Filed.",
             work_items=[WorkItem(title="Use attachment", prompt="Read the file.")],
@@ -88,7 +92,8 @@ def test_chat_attachment_upload_and_passthrough(tmp_path) -> None:
 
     from orchestrator.chat_flow import ChatService
 
-    service = ChatService(chat_repository, _StaticReasoner(), gateway)
+    reasoner = _StaticReasoner()
+    service = ChatService(chat_repository, reasoner, gateway)
 
     app.dependency_overrides[get_chat_repository] = lambda: chat_repository
     app.dependency_overrides[get_chat_service] = lambda: service
@@ -115,6 +120,7 @@ def test_chat_attachment_upload_and_passthrough(tmp_path) -> None:
         )
         assert response.status_code == 200
         assert response.json()["messages"][0]["attachment_ids"] == [attachment["id"]]
+        assert "hello attachment" in reasoner.calls[0]["user_text"]
         assert gateway.calls[0]["attachment_ids"] == [attachment["id"]]
     finally:
         app.dependency_overrides.clear()
