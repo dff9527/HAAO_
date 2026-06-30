@@ -340,7 +340,9 @@ def _decode_jwt(token: str) -> tuple[dict[str, Any], dict[str, Any], bytes, byte
 
 
 def _validate_claims(claims: dict[str, Any], config: OIDCProviderConfig) -> None:
-    if claims.get("iss") != config.issuer:
+    # Issuers such as Auth0 emit `iss` with a trailing slash while the stored config
+    # is normalized without one; compare slash-insensitively.
+    if str(claims.get("iss") or "").rstrip("/") != config.issuer.rstrip("/"):
         raise OIDCVerificationError("Invalid id_token issuer")
     aud = claims.get("aud")
     audiences = aud if isinstance(aud, list) else [aud]
