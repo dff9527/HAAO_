@@ -423,11 +423,19 @@ def _verify_signed_payload(prefix: str, token: str) -> dict[str, Any]:
     parts = token.split(".")
     if len(parts) != 3 or parts[0] != prefix:
         raise OIDCVerificationError("Invalid signed token shape")
-    expected = hmac.new(_session_secret(), parts[1].encode("ascii"), hashlib.sha256).digest()
-    actual = _b64decode(parts[2])
-    if not hmac.compare_digest(expected, actual):
-        raise OIDCVerificationError("Invalid signed token signature")
-    payload = json.loads(_b64decode(parts[1]).decode("utf-8"))
+    # Malformed base64 / json (e.g. a garbage or truncated cookie) must surface as a
+    # verification error, not a raw binascii/ValueError that would 500 the caller.
+    # binascii.Error, json.JSONDecodeError and UnicodeDecodeError all subclass ValueError.
+    try:
+        expected = hmac.new(_session_secret(), parts[1].encode("ascii"), hashlib.sha256).digest()
+        actual = _b64decode(parts[2])
+        if not hmac.compare_digest(expected, actual):
+            raise OIDCVerificationError("Invalid signed token signature")
+        payload = json.loads(_b64decode(parts[1]).decode("utf-8"))
+    except OIDCVerificationError:
+        raise
+    except ValueError as exc:
+        raise OIDCVerificationError("Invalid signed token encoding") from exc
     if not isinstance(payload, dict):
         raise OIDCVerificationError("Invalid signed token payload")
     return payload

@@ -88,14 +88,21 @@ async def api_token_auth(request: Request, call_next):
             try:
                 session = decode_session_token(session_token)
             except OIDCVerificationError as exc:
-                return _auth_error_response(
-                    "Login required",
-                    status_code=401,
-                    reason="login_required",
-                    www_authenticate='Bearer realm="haao"',
-                )
-            header_user_id = session.user_id
-            header_workspace_id = session.workspace_id
+                # When auth is not enabled, a stale/invalid session cookie (e.g. left
+                # over from an earlier SSO test or signed with a different
+                # HAAO_SECRET_KEY) must NOT lock out a zero-config instance. Ignore it
+                # and fall through to implicit-owner. Only reject when auth is enforced.
+                if enforcement_enabled:
+                    return _auth_error_response(
+                        "Login required",
+                        status_code=401,
+                        reason="login_required",
+                        www_authenticate='Bearer realm="haao"',
+                    )
+                session = None
+            if session is not None:
+                header_user_id = session.user_id
+                header_workspace_id = session.workspace_id
 
         identity = IdentityRepository(connection)
         try:

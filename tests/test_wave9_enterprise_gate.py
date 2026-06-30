@@ -132,6 +132,30 @@ def test_stray_membership_does_not_disable_implicit_owner_mode(tmp_path: Path, m
     assert admin_write.status_code == 200
 
 
+def test_stale_session_cookie_does_not_lock_zero_config(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "haao.sqlite3"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.delenv("HAAO_API_TOKEN", raising=False)
+    monkeypatch.setenv("HAAO_SECRET_KEY", "test-secret")
+    get_settings.cache_clear()
+
+    connect(db_path)  # ensure schema exists
+
+    # A leftover session cookie signed with a *different* secret can't be decoded.
+    # With auth not enabled it must be ignored (implicit-owner), not turned into a 401.
+    stale = issue_session_token(user_id="oidc-user", workspace_id="default")  # signed with test-secret
+    monkeypatch.setenv("HAAO_SECRET_KEY", "rotated-different-secret")
+    get_settings.cache_clear()
+
+    client = TestClient(app)
+    resp = client.get("/api/workspace/usage", headers={"X-HAAO-Session": stale})
+    assert resp.status_code == 200
+
+    # And outright garbage is likewise ignored, not a lockout.
+    resp2 = client.get("/api/workspace/usage", headers={"X-HAAO-Session": "hses.bogus.signature"})
+    assert resp2.status_code == 200
+
+
 def test_oidc_configured_requires_login_and_accepts_session(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "haao.sqlite3"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
